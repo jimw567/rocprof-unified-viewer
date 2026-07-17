@@ -147,15 +147,22 @@ def load_kernel_slices(path):
     by_stream = defaultdict(list)
     with open(path) as fh:
         for r in csv.DictReader(fh):
+            kname = r["Kernel_Name"]
             try:
                 gx = int(r["Grid_Size_X"])
                 wg = int(r["Workgroup_Size_X"])
                 n = gx // wg if wg else 0
+                # The wvsplitk decode kernel uses a 2D block (warp_size x WvPrGrp=16)
+                # and grid.x = ceil(nrows/16), so Grid_Size_X/Workgroup_Size_X yields
+                # ceil(nrows/16), not nrows. Recover true output rows (exact for the
+                # 16-aligned decode shapes) so it still order-maps onto its weight.
+                if "wvsplitk" in kname:
+                    n *= 16
             except (KeyError, ValueError, TypeError):
                 n = 0
             by_stream[r["Stream_Id"]].append(
                 (int(r["Start_Timestamp"]), int(r["End_Timestamp"]),
-                 r["Kernel_Name"], n))
+                 kname, n))
     for evs in by_stream.values():
         evs.sort()
     return by_stream
@@ -265,6 +272,8 @@ def load_fetch_bytes(path):
                 gs = int(r["Grid_Size"])
                 ws = int(r["Workgroup_Size"])
                 n = gs // ws if ws else 0
+                if "wvsplitk" in r["Kernel_Name"]:  # 2D block: recover true rows
+                    n *= 16
             except (KeyError, ValueError, TypeError):
                 n = 0
             if n:
@@ -272,6 +281,63 @@ def load_fetch_bytes(path):
     by_fam = {fam: statistics.mean(v) * 1024.0 for fam, v in agg.items() if v}
     by_fam_n = {k: statistics.mean(v) * 1024.0 for k, v in agg_n.items() if v}
     return by_fam, by_fam_n
+
+
+def load_fetch_bytes_mapped(path, expected_seq):
+    """Order-map the FETCH_SIZE run to PER-WEIGHT measured DRAM bytes.
+
+    The (family, N) bucket in load_fetch_bytes cannot separate two different
+    weights that launch the same N -- e.g. ffn_down [9216 x 2560] and attn_output
+    [2560 x 2560] both dispatch N=2560, so they share one blended measurement and
+    over-fetch comes out physically impossible (< 1.0x for the bigger, > 1x for the
+    smaller). But the FETCH run is also strictly-periodic decode, so each
+    mul_mat_vec dispatch can be attached to its exact GGUF weight by execution
+    order (the same heuristic the trace uses). Returns {weight_name: mean bytes/
+    dispatch} averaged over the clean steady-state tokens in the run, giving an
+    honest per-weight over-fetch. Falls back to {} (caller uses the blend) if the
+    run cannot be cleanly segmented against expected_seq."""
+    if not expected_seq:
+        return {}
+    L = len(expected_seq)
+    vocab_n = expected_seq[-1]["N"]          # output head N delimits each token
+    rows = []
+    with open(path) as fh:
+        for r in csv.DictReader(fh):
+            if r.get("Counter_Name") != "FETCH_SIZE":
+                continue
+            if "mul_mat_vec" not in r.get("Kernel_Name", ""):
+                continue
+            try:
+                did = int(r["Dispatch_Id"])
+                gs = int(r["Grid_Size"])
+                ws = int(r["Workgroup_Size"])
+                n = gs // ws if ws else 0
+                if "wvsplitk" in r["Kernel_Name"]:  # 2D block: recover true rows
+                    n *= 16
+                v = float(r["Counter_Value"]) * 1024.0
+            except (KeyError, ValueError, TypeError):
+                continue
+            if n:
+                rows.append((did, n, v))
+    rows.sort()
+    # Segment into tokens at the output head (N == vocab), then keep only clean
+    # tokens whose dispatch count matches the expected per-token sequence length.
+    toks, cur = [], []
+    for _did, n, v in rows:
+        cur.append((n, v))
+        if n == vocab_n:
+            toks.append(cur)
+            cur = []
+    good = [t for t in toks if len(t) == L]
+    if not good:
+        return {}
+    acc = defaultdict(list)
+    for t in good:
+        for i, (n, v) in enumerate(t):
+            ent = expected_seq[i]
+            if ent["N"] == n:                # attach only on shape match
+                acc[ent["nm"]].append(v)
+    return {nm: statistics.mean(vs) for nm, vs in acc.items() if vs}
 
 
 def load_loadwidth(path):
@@ -410,7 +476,17 @@ def build_expected_sequence(tensors, drop_ffn_up):
             t = roles.get(role)
             if t is None or len(t["ne"]) < 2 or t["gt"] not in _MATVEC_TYPES:
                 continue
-            seq.append(_seq_entry(t, layer, role))
+            ent = _seq_entry(t, layer, role)
+            # Fused SwiGLU: the single ffn_gate dispatch streams BOTH the gate and
+            # up weights from DRAM, so its true footprint is gate+up. Fold up's
+            # bytes in, else the theoretical denominator is ~2x too small (the
+            # dispatch would look like it over-fetches ~2x when it does not).
+            if role == "ffn_gate" and drop_ffn_up:
+                up = roles.get("ffn_up")
+                if up is not None and up["gt"] in _MATVEC_TYPES:
+                    ent["bytes"] += up["bytes"]
+                    ent["fused"] = "gate+up"
+            seq.append(ent)
     # Output head: a dedicated output.weight, else the tied token_embd.weight.
     head = (next((t for t in nonblk if t["name"] == "output.weight"), None)
             or next((t for t in nonblk if t["name"] == "token_embd.weight"), None))
@@ -559,6 +635,12 @@ def main():
         if best:
             expected_seq = best[1]
 
+    # Per-weight measured DRAM bytes: order-map the FETCH run itself so weights
+    # sharing an N (ffn_down vs attn_output at N=2560) get exact measurements
+    # instead of a shape-blended (family, N) average. Empty -> fall back to blend.
+    fetch_by_name = (load_fetch_bytes_mapped(args.fetch_csv, expected_seq)
+                     if (args.fetch_csv and expected_seq) else {})
+
     # Baked-relative indices where a new decode token starts (reset the order-map
     # pointer here so each token re-aligns to the expected sequence head).
     tok_boundary_idx = {bounds[k] - a for k in range(lo_tok, hi_tok + 1)}
@@ -594,7 +676,13 @@ def main():
                 true_n = ent["N"]
                 k = ent["K"]
                 packed = ent["bytes"]
-                measured = fetch_bytes_n.get((fam, ncol)) or fetch_bytes.get(fam, 0)
+                # Prefer per-weight order-mapped bytes (over-fetch-honest even for
+                # weights sharing an N); fall back to the (family, N) blend, then
+                # the family mean.
+                mexact = ent["nm"] in fetch_by_name
+                measured = (fetch_by_name.get(ent["nm"])
+                            or fetch_bytes_n.get((fam, ncol))
+                            or fetch_bytes.get(fam, 0))
                 sl["map"] = {
                     "nm": ent["nm"], "role": ent["role"], "L": ent["L"],
                     "q": ent["q"], "K": k, "trueN": true_n, "launchN": ncol,
@@ -603,10 +691,24 @@ def main():
                     # Reduction (K) padding to the quant block (256 for K-quants).
                     "padK": (((k + 255) // 256) * 256 - k) if k else 0,
                     "packed": packed,
+                    "fused": ent.get("fused", ""),
                     "measured": round(measured) if measured else 0,
+                    # True when `measured` is this weight's own order-mapped bytes
+                    # (over-fetch-honest); False when it fell back to the (fam, N) blend.
+                    "mexact": mexact,
                     # Over-fetch: measured DRAM bytes / theoretical packed footprint.
                     "overfetch": (round(measured / packed, 2)
                                   if (measured and packed) else 0),
+                    # Effective (useful-work) bandwidth: the THEORETICAL bytes this
+                    # matvec must move / its exact kernel time. Immune to over-fetch
+                    # by construction (numerator is the algorithmic minimum, not
+                    # measured traffic), and uses exact per-dispatch duration (no
+                    # separate-run / family blend), so it is the honest roofline
+                    # number: a kernel that over-fetches 100x keeps DRAM busy but
+                    # its effective BW stays low. 1 byte/ns == 1 GB/s.
+                    "effbw": round(packed / dur, 1) if dur else 0,
+                    "effbw_pct": (round(packed / dur / peak_bw * 100, 1)
+                                  if dur else 0),
                     "nmatch": (true_n == ncol),
                 }
                 if true_n == ncol:
@@ -828,8 +930,7 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
     <div class="panel grow">
       <h2>Per-kernel-family (baked span)</h2>
       <table id="tbl"><thead><tr>
-        <th>family</th><th>count/tok</th><th>busy%</th><th title="measured achieved DRAM bandwidth: FETCH_SIZE bytes/dispatch / kernel time, vs arch peak">GB/s(%pk)</th><th>MemBusy</th>
-        <th>L2hit</th><th>Occ</th><th>stall</th>
+        <th>family</th><th>cnt/tok</th><th>time%</th><th>stall</th>
       </tr></thead><tbody></tbody><tfoot></tfoot></table>
       <div class="sub" id="bwnote" style="margin-top:8px"></div>
     </div>
@@ -870,11 +971,10 @@ document.getElementById('sub').textContent =
 document.getElementById('cpunote').textContent = D.has_cpu ? '' :
   '(no --hip-csv supplied: CPU lane empty)';
 document.getElementById('bwnote').textContent = D.has_bw ?
-  ('GB/s(%pk) = MEASURED achieved DRAM bandwidth: FETCH_SIZE bytes/dispatch (post-L2 '+
-   'actual VRAM read traffic) / kernel time, vs '+D.peak_bw_gbs+' GB/s peak. Measured '+
-   'attributes bytes to the exact kernel that moved them (no shared-quant-type '+
-   'over-counting), so every family gets a real roofline number.')
-  : '(no --fetch-csv supplied: achieved-bandwidth column omitted)';
+  ('time% = share of window GPU-busy time. Aggregate DRAM read/token and achieved BW '+
+   '(all bytes / kernel time, vs '+D.peak_bw_gbs+' GB/s peak) are in the table footer. '+
+   'Per-family roofline is in the click-through detail panel (real per-shape effective BW).')
+  : '(no --fetch-csv supplied: achieved-bandwidth footer omitted)';
 
 // legend
 const legOrder = ['memory','compute','occupancy','lds','copy','unknown'];
@@ -1013,12 +1113,8 @@ function draw(){
 const tb = document.querySelector('#tbl tbody');
 tb.innerHTML = D.summary.map(r=>{
   const col = D.colors[r.stall]||D.colors.unknown;
-  const bw = r.bw_gbs
-    ? `${r.bw_gbs} <span class="r">(${r.bw_pct}%)</span>`
-    : '-';
   return `<tr data-fam="${r.fam}"><td><span class="fam-dot" style="background:${col}"></span>${r.fam}</td>`+
-    `<td>${r.per_tok}</td><td>${r.busy_pct}</td><td>${bw}</td><td>${r.mem}</td>`+
-    `<td>${r.l2}</td><td>${r.occ}</td><td>${r.stall}</td></tr>`;
+    `<td>${r.per_tok}</td><td>${r.busy_pct}</td><td>${r.stall}</td></tr>`;
 }).join('');
 // selection: a table row selects a FAMILY (dims other families); a click on the
 // timeline selects a SINGLE kernel (bright outline) and shows its details below.
@@ -1087,7 +1183,63 @@ function diagnose(fc){
 // details panel below the lanes for the single selected kernel
 const dp = document.getElementById('detail');
 function updateDetail(){
-  if(!selectedSlice){ dp.style.display='none'; dp.innerHTML=''; return; }
+  if(selectedSlice){ renderSelectedKernel(); return; }
+  if(selectedFam){ renderFamilyMembers(); return; }
+  dp.style.display='none'; dp.innerHTML='';
+}
+// Family view: when a per-kernel-family row is selected (no single slice), list
+// every order-mapped shape in that family with its packed footprint + effective BW.
+function renderFamilyMembers(){
+  const fam=selectedFam;
+  const KB=b=>b>=1048576?(b/1048576).toFixed(1)+' MB':(b/1024).toFixed(1)+' KB';
+  const groups=new Map();
+  for(const s of D.gpu){
+    if(s.fam!==fam || !s.map) continue;
+    const m=s.map, key=m.role+'|'+m.K+'x'+m.trueN+'|'+m.q;
+    let g=groups.get(key);
+    if(!g){ g={role:m.role,K:m.K,N:m.trueN,q:m.q,packed:m.packed,fused:m.fused,es:0,ep:0,dur:0,of:0,ofn:0,n:0}; groups.set(key,g); }
+    g.es+=m.effbw||0; g.ep+=m.effbw_pct||0; g.dur+=(s.e-s.s); g.n++;
+    if(m.overfetch){ g.of+=m.overfetch; g.ofn++; }
+  }
+  const gs=[...groups.values()].sort((a,b)=>b.packed-a.packed);
+  let h=`<h2>Kernel family/Token</h2>`+
+    `<div style="color:#7fd1ff;word-break:break-all;margin-bottom:6px">${fam}`+
+    `<span class="r"> (${gs.length} distinct shape${gs.length===1?'':'s'})</span></div>`;
+  if(!gs.length){
+    h+=`<div class="sub">No order-mapped dispatches in this family`+
+       (D.has_map?`.`:` -- run with --gguf to attach shape / packed footprint / effective BW.`)+`</div>`;
+    dp.innerHTML=h; dp.style.display='block'; return;
+  }
+  h+=`<table><thead><tr><th style="text-align:left">role</th>`+
+     `<th style="text-align:left">shape [K x N]</th><th style="text-align:left">packed</th>`+
+     `<th style="text-align:left">kernel time</th>`+
+     `<th style="text-align:left">eff BW</th><th style="text-align:left">eff BW %</th>`+
+     `<th style="text-align:left">over-fetch</th>`+
+     `<th style="text-align:left">cnt/tok</th></tr></thead><tbody>`;
+  for(const g of gs){
+    const eb=g.n?g.es/g.n:0, ep=g.n?g.ep/g.n:0, dt=g.n?g.dur/g.n:0;
+    const of=g.ofn?(g.of/g.ofn):0;
+    h+=`<tr><td style="color:#ffd479">${g.role}</td>`+
+       `<td>${g.K} x ${g.N} <span class="r">${g.q}</span></td>`+
+       `<td>${KB(g.packed)}${g.fused?` <span class="r">(${g.fused})</span>`:``}</td>`+
+       `<td>${fmtus(dt)}</td>`+
+       `<td style="color:#8fe388">${eb.toFixed(1)} GB/s</td>`+
+       `<td style="color:#8fe388">${ep.toFixed(1)}%</td>`+
+       `<td>${of?of.toFixed(2)+'x':'<span class="r">-</span>'}</td>`+
+       `<td>${(g.n/(D.n_tokens_baked||1)).toFixed(1)}</td></tr>`;
+  }
+  const tot=gs.reduce((a,g)=>a+g.n,0);
+  h+=`</tbody></table>`+
+     `<div class="sub" style="margin-top:6px">All order-mapped dispatches of `+
+     `<b>${fam}</b> in the baked span, grouped by role + shape. <b>packed</b> = theoretical `+
+     `on-disk weight bytes (gate+up folded when fused); <b>kernel time</b> + <b>eff BW</b> `+
+     `(= packed / dispatch time) are means over the ${tot} dispatches `+
+     `(over-fetch-immune, vs peak ${D.peak_bw_gbs} GB/s). <b>cnt/tok</b> = `+
+     `dispatches per baked token (${D.n_tokens_baked} baked). `+
+     `Click any timeline slice for its full per-dispatch panel.</div>`;
+  dp.innerHTML=h; dp.style.display='block';
+}
+function renderSelectedKernel(){
   const s=selectedSlice, fc=D.fam_counters[s.fam]||{};
   const dg=diagnose(fc);
   let h=`<h2>Selected kernel</h2>`+
@@ -1108,11 +1260,20 @@ function updateDetail(){
        (m.padN?` <span class="r">(+${m.padN} padding rows vs true ${m.trueN})</span>`
              :` <span class="r">(== true N, no output-row padding)</span>`)+`</td></tr>`;
     if(m.padK) h+=`<tr><td>K block padding</td><td>+${m.padK} <span class="r">(to 256-elem quant block)</span></td></tr>`;
-    h+=`<tr><td>packed footprint</td><td>${KB(m.packed)} <span class="r">(theoretical, on-disk)</span></td></tr>`;
-    if(m.measured) h+=`<tr><td>over-fetch</td><td>${m.overfetch}x <span class="r">(measured ${KB(m.measured)} / packed)</span></td></tr>`;
+    h+=`<tr><td>packed weights</td><td>${KB(m.packed)} <span class="r">(theoretical, on-disk`+
+       (m.fused?`, ${m.fused} fused`:``)+`)</span></td></tr>`;
+    if(m.effbw) h+=`<tr><td>effective BW</td><td style="color:#8fe388">${m.effbw} GB/s `+
+       `(${m.effbw_pct}% of ${D.peak_bw_gbs}) <span class="r">(useful: packed / this dispatch time)</span></td></tr>`;
+    if(m.measured){ const src=m.mexact?'per-weight (order-mapped)':'family+N avg';
+      h+=`<tr><td>FETCH_SIZE</td><td>${KB(m.measured)} <span class="r">(measured DRAM read, ${src})</span></td></tr>`+
+         `<tr><td>over-fetch</td><td>${m.overfetch}x <span class="r">(FETCH_SIZE / packed; ${src})</span></td></tr>`; }
   }
-  if(D.has_bw && fc.bw_gbs){
-    h += `<tr><td>achieved BW</td><td>${fc.bw_gbs} GB/s (${fc.bw_pct}% of ${D.peak_bw_gbs}), ${fc.kb_disp} KB/disp</td></tr>`;
+  // Achieved BW is per-family (all shapes blended) and counts over-fetched bytes,
+  // so it is misleading for a single dispatch. When this slice is order-mapped we
+  // already show effective BW (per-dispatch, over-fetch-immune); only fall back to
+  // achieved BW for unmapped kernels where it is the sole bandwidth signal.
+  if(D.has_bw && fc.bw_gbs && !s.map){
+    h += `<tr><td>achieved BW</td><td>${fc.bw_gbs} GB/s (${fc.bw_pct}% of ${D.peak_bw_gbs}), ${fc.kb_disp} KB/disp <span class="r">(per-family, raw traffic)</span></td></tr>`;
   }
   if(D.has_pmc){
     h+=`<tr><td>MemUnitBusy</td><td>${fc.mem}%</td></tr>`+
@@ -1122,21 +1283,6 @@ function updateDetail(){
        `<tr><td>WriteUnitStalled</td><td>${fc.wr}</td></tr>`+
        `<tr><td>Wavefronts</td><td>${fc.wav}</td></tr>`+
        `<tr><td>dominant stall</td><td style="color:${D.colors[s.stall]};font-weight:600">${s.stall}</td></tr>`;
-    // Traffic amplification = load-unit bytes / DRAM bytes = 1/(1 - L2hit).
-    // How many times each DRAM-fetched byte was re-served by L2. ~1.0 =
-    // read-once/streaming (matvec/decode); >>1 = the kernel re-reads data L2
-    // caught -- a tiling/reuse smell (stage it in LDS/registers). NOTE this only
-    // sees re-reads L2 absorbed; refetch that MISSES L2 needs the unique
-    // footprint (not known here) to detect -- watch low L2 hit + high DRAM bytes.
-    const l2h=Math.min(fc.l2||0,99.9), amp=1/(1-l2h/100);
-    // Byte breakdown per dispatch: FETCH_SIZE (DRAM, measured) + cache-hit
-    // (L2 re-served, derived from L2 hit%) = load-unit bytes the loads requested.
-    const fkb=fc.kb_disp||0, hitkb=fkb*l2h/(100-l2h), lukb=fkb+hitkb;
-    h+=`<tr><td>traffic amplification</td><td>${amp.toFixed(2)}x`+
-       (fkb?` <span class="r">(load-unit ${lukb.toFixed(1)} = FETCH_SIZE ${fkb.toFixed(1)}`+
-            ` + cache-hit ${hitkb.toFixed(1)} KB/disp)</span>`
-           :` <span class="r">(load bytes / DRAM bytes; L2-absorbed re-reads)</span>`)+
-       `</td></tr>`;
     if(fc.ea) h+=`<tr><td>EA (DRAM iface) busy</td><td>${fc.ea}%</td></tr>`;
     if(fc.alu) h+=`<tr><td>ALU (VALU) busy</td><td>${fc.alu}%</td></tr>`;
     if(fc.vgpr) h+=`<tr><td>VGPR / SGPR</td><td>${fc.vgpr} / ${fc.sgpr}`+
@@ -1160,13 +1306,18 @@ function updateDetail(){
      `dispatch; PMC, achieved BW + load width are per-family (PMC + FETCH_SIZE from `+
      `separate runs; load width from device disassembly). vector = per-lane global/`+
      `buffer loads (b32=4B, d16=2B, u8=1B); scalar = s_load uniform; LDS = ds_ reads.`+
-     `<br>traffic amplification = load-unit / FETCH_SIZE = 1/(1-L2hit). `+
-     `<b>FETCH_SIZE</b> = DRAM bytes read (GL2C-&gt;EA, L2 misses only, measured). `+
-     `<b>cache-hit</b> = bytes L2 re-served (derived: FETCH_SIZE*hit/(1-hit)). `+
-     `<b>theoretical input</b> = unique bytes touched once (weights read once) = the `+
-     `algorithmic minimum; NOT a counter -- supply it from model/kernel shapes. `+
-     `For a read-once kernel FETCH_SIZE ~ theoretical, so FETCH_SIZE well above the `+
-     `known weight footprint = DRAM over-fetch (bad tiling missing L2).</div>`;
+     `<br><b>packed footprint</b> = the weight tensor's on-disk quantized size (from GGUF) `+
+     `= the DRAM bytes a read-once matvec MUST move (gate+up folded in when fused). `+
+     `<b>effective BW</b> = packed / this dispatch's exact time = <i>useful</i> throughput. `+
+     `Model assumption: <b>weights always come from DRAM</b> and <b>L2 hits are activation `+
+     `reuse</b>. <b>FETCH_SIZE</b> = measured DRAM bytes read (L2 misses only). `+
+     `<b>over-fetch</b> = FETCH_SIZE / packed: ~1.0x = streamed once, &gt;1 = weight `+
+     `refetched (bad tiling). NOTE achieved BW (FETCH_SIZE/time) rewards over-fetch -- a `+
+     `kernel that reads the same bytes 100x keeps DRAM busy but does no extra work; `+
+     `<b>effective BW is the over-fetch-immune roofline number</b>. When the FETCH run is `+
+     `order-mapped (GGUF present), over-fetch is <b>per-weight exact</b> even for weights `+
+     `sharing an N; otherwise it falls back to a family+N average (separate PMC run) that `+
+     `blends weights of the same N.</div>`;
   dp.innerHTML=h; dp.style.display='block';
 }
 tb.querySelectorAll('tr').forEach(tr=>{
@@ -1183,17 +1334,25 @@ tb.querySelectorAll('tr').forEach(tr=>{
   const nGaps = totCount>1 ? totCount-1 : 1;
   const avgGap = totGap/nGaps;
   let rows =
-    `<tr><td colspan="7">total count / token</td><td>${totCountTok.toFixed(1)}</td></tr>`+
-    `<tr><td colspan="7">total kernel time / token</td><td>${fmtdur(timePerTok)}</td></tr>`+
-    `<tr><td colspan="7">total CP Transition Gap / token</td><td>${fmtdur(gapPerTok)}</td></tr>`+
-    `<tr><td colspan="7">avg CP Transition Gap/kernel</td><td>${fmtdur(avgGap)}</td></tr>`;
+    `<tr><td colspan="3">total count / token</td><td>${totCountTok.toFixed(1)}</td></tr>`+
+    `<tr><td colspan="3">total kernel time / token</td><td>${fmtdur(timePerTok)}</td></tr>`+
+    `<tr><td colspan="3">total CP Transition Gap / token</td><td>${fmtdur(gapPerTok)}</td></tr>`+
+    `<tr><td colspan="3">avg CP Transition Gap/kernel</td><td>${fmtdur(avgGap)}</td></tr>`;
   if (D.has_bw){
     const totMB = D.summary.reduce((a,r)=>a+(r.mb_tok||0),0);
-    const bwAgg = timePerTok ? totMB*1e6/timePerTok : 0;  // bytes/ns == GB/s
     rows +=
-      `<tr><td colspan="7">DRAM read / token (all kernels, measured)</td><td>${totMB.toFixed(0)} MB</td></tr>`+
-      `<tr><td colspan="7">achieved BW (all bytes / kernel time)</td>`+
-      `<td>${bwAgg.toFixed(0)} GB/s (${(bwAgg/D.peak_bw_gbs*100).toFixed(0)}%)</td></tr>`;
+      `<tr><td colspan="3">DRAM read / token (all kernels, measured)</td><td>${totMB.toFixed(0)} MB</td></tr>`;
+  }
+  if (D.has_map){
+    // eff BW = useful throughput: theoretical packed weight bytes / kernel time
+    // (over-fetch-immune; only order-mapped matvec dispatches carry packed bytes).
+    let totPacked = 0;
+    for(const s of D.gpu){ if(s.map) totPacked += s.map.packed||0; }
+    const packedTok = D.n_tokens_baked ? totPacked/D.n_tokens_baked : 0;
+    const effbw = timePerTok ? packedTok/timePerTok : 0;  // bytes/ns == GB/s
+    rows +=
+      `<tr><td colspan="3">eff BW% (packed weights / kernel time)</td>`+
+      `<td>${effbw.toFixed(0)} GB/s (${(effbw/D.peak_bw_gbs*100).toFixed(0)}%)</td></tr>`;
   }
   tf.innerHTML = rows;
 }
@@ -1218,8 +1377,10 @@ cv.addEventListener('mousemove', e=>{
       `<div class="r">dur ${fmtus(s.e-s.s)}</div>`+
       (s.map?`<div style="color:#ffd479">${s.map.role} [${s.map.K}x${s.map.trueN}] ${s.map.q}`+
         (s.map.padN?` +${s.map.padN} pad`:` (no pad)`)+
-        (s.map.overfetch?`, ${s.map.overfetch}x fetch`:``)+`</div>`:'')+
-      ((D.has_bw && fc.bw_gbs)?
+        (s.map.overfetch?`, ${s.map.overfetch}x fetch`:``)+`</div>`+
+        (s.map.effbw?`<div style="color:#8fe388">effective BW ~ ${s.map.effbw} GB/s `+
+          `(${s.map.effbw_pct}% of ${D.peak_bw_gbs} peak)</div>`:''):'')+
+      ((D.has_bw && fc.bw_gbs && !s.map)?
         `<div style="color:#7fd1ff">achieved BW ~ ${fc.bw_gbs} GB/s `+
         `(${fc.bw_pct}% of ${D.peak_bw_gbs} peak), ${fc.kb_disp} KB/disp</div>`:'')+
       ((D.has_loadw && fc.loadw)?
