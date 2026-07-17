@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.html
+*.csv
+*.pftrace
+loadwidth.json
+*.egg-info/
+dist/
+build/
+.venv/

@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rocprof-unified-viewer"
+version = "0.1.0"
+description = "Fuse rocprofv3 CPU/GPU/PMC/bandwidth traces into one self-contained HTML timeline"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { file = "LICENSE" }
+authors = [{ name = "Jim Wu" }]
+dependencies = []
+
+[project.scripts]
+rocprof-unified-viewer = "rocprof_unified_viewer:main"
+rocprof-disasm-loadwidth = "disasm_loadwidth:main"
+
+[tool.setuptools]
+py-modules = ["rocprof_unified_viewer", "disasm_loadwidth"]
