@@ -51,6 +51,7 @@ Example:
 import argparse
 import csv
 import json
+import os
 import re
 import statistics
 import sys
@@ -160,9 +161,21 @@ def load_kernel_slices(path):
                     n *= 16
             except (KeyError, ValueError, TypeError):
                 n = 0
+            # Per-dispatch block (workgroup) count = product over grid dims of
+            # (Grid_Size_d / Workgroup_Size_d). Grid_Size_* is in work-items, so the
+            # per-dim ratio is that dim's block count. Unlike N above this is NOT
+            # scaled for wvsplitk -- grid.x already IS the launched block count.
+            try:
+                nblk = 1
+                for d in ("X", "Y", "Z"):
+                    gd = int(r["Grid_Size_" + d]); wd = int(r["Workgroup_Size_" + d])
+                    if wd:
+                        nblk *= gd // wd
+            except (KeyError, ValueError, TypeError):
+                nblk = 0
             by_stream[r["Stream_Id"]].append(
                 (int(r["Start_Timestamp"]), int(r["End_Timestamp"]),
-                 kname, n))
+                 kname, n, nblk))
     for evs in by_stream.values():
         evs.sort()
     return by_stream
@@ -199,12 +212,15 @@ def load_pmc_families(path):
     # Register counts are per-dispatch metadata columns (constant per kernel),
     # not PMC counters, so track them separately as a per-family max.
     regs = defaultdict(lambda: {"vgpr": 0, "accum_vgpr": 0, "sgpr": 0,
-                                "scratch": 0})
+                                "scratch": 0, "lds": 0})
     # Wavefront size = work-items / wavefronts dispatched, derived from
     # Grid_Size / Wavefronts. Both are summed over the SAME dispatches (gated on
     # the Wavefronts counter row, which occurs once per dispatch) so the ratio is
     # exact even when a family mixes dispatch sizes.
-    wsz = defaultdict(lambda: {"grid": 0.0, "waves": 0.0})
+    # Tiling geometry: threads/block (Workgroup_Size, constant per family) and the
+    # per-family mean block count (mean Grid_Size / Workgroup_Size). ndisp counts
+    # dispatches (the Wavefronts counter row occurs once per dispatch).
+    wsz = defaultdict(lambda: {"grid": 0.0, "waves": 0.0, "wg": 0, "ndisp": 0})
     with open(path) as fh:
         for r in csv.DictReader(fh):
             fam = family_of(r["Kernel_Name"])
@@ -216,7 +232,8 @@ def load_pmc_families(path):
             for key, col in (("vgpr", "VGPR_Count"),
                              ("accum_vgpr", "Accum_VGPR_Count"),
                              ("sgpr", "SGPR_Count"),
-                             ("scratch", "Scratch_Size")):
+                             ("scratch", "Scratch_Size"),
+                             ("lds", "LDS_Block_Size")):
                 try:
                     g[key] = max(g[key], int(r[col]))
                 except (KeyError, ValueError, TypeError):
@@ -225,6 +242,8 @@ def load_pmc_families(path):
                 try:
                     wsz[fam]["grid"] += int(r["Grid_Size"])
                     wsz[fam]["waves"] += float(r["Counter_Value"])
+                    wsz[fam]["wg"] = max(wsz[fam]["wg"], int(r["Workgroup_Size"]))
+                    wsz[fam]["ndisp"] += 1
                 except (KeyError, ValueError, TypeError):
                     pass
     fams = {}
@@ -238,6 +257,9 @@ def load_pmc_families(path):
             "stall": dominant_stall(means),
             "regs": regs[fam],
             "wave": int(round(w["grid"] / w["waves"])) if w["waves"] else 0,
+            "wg": int(w["wg"]),
+            "blocks": (int(round((w["grid"] / w["ndisp"]) / w["wg"]))
+                       if w["ndisp"] and w["wg"] else 0),
         }
     return fams
 
@@ -346,6 +368,84 @@ def load_loadwidth(path):
     objects. Keyed by the same family_of() names, so it joins onto slices."""
     with open(path) as fh:
         return json.load(fh)
+
+
+def load_att_stats(att_dir):
+    """Aggregate decoded ATT (Advanced Thread Trace) instruction stats per kernel
+    FAMILY so they join onto the same family_of() slices as PMC/loadwidth.
+
+    Reads every `stats_ui_output_*_dispatch_*.csv` under `att_dir`. Each such CSV
+    is one traced dispatch and lists per-instruction rows with columns
+    CodeObj,Vaddr,Instruction,Hitcount,Latency,Stall,Idle,Source. The demangled
+    kernel name only appears on the first row of each function block (the `Source`
+    column is blank on the instruction rows that follow), so we carry the last
+    non-blank Source forward. A dispatch's decoded output usually contains a few
+    neighbouring kernels; every function block is attributed to its own family,
+    and the one with the most Stall cycles is the traced target.
+
+    Returns {family: {stall,lat,idle,hits, n_disp, top:[{i,st,idle,hits}],
+    byclass:[[opcode,stall]]}} -- cycle totals summed across all traced dispatches
+    of that family, top instructions ranked by stall cycles, and stall grouped by
+    opcode. Empty dict if no populated stats CSVs are found (all cut off)."""
+    import glob
+    agg = {}
+    for path in sorted(glob.glob(os.path.join(att_dir, "**",
+                                              "stats_ui_output_*_dispatch_*.csv"),
+                                 recursive=True)):
+        # Per-file: which families appear, and their instruction rows.
+        fam_rows = defaultdict(list)
+        cur = None
+        try:
+            with open(path) as fh:
+                for r in csv.DictReader(fh):
+                    src = (r.get("Source") or "").strip()
+                    if src:
+                        cur = family_of(src)
+                    if not cur:
+                        continue
+                    instr = (r.get("Instruction") or "").strip()
+
+                    def _i(k):
+                        try:
+                            return int(r.get(k) or 0)
+                        except ValueError:
+                            return 0
+                    st, idle, hits, lat = (_i("Stall"), _i("Idle"),
+                                           _i("Hitcount"), _i("Latency"))
+                    if instr:
+                        fam_rows[cur].append((instr, st, idle, hits, lat))
+        except OSError:
+            continue
+        for fam, rows in fam_rows.items():
+            if not any(h for (_i, _s, _d, h, _l) in rows):
+                continue                       # this dispatch was empty/cut off
+            a = agg.setdefault(fam, {"stall": 0, "lat": 0, "idle": 0, "hits": 0,
+                                     "n_disp": 0, "_instr": defaultdict(
+                                         lambda: [0, 0, 0]),
+                                     "_class": defaultdict(int)})
+            a["n_disp"] += 1
+            for instr, st, idle, hits, lat in rows:
+                a["stall"] += st
+                a["idle"] += idle
+                a["hits"] += hits
+                a["lat"] += lat
+                d = a["_instr"][instr]
+                d[0] += st
+                d[1] += idle
+                d[2] += hits
+                a["_class"][instr.split()[0] if instr else "?"] += st
+    out = {}
+    for fam, a in agg.items():
+        top = sorted(a["_instr"].items(), key=lambda kv: -kv[1][0])[:8]
+        byclass = sorted(a["_class"].items(), key=lambda kv: -kv[1])[:10]
+        out[fam] = {
+            "stall": a["stall"], "lat": a["lat"], "idle": a["idle"],
+            "hits": a["hits"], "n_disp": a["n_disp"],
+            "top": [{"i": i, "st": v[0], "idle": v[1], "hits": v[2]}
+                    for i, v in top],
+            "byclass": [[op, st] for op, st in byclass],
+        }
+    return out
 
 
 # --- GGUF weight-tensor table (stdlib; per-dispatch true-shape mapping) --------
@@ -514,10 +614,8 @@ def detect_boundaries(evs, gap_thr_ns):
     return kept
 
 
-def main():
-    ap = argparse.ArgumentParser(
-        description=__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter)
+def add_common_args(ap):
+    """Input + rendering flags shared by the generator (main) and serve.py."""
     ap.add_argument("--kernel-csv", required=True,
                     help="rocprofv3 *_kernel_trace.csv (GPU slices)")
     ap.add_argument("--hip-csv",
@@ -535,6 +633,14 @@ def main():
                     help="JSON of per-family memory-load instruction widths from "
                          "device disassembly (optional): shows per-lane load width "
                          "(b32=4B, d16=2B, ...) in the selected-kernel detail panel")
+    ap.add_argument("--att-dir",
+                    help="directory of DECODED rocprofv3 --att output (the "
+                         "stats_ui_output_*_dispatch_*.csv files, e.g. produced by "
+                         "collect-att.sh): folds per-instruction thread-trace stall "
+                         "cycles into the selected-kernel detail panel (total stall, "
+                         "dominant stall instruction, top stalling instructions, and "
+                         "stall grouped by opcode). ATT is a microscope -- one SIMD, "
+                         "a few dispatches -- so it only enriches families it traced.")
     ap.add_argument("--gguf",
                     help="GGUF model file (optional): order-maps each mul_mat_vec "
                          "decode dispatch to its GGUF weight tensor by execution "
@@ -543,13 +649,19 @@ def main():
                          "the detail panel -- so launch-grid vs true shape reveals "
                          "any output-row/reduction padding waste and the packed "
                          "weight bytes give a theoretical-vs-measured over-fetch ratio")
+    ap.add_argument("--build-dir",
+                    help="llama.cpp build dir (optional): baked into the "
+                         "copy-ready 'Trace this kernel with ATT' command in the "
+                         "detail panel as a full path, so the command runs as-is "
+                         "with no env vars to fill in. Falls back to a "
+                         "/path/to/... placeholder if omitted.")
     ap.add_argument("--arch", default=DEFAULT_ARCH,
                     help="GPU arch, selects peak DRAM BW for the roofline "
                          "(default %s = %g GB/s)"
                          % (DEFAULT_ARCH, PEAK_BW_GBS_BY_ARCH[DEFAULT_ARCH]))
     ap.add_argument("--peak-bw", type=float,
                     help="override peak DRAM bandwidth in GB/s (else from --arch)")
-    ap.add_argument("--out", required=True, help="output HTML path")
+    ap.add_argument("--out", help="output HTML path (required for the generator)")
     ap.add_argument("--tokens", type=int, default=2,
                     help="decode tokens to show in the viewport (default 2)")
     ap.add_argument("--skip-tokens", type=int, default=30,
@@ -561,8 +673,20 @@ def main():
                     help="inter-dispatch gap (us) that marks a token boundary "
                          "(default 150)")
     ap.add_argument("--title", default="rocprof unified viewer (gfx1151)")
-    args = ap.parse_args()
 
+
+def main():
+    ap = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    add_common_args(ap)
+    args = ap.parse_args()
+    if not args.out:
+        ap.error("--out is required")
+    write_overlay(args)
+
+
+def build_payload(args):
     peak_bw = peak_bw_for(args.arch, args.peak_bw)
     # Surface the peak next to the arch string in the title (e.g.
     # "... (gfx1151)" -> "... (gfx1151, 230 GB/s peak)").
@@ -611,6 +735,7 @@ def main():
     fetch_bytes, fetch_bytes_n = (load_fetch_bytes(args.fetch_csv)
                                   if args.fetch_csv else ({}, {}))
     loadwidth = load_loadwidth(args.loadwidth_json) if args.loadwidth_json else {}
+    att_by_fam = load_att_stats(args.att_dir) if args.att_dir else {}
 
     # Optional GGUF order-map: build the expected per-token matvec tensor sequence
     # in decode execution order. llama.cpp fuses the SwiGLU gate+up into one
@@ -621,7 +746,7 @@ def main():
         gguf_tensors, _ = load_gguf_tensors(args.gguf)
         # Reference token = the matvec N-stream between the first two boundaries in
         # the baked span (a full steady-state token).
-        ref = [n for (s, e, nm, n) in evs[bounds[args.skip_tokens]:
+        ref = [n for (s, e, nm, n, _nb) in evs[bounds[args.skip_tokens]:
                                           bounds[args.skip_tokens + 1]]
                if "mul_mat_vec" in nm and n]
         best = None
@@ -655,7 +780,7 @@ def main():
     fam_count = defaultdict(int)
     ei = 0
     mv_total = mv_mapped = 0
-    for idx, (s, e, name, ncol) in enumerate(baked):
+    for idx, (s, e, name, ncol, nblk) in enumerate(baked):
         if idx in tok_boundary_idx:
             ei = 0
         fam = family_of(name)
@@ -667,7 +792,7 @@ def main():
         busy_ns += dur
         fam_busy[fam] += dur
         fam_count[fam] += 1
-        sl = {"s": s - t0, "e": e - t0, "fam": fam, "stall": stall}
+        sl = {"s": s - t0, "e": e - t0, "fam": fam, "stall": stall, "blocks": nblk}
         if expected_seq and "mul_mat_vec" in name and ncol:
             mv_total += 1
             ent = expected_seq[ei] if ei < len(expected_seq) else None
@@ -771,6 +896,11 @@ def main():
             "accum_vgpr": finfo.get("regs", {}).get("accum_vgpr", 0),
             "sgpr": finfo.get("regs", {}).get("sgpr", 0),
             "scratch": finfo.get("regs", {}).get("scratch", 0),
+            # Tiling: static LDS/block (dynamic extern-shared not reported by the
+            # profiler), threads/block, and per-family mean block count.
+            "lds_static": finfo.get("regs", {}).get("lds", 0),
+            "wg": finfo.get("wg", 0),
+            "blocks": finfo.get("blocks", 0),
             # Wavefront size (Grid_Size / Wavefronts); computed in load_pmc_families.
             "wave": finfo.get("wave", 0),
             "kb_disp": round(b_disp / 1024.0, 1) if b_disp else 0,
@@ -790,12 +920,56 @@ def main():
                           "accum_vgpr": summary_i["accum_vgpr"],
                           "sgpr": summary_i["sgpr"],
                           "scratch": summary_i["scratch"],
+                          "lds_static": summary_i["lds_static"],
+                          "wg": summary_i["wg"],
+                          "blocks": summary_i["blocks"],
                           "wave": summary_i["wave"],
                           "kb_disp": summary_i["kb_disp"],
                           "mb_tok": summary_i["mb_tok"],
                           "bw_gbs": summary_i["bw_gbs"], "bw_pct": summary_i["bw_pct"],
                           "loadw": summary_i["loadw"]}
                     for summary_i, fam in ((s, s["fam"]) for s in summary)}
+
+    # Bake a copy-ready ATT command for the detail panel using FULL PATHS and no
+    # env vars, so it runs as-is. collect-att.sh lives next to this script; the
+    # regen command reconstructs the exact flags used here (abspath'd) minus
+    # --att-dir/--out, which the JS appends per selected kernel.
+    _self_dir = os.path.dirname(os.path.abspath(__file__))
+    _out = args.out or "overlay.html"
+    regen_parts = ["--kernel-csv " + os.path.abspath(args.kernel_csv)]
+    if args.hip_csv:
+        regen_parts.append("--hip-csv " + os.path.abspath(args.hip_csv))
+    if args.pmc_csv:
+        regen_parts.append("--pmc-csv " + os.path.abspath(args.pmc_csv))
+    if args.fetch_csv:
+        regen_parts.append("--fetch-csv " + os.path.abspath(args.fetch_csv))
+    if args.loadwidth_json:
+        regen_parts.append("--loadwidth-json " + os.path.abspath(args.loadwidth_json))
+    if args.gguf:
+        regen_parts.append("--gguf " + os.path.abspath(args.gguf))
+    if args.arch != DEFAULT_ARCH:
+        regen_parts.append("--arch " + args.arch)
+    if args.peak_bw:
+        regen_parts.append("--peak-bw %g" % args.peak_bw)
+    if args.tokens != 2:
+        regen_parts.append("--tokens %d" % args.tokens)
+    if args.skip_tokens != 30:
+        regen_parts.append("--skip-tokens %d" % args.skip_tokens)
+    if args.context_tokens:
+        regen_parts.append("--context-tokens %d" % args.context_tokens)
+    if args.gap_threshold_us != 150.0:
+        regen_parts.append("--gap-threshold-us %g" % args.gap_threshold_us)
+    att_cmd = {
+        "script": os.path.join(_self_dir, "collect-att.sh"),
+        "build_dir": os.path.abspath(args.build_dir) if args.build_dir
+                     else "/path/to/llamacpp-build",
+        "model": os.path.abspath(args.gguf) if args.gguf
+                 else "/path/to/model.gguf",
+        "out_base": os.path.dirname(os.path.abspath(_out)),
+        "viewer": os.path.abspath(__file__),
+        "regen_flags": " \\\n  ".join(regen_parts),
+        "out_html": os.path.abspath(_out),
+    }
 
     payload = {
         "title": title,
@@ -817,25 +991,51 @@ def main():
         "has_cpu": bool(cpu_slices),
         "has_bw": bool(fetch_bytes),
         "has_loadw": bool(loadwidth),
+        "att_by_fam": att_by_fam,
+        "has_att": bool(att_by_fam),
+        "att_cmd": att_cmd,
+        # Live-tracing mode: false for the static export; serve.py flips this true
+        # so the client shows a "Trace now" button instead of the copy command.
+        "att_server": False,
         "has_map": bool(expected_seq),
         "map_stats": map_stats,
         "peak_bw_gbs": peak_bw,
+        # gfx1151 (RDNA3.5) scheduling constants for the modeled occupancy row.
+        # 20 WGP; each WGP = 2 CU = 4 SIMD32; each SIMD32 holds 16 wave32 slots
+        # and a 1536-entry VGPR file (wave32); 128 KB LDS shared per WGP.
+        "hw": {"wgp": 20, "simd_per_wgp": 4, "slots_per_simd": 16,
+               "vgpr_per_simd": 1536, "lds_per_wgp": 131072},
     }
+    return payload
 
+
+def write_overlay(args):
+    payload = build_payload(args)
     html = render_html(payload)
     with open(args.out, "w") as f:
         f.write(html)
     print(f"wrote {args.out}", file=sys.stderr)
-    print(f"  baked {ntok_baked} tokens ({len(gpu_slices)} GPU slices, "
-          f"{len(cpu_slices)} CPU calls); viewport shows {args.tokens} tokens.",
+    print(f"  baked {payload['n_tokens_baked']} tokens ({len(payload['gpu'])} GPU "
+          f"slices, {len(payload['cpu'])} CPU calls); viewport shows "
+          f"{payload['tokens_view']} tokens.", file=sys.stderr)
+    print(f"  window busy {payload['busy_ns']/1e6:.3f} ms / span "
+          f"{payload['span_ns']/1e6:.3f} ms "
+          f"({payload['busy_ns']/payload['span_ns']*100:.1f}% GPU-busy)",
           file=sys.stderr)
-    print(f"  window busy {busy_ns/1e6:.3f} ms / span {span_ns/1e6:.3f} ms "
-          f"({busy_ns/span_ns*100:.1f}% GPU-busy)", file=sys.stderr)
-    if map_stats:
-        print(f"  gguf order-map: {map_stats['mapped']}/{map_stats['total']} "
+    ms = payload['map_stats']
+    if ms:
+        print(f"  gguf order-map: {ms['mapped']}/{ms['total']} "
               f"matvec dispatches N-matched to weights "
-              f"({map_stats['pct']:.1f}%); expected seq len "
-              f"{map_stats['seq_len']}/token", file=sys.stderr)
+              f"({ms['pct']:.1f}%); expected seq len "
+              f"{ms['seq_len']}/token", file=sys.stderr)
+    ab = payload['att_by_fam']
+    if ab:
+        fams_str = ", ".join("%s (%d disp)" % (f, a["n_disp"])
+                             for f, a in sorted(ab.items(),
+                                                key=lambda kv: -kv[1]["stall"]))
+        print(f"  att thread-trace folded into {len(ab)} "
+              f"famil{'y' if len(ab)==1 else 'ies'}: {fams_str}",
+              file=sys.stderr)
 
 
 def render_html(payload):
@@ -941,7 +1141,7 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
 const D = __DATA__;
 const cv = document.getElementById('cv');
 const ctx = cv.getContext('2d');
-const CPU_H = 70, GPU_H = 150, PAD_T = 8, GAP = 26, AXIS_H = 22;
+const CPU_H = 70, GPU_H = 70, PAD_T = 8, GAP = 26, AXIS_H = 22;
 const H = PAD_T + CPU_H + GAP + GPU_H + AXIS_H;
 let view0 = D.tok_starts[D.view_i0];
 let view1 = D.tok_starts[D.view_i1];
@@ -959,6 +1159,26 @@ function fmtLoads(m){
   const ks=Object.keys(m||{}).map(Number).sort((a,b)=>b-a);
   if(!ks.length) return '-';
   return ks.map(k=>`${m[k]}x${k}B`).join(' + ');
+}
+// cycle counts: 199587 -> "199.6k", 1.2e6 -> "1.2M"
+function fmtc(n){n=+n||0;return n>=1e6?(n/1e6).toFixed(1)+'M':n>=1e3?(n/1e3).toFixed(1)+'k':(''+n);}
+function esc(s){return (''+s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+// Copy text to clipboard with a file:// fallback (navigator.clipboard is often
+// unavailable when the HTML is opened from disk, so fall back to a hidden
+// textarea + execCommand). Flashes the sibling #attcopied on success.
+function copyCmd(text){
+  const done=()=>{const m=document.getElementById('attcopied');
+    if(m){m.style.display='inline';setTimeout(()=>m.style.display='none',1500);}};
+  if(navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(text).then(done,()=>fallbackCopy(text,done));
+  } else { fallbackCopy(text,done); }
+}
+function fallbackCopy(text,done){
+  const ta=document.createElement('textarea');
+  ta.value=text; ta.style.position='fixed'; ta.style.opacity='0';
+  document.body.appendChild(ta); ta.select();
+  try{ if(document.execCommand('copy')) done(); }catch(e){}
+  document.body.removeChild(ta);
 }
 
 document.getElementById('title').textContent = D.title;
@@ -995,6 +1215,30 @@ window.addEventListener('resize', resize);
 
 function xOf(ns, w){ return (ns - view0) / (view1 - view0) * w; }
 
+// Pick a crisp text color (dark or white) for legibility over a given box fill,
+// by perceived luminance -- avoids a blurry outline while keeping contrast.
+function textOn(bg){
+  const m=/^#?([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(bg||'');
+  if(!m) return '#fff';
+  const r=parseInt(m[1],16), g=parseInt(m[2],16), b=parseInt(m[3],16);
+  return (0.299*r+0.587*g+0.114*b) > 140 ? '#111' : '#fff';
+}
+
+// Draw a slice's name INSIDE its box, but only when the box is wide enough to
+// hold the whole name (no clipping/ellipsis). Plain fillText (no outline) so it
+// renders as crisply as the axis/token labels; inherits the box's globalAlpha.
+function boxLabel(label, x, wpx, midY, bg){
+  if (wpx < 14) return;                       // too thin to bother measuring
+  ctx.font = '10px sans-serif';
+  const tw = ctx.measureText(label).width;
+  if (tw + 8 > wpx) return;                    // name would not fully fit
+  const prevBaseline = ctx.textBaseline;
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = textOn(bg);
+  ctx.fillText(label, x+4, midY);
+  ctx.textBaseline = prevBaseline;
+}
+
 function draw(){
   const w = cv.clientWidth;
   ctx.clearRect(0,0,w,H);
@@ -1023,8 +1267,10 @@ function draw(){
     const wpx = Math.max(1, x2-x);
     const isSel = selectedFam && s.fam===selectedFam;
     ctx.globalAlpha = (selectedFam && !isSel) ? 0.25 : 1.0;
-    ctx.fillStyle = D.colors[s.stall] || D.colors.unknown;
+    const gcol = D.colors[s.stall] || D.colors.unknown;
+    ctx.fillStyle = gcol;
     ctx.fillRect(x, gpuY+4, wpx, GPU_H-8);
+    boxLabel(s.fam, x, wpx, gpuY + GPU_H/2, gcol);
     ctx.globalAlpha = 1.0;
     if(isSel){ ctx.strokeStyle='#ffffff'; ctx.lineWidth=1.5;
       ctx.strokeRect(x+0.5, gpuY+4.5, Math.max(1,wpx-1), GPU_H-9); ctx.lineWidth=1; }
@@ -1042,10 +1288,12 @@ function draw(){
     if (c.e < view0 || c.s > view1) continue;
     const x = xOf(c.s,w), x2 = xOf(c.e,w);
     const wpx = Math.max(1, x2-x);
-    ctx.fillStyle = c.name.indexOf('Graph')>=0 ? '#5fa8d3' :
-                    c.name.indexOf('Memcpy')>=0 ? '#c9a227' :
-                    c.name.indexOf('Synchronize')>=0 ? '#7a6f9b' : '#4a6070';
+    const ccol = c.name.indexOf('Graph')>=0 ? '#5fa8d3' :
+                 c.name.indexOf('Memcpy')>=0 ? '#c9a227' :
+                 c.name.indexOf('Synchronize')>=0 ? '#7a6f9b' : '#4a6070';
+    ctx.fillStyle = ccol;
     ctx.fillRect(x, cpuY+4, wpx, CPU_H-8);
+    boxLabel(c.name, x, wpx, cpuY + CPU_H/2, ccol);
     rects.push({x:x,y:cpuY+4,w:wpx,h:CPU_H-8,type:'cpu',p:c});
   }
 
@@ -1280,17 +1528,57 @@ function renderSelectedKernel(){
        `<tr><td>L2 hit</td><td>${fc.l2}%</td></tr>`+
        `<tr><td>Occupancy</td><td>${fc.occ}%</td></tr>`+
        `<tr><td>LDS bank conflict</td><td>${fc.lds}</td></tr>`+
-       `<tr><td>WriteUnitStalled</td><td>${fc.wr}</td></tr>`+
-       `<tr><td>Wavefronts</td><td>${fc.wav}</td></tr>`+
-       `<tr><td>dominant stall</td><td style="color:${D.colors[s.stall]};font-weight:600">${s.stall}</td></tr>`;
+       `<tr><td>WriteUnitStalled</td><td>${fc.wr}</td></tr>`;
     if(fc.ea) h+=`<tr><td>EA (DRAM iface) busy</td><td>${fc.ea}%</td></tr>`;
     if(fc.alu) h+=`<tr><td>ALU (VALU) busy</td><td>${fc.alu}%</td></tr>`;
     if(fc.vgpr) h+=`<tr><td>VGPR / SGPR</td><td>${fc.vgpr} / ${fc.sgpr}`+
        (fc.accum_vgpr?` (+${fc.accum_vgpr} accum)`:``)+`</td></tr>`;
-    if(fc.wave) h+=`<tr><td>wavefront size</td><td>wave${fc.wave} `+
-       `<span class="r">(grid / wavefronts)</span></td></tr>`;
     const sc=fc.scratch||0;
     h+=`<tr><td>scratch size</td><td>${sc>=1024?(sc/1024).toFixed(1)+' KB':sc+' B'}</td></tr>`;
+    // ---- tiling / scheduling ----
+    if(fc.wg){
+      const W = fc.wave ? Math.round(fc.wg/fc.wave) : 0;   // waves per block
+      const L = fc.lds_static||0;
+      h+=`<tr><td colspan="2" style="color:var(--dim);padding-top:8px;`+
+         `text-transform:uppercase;font-size:10px;letter-spacing:.5px">tiling / scheduling</td></tr>`;
+      const nblk = s.blocks || 0;
+      if(nblk)
+        h+=`<tr><td>grid</td><td>${nblk} blocks <span class="r">(this dispatch)</span></td></tr>`;
+      h+=`<tr><td>block (workgroup)</td><td>${fc.wg} threads`+
+         (W?` = ${W} wave${fc.wave}`:``)+`</td></tr>`;
+      // Wavefronts for THIS dispatch = grid blocks x waves-per-block (exact: the
+      // hw counter is just grid_size/wave_size). Derived from this slice's grid so
+      // it tracks the selected dispatch, not the useless per-family mean.
+      if(nblk && W)
+        h+=`<tr><td>wavefronts</td><td>${nblk*W} `+
+           `<span class="r">(${nblk} blocks x ${W} wave${fc.wave})</span></td></tr>`;
+      h+=`<tr><td>LDS / block</td><td>${L>=1024?(L/1024).toFixed(1)+' KB':L+' B'}`+
+         (L===0?` <span class="r">(static; dynamic extern-shared not profiled)</span>`:``)+`</td></tr>`;
+      // Tier 2: modeled occupancy limiter (gfx1151 wave32).
+      const hw=D.hw;
+      if(hw && W){
+        const slotsWGP=hw.simd_per_wgp*hw.slots_per_simd;   // 64 wave32
+        const vgprWGP =hw.simd_per_wgp*hw.vgpr_per_simd;    // 6144
+        const V=fc.vgpr||1;
+        const bSlots=Math.floor(slotsWGP/W);
+        const bVgpr =Math.floor(vgprWGP/(W*V));
+        const bLds  =L>0?Math.floor(hw.lds_per_wgp/L):Infinity;
+        let lim='slots', resid=bSlots;
+        if(bVgpr<resid){lim='VGPR';resid=bVgpr;}
+        if(bLds<resid){lim='LDS';resid=bLds;}
+        if(resid>0){
+          const theo=Math.round(resid*W/slotsWGP*100);
+          const chip=resid*hw.wgp;
+          h+=`<tr><td>resident / WGP</td><td>${resid} block${resid!==1?'s':''} `+
+             `<span class="r">(${lim}-bound; modeled gfx1151 wave32)</span></td></tr>`;
+          h+=`<tr><td>occupancy (modeled)</td><td>theo ~${theo}%`+
+             (fc.occ?` &middot; achieved ${fc.occ}%`:``)+`</td></tr>`;
+          if(nblk)
+            h+=`<tr><td>rounds to drain</td><td>~${Math.ceil(nblk/chip)} `+
+               `<span class="r">(${nblk} blocks / ${chip} chip-resident)</span></td></tr>`;
+        }
+      }
+    }
   }
   if(D.has_loadw && fc.loadw){
     const lw=fc.loadw;
@@ -1318,7 +1606,118 @@ function renderSelectedKernel(){
      `order-mapped (GGUF present), over-fetch is <b>per-weight exact</b> even for weights `+
      `sharing an N; otherwise it falls back to a family+N average (separate PMC run) that `+
      `blends weights of the same N.</div>`;
+  // ---- ATT thread-trace stall overlay (folded in via --att-dir) ----
+  const at=(D.att_by_fam||{})[s.fam];
+  if(at){
+    const tot=at.stall||1;
+    h+=`<div style="margin-top:12px;padding:8px 10px;border-left:3px solid #ff9d5c;`+
+       `background:rgba(255,157,92,.07);border-radius:3px">`+
+       `<b style="color:#ff9d5c">ATT thread-trace stalls</b> `+
+       `<span class="r">(${at.n_disp} dispatch${at.n_disp!==1?'es':''}, ~1 SIMD; `+
+       `${fmtc(at.stall)} stall / ${fmtc(at.lat)} latency / ${fmtc(at.idle)} idle cyc)</span>`;
+    if(at.top && at.top.length){
+      h+=`<table style="margin-top:6px"><thead><tr>`+
+         `<th style="text-align:left">instruction</th>`+
+         `<th style="text-align:right">stall</th><th style="text-align:right">% stall</th>`+
+         `<th style="text-align:right">idle</th><th style="text-align:right">hits</th>`+
+         `</tr></thead><tbody>`;
+      for(const t of at.top){
+        const pct=100*t.st/tot;
+        h+=`<tr><td style="font-family:monospace;color:#d7dde5">${esc(t.i)}</td>`+
+           `<td style="text-align:right">${fmtc(t.st)}</td>`+
+           `<td style="text-align:right;color:${pct>=25?'#ff6b6b':'#c8d0da'}">${pct.toFixed(1)}%</td>`+
+           `<td style="text-align:right">${fmtc(t.idle)}</td>`+
+           `<td style="text-align:right">${fmtc(t.hits)}</td></tr>`;
+      }
+      h+=`</tbody></table>`;
+    }
+    if(at.byclass && at.byclass.length)
+      h+=`<div class="r" style="margin-top:6px">stall by opcode: `+
+         at.byclass.map(c=>`${esc(c[0])} ${fmtc(c[1])}`).join(' &middot; ')+`</div>`;
+    h+=`<div class="sub" style="margin-top:4px">Per-instruction cycles from the decoded `+
+       `ATT trace of this kernel family. <b>stall</b> = cycles the wave was blocked at that `+
+       `PC (e.g. <code>s_waitcnt vmcnt</code> = waiting on a global-memory load, so a matvec `+
+       `dominated by it is memory-bound). Sampled on ~1 SIMD across ${at.n_disp} `+
+       `dispatch${at.n_disp!==1?'es':''} -- a representative profile, not a full-GPU count.`+
+       `</div></div>`;
+  }
+  // ---- "Trace this kernel with ATT" -- copy-ready command (Option A round-trip) ----
+  const sym=s.fam.replace(/\[.*$/,'');
+  const ac=D.att_cmd||{};
+  const outdir=(ac.out_base||'.')+'/att-'+sym;
+  const cmd=
+    `# on the gfx1151 board (local ROCm): trace just this kernel with ATT\n`+
+    `${ac.script} --kernel '${sym}' \\\n`+
+    `  --build-dir ${ac.build_dir} \\\n`+
+    `  --model ${ac.model} \\\n`+
+    `  --out-dir ${outdir}\n`+
+    `# then regenerate this overlay with the decoded trace folded in:\n`+
+    `python3 ${ac.viewer} \\\n`+
+    `  ${ac.regen_flags} \\\n`+
+    `  --att-dir ${outdir} --out ${ac.out_html}`;
+  const liveBtn = D.att_server
+    ? `<button id="atttrace" style="cursor:pointer;background:#1f5c34;color:#e6f5ea;`+
+      `border:1px solid #2f7d48;border-radius:3px;padding:1px 8px;font-size:11px;`+
+      `margin-left:6px">Trace now</button>`+
+      `<span id="attstatus" class="r" style="margin-left:8px;color:#c8d0da;display:none"></span>`
+    : ``;
+  h+=`<div style="margin-top:12px;padding:8px 10px;border:1px dashed var(--dim);border-radius:3px">`+
+     `<b>Trace this kernel with ATT</b> `+
+     `<button id="attcopy" style="cursor:pointer;background:#2a3340;color:#d7dde5;`+
+     `border:1px solid #3a4553;border-radius:3px;padding:1px 8px;font-size:11px">copy</button>`+
+     liveBtn+
+     `<span id="attcopied" class="r" style="margin-left:8px;color:#8fe388;display:none">copied</span>`+
+     `<pre style="margin:6px 0 0;padding:7px 9px;background:#0d1117;border-radius:3px;`+
+     `overflow:auto;white-space:pre;font-size:11px;color:#c8d0da">${esc(cmd)}</pre>`+
+     (at?``:`<div class="sub">No ATT data loaded for this kernel yet -- `+
+       (D.att_server
+         ? `click <b>Trace now</b> to dispatch ATT to a free GPU board over ssh and fold `+
+           `the result in live, or `
+         : ``)+
+       `run the command above on the board, then re-run the viewer with `+
+       `<code>--att-dir</code> to see per-instruction stalls here. (ATT filters by kernel `+
+       `<i>symbol</i>, so it captures every quant/shape variant of `+
+       `<code>${esc(sym)}</code>.)</div>`)+
+     `</div>`;
   dp.innerHTML=h; dp.style.display='block';
+  const cp=document.getElementById('attcopy');
+  if(cp) cp.onclick=()=>copyCmd(cmd);
+  const tb2=document.getElementById('atttrace');
+  if(tb2) tb2.onclick=()=>traceKernelLive(sym, s.fam);
+}
+
+// POST to the companion server to run ATT on a free GPU board and fold the result in
+async function traceKernelLive(sym, fam){
+  const btn=document.getElementById('atttrace');
+  const st=document.getElementById('attstatus');
+  if(!btn||!st) return;
+  btn.disabled=true; st.style.display='inline';
+  st.style.color='#c8d0da'; st.textContent='dispatching to a free GPU board... (~30-90s)';
+  try{
+    const r=await fetch('/api/trace',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({kernel:sym})});
+    const j=await r.json().catch(()=>({}));
+    if(r.status===409){
+      st.style.color='#e0b341';
+      st.textContent=j.error||'a trace is already running -- try again shortly';
+      btn.disabled=false; return;
+    }
+    if(!r.ok||!j.ok){
+      st.style.color='#ff6b6b';
+      st.textContent='trace failed: '+(j.error||('HTTP '+r.status));
+      btn.disabled=false; return;
+    }
+    // fold every returned family into the cache (ATT captures all variants of the symbol)
+    D.att_by_fam=D.att_by_fam||{};
+    let n=0;
+    for(const k in j.fam_stats){ D.att_by_fam[k]=j.fam_stats[k]; n++; }
+    st.style.color='#8fe388';
+    st.textContent='traced on '+(j.host||'board')+' -- '+n+' famil'+(n===1?'y':'ies')+' folded in';
+    renderSelectedKernel();
+  }catch(e){
+    st.style.color='#ff6b6b'; st.textContent='trace error: '+e; btn.disabled=false;
+  }
 }
 tb.querySelectorAll('tr').forEach(tr=>{
   tr.onclick=()=>setSelection(selectedFam===tr.dataset.fam ? null : tr.dataset.fam);

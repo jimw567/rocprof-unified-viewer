@@ -70,6 +70,10 @@ Outputs land under `./run/{trace,stall,fetch}/<host>/*.csv` and
 `./run/loadwidth.json`. `collect.sh` prints the exact `rocprof-unified-viewer`
 command to run next.
 
+For the optional per-instruction stall layer, [`collect-att.sh`](collect-att.sh)
+captures + decodes a single kernel's thread trace (`--att-dir` input); see
+[ATT thread-trace stalls](#att-thread-trace-stalls---att-dir).
+
 ### By hand
 
 The four rocprofv3 invocations `collect.sh` wraps are, roughly:
@@ -115,7 +119,8 @@ rocprof-unified-viewer \
 Only `--kernel-csv` and `--out` are required; every other input is optional and
 adds a layer (`--hip-csv` = CPU lane, `--pmc-csv` = stall coloring, `--fetch-csv`
 = achieved-bandwidth column, `--loadwidth-json` = per-lane load width in the
-detail panel, `--gguf` = per-dispatch weight-tensor identity + padding/over-fetch).
+detail panel, `--gguf` = per-dispatch weight-tensor identity + padding/over-fetch,
+`--att-dir` = per-instruction thread-trace stalls in the detail panel).
 Then just open `overlay.html` -- it is fully self-contained.
 
 ### GGUF weight mapping (`--gguf`)
@@ -138,6 +143,101 @@ whichever candidate best matches the trace. On Qwen3.5-4B-Q4_K_M (gfx1151) the m
 The mapping % is shown in the header; the parser is stdlib-only (mmap, no `gguf` pip
 dep) and only walks the tensor-info table (never reads the 2+GB of weights).
 
+### ATT thread-trace stalls (`--att-dir`)
+
+The PMC layer tells you a kernel family is (say) memory-bound in aggregate; ATT
+(Advanced Thread Trace) tells you **which instruction the waves are stalled on,
+cycle by cycle**. Point `--att-dir` at a directory of *decoded* rocprofv3 `--att`
+output (the `stats_ui_output_*_dispatch_*.csv` files) and the selected-kernel
+detail panel gains an **ATT thread-trace stalls** section: total stall / latency /
+idle cycles, the top stalling instructions (with % of stall), and stall grouped by
+opcode. A matvec dominated by `s_waitcnt vmcnt` is waiting on global-memory loads
+= bandwidth-bound; a large `ds_`/`lgkmcnt` share points at LDS; a VALU-heavy tail
+that isn't hidden under memory latency is a dequant-cost lever.
+
+ATT is a **microscope**: rocprofv3 instruments ~1 CU/SIMD for a few dispatches, so
+it only enriches the kernel families it actually traced (treat the numbers as a
+representative profile, not a full-GPU count). Because you trace one kernel at a
+time, the workflow is: **click a kernel in the overlay** -> its detail panel prints
+the exact `collect-att.sh --kernel '<symbol>'` command (with a copy button) ->
+run that on the board -> re-run the viewer with `--att-dir <out>` to fold the
+decoded trace back into the same view. (The static HTML can't SSH itself, so it
+hands you the command rather than running it -- see [`collect-att.sh`](collect-att.sh).)
+The printed command uses **full paths and no env vars**, so it runs as-is: pass
+`--build-dir` (and `--gguf` for the model) when generating the overlay and they are
+baked into the command; the regen line reproduces the exact flags you used.
+
+```bash
+# on the gfx1151 board: trace one kernel (the overlay prints this line for you)
+./collect-att.sh --kernel 'mul_mat_vec_q_wvsplitk' \
+    --build-dir /path/to/build --model model.gguf --out-dir att-wvsplitk
+# then regenerate the overlay with the decoded stalls folded in
+rocprof-unified-viewer <existing flags> --att-dir att-wvsplitk --out overlay.html
+```
+
+ATT filters by kernel **symbol**, so a trace of `mul_mat_vec_q` captures every
+quant/shape variant of it; the viewer keys the folded stalls by the same family
+name (quant suffix included) as the rest of the overlay, so they line up.
+
+### Live tracing (companion server)
+
+The copy-paste ATT round-trip above works but is clunky. `serve.py` closes the
+loop: run it **on your workstation**, open the served page, click a kernel, hit
+**Trace now**, and the ATT trace runs on a GPU board and folds into the detail
+panel live -- no copy-paste, no regenerate.
+
+```bash
+# a colon-separated list of GPU boards to dispatch ATT to (NOT in the repo --
+# put this in your shell profile; no hostname is ever hardcoded in the code)
+export ROCPROF_ATT_HOSTS="board-a:board-b:board-c"
+export ROCM_DIR=/path/to/rocm          # board-side ROCm (drives rocprofv3 + rocm-smi)
+export ROCPROF_ATT_OUT_BASE=/nfs/scratch/att   # dir shared between workstation + boards
+
+rocprof-unified-viewer-serve \
+    --kernel-csv     run/trace/<host>/*_kernel_trace.csv \
+    --hip-csv        run/trace/<host>/*_hip_api_trace.csv \
+    --pmc-csv        run/stall/<host>/*_counter_collection.csv \
+    --fetch-csv      run/fetch/<host>/*_counter_collection.csv \
+    --loadwidth-json run/loadwidth.json \
+    --gguf           model.gguf \
+    --build-dir      /path/to/llamacpp-build
+# then open http://localhost:8756
+```
+
+How it works and why it is safe:
+
+- **The server runs locally; only GPU work goes to a board.** The web server
+  binds `127.0.0.1` only. When you click **Trace now**, it picks a board from
+  `$ROCPROF_ATT_HOSTS` whose GPU is idle (`ssh <host> rocm-smi --showuse`,
+  free = use `<= --busy-threshold`, default 10%), pipes the repo's current
+  `collect-att.sh` over `ssh <host> bash -s` to run ATT there, then reads the
+  decoded CSVs straight off shared NFS (`$ROCPROF_ATT_OUT_BASE`) -- no scp.
+- **No hardcoded hostnames.** The board list lives entirely in the environment
+  variable; nothing host-specific is committed.
+- **Only real kernels are traceable.** The requested symbol must exactly match a
+  kernel family already in the loaded trace (allowlist); the ssh argv is built as
+  a list with the symbol `shlex`-quoted (never `shell=True`).
+- **One trace at a time.** The board GPU + ATT is exclusive, so a second request
+  while one is running gets `409 busy`; the page stays responsive meanwhile.
+- **The static export path is unchanged.** Opened as a plain file, the overlay
+  behaves exactly as before -- **Trace now** only appears when served.
+
+For GPU-free testing, `--stub-att-dir DIR` returns `load_att_stats(DIR)` for
+every trace request instead of ssh-ing to a board, exercising the whole
+click -> trace -> fold loop against an existing decoded `--att-dir`.
+
+| Flag (serve.py, in addition to the viewer flags) | Default | Meaning |
+| --- | --- | --- |
+| `--port` | `8756` | localhost port to serve on |
+| `--hosts-env` | `ROCPROF_ATT_HOSTS` | env var holding the colon-separated board list |
+| `--model` | (`--gguf`) | GGUF model to run under ATT on the board |
+| `--rocm` | `$ROCM_DIR` | board-side ROCm dir (rocprofv3 + rocm-smi) |
+| `--out-base` | `$ROCPROF_ATT_OUT_BASE` | NFS scratch base for `att-<sym>/` trace dirs |
+| `--busy-threshold` | `10` | GPU use% at/under which a host counts as free |
+| `--bench-flags` | `-fa 1` | llama-bench flags passed to collect-att.sh |
+| `--trace-timeout` | `300` | seconds to wait for a board ATT trace |
+| `--stub-att-dir` | - | GPU-free testing: return `load_att_stats(DIR)` per request |
+
 ### CLI reference (viewer)
 
 | Flag | Default | Meaning |
@@ -147,7 +247,9 @@ dep) and only walks the tensor-info table (never reads the 2+GB of weights).
 | `--pmc-csv` | - | `*_counter_collection.csv` stall counters (coloring) |
 | `--fetch-csv` | - | `*_counter_collection.csv` FETCH_SIZE (achieved BW) |
 | `--loadwidth-json` | - | per-family load widths from `disasm_loadwidth.py` |
+| `--att-dir` | - | decoded rocprofv3 `--att` dir: per-instruction stalls in detail panel |
 | `--gguf` | - | GGUF model: order-map matvec dispatch -> weight (shape/pad/over-fetch) |
+| `--build-dir` | - | llama.cpp build dir: baked into the detail-panel ATT command as a full path (no env vars to fill in) |
 | `--arch` | `gfx1151` | selects peak DRAM BW for the roofline |
 | `--peak-bw` | (from arch) | override peak DRAM bandwidth in GB/s |
 | `--out` | (required) | output HTML path |

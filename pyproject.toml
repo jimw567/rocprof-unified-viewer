@@ -14,7 +14,8 @@ dependencies = []
 
 [project.scripts]
 rocprof-unified-viewer = "rocprof_unified_viewer:main"
+rocprof-unified-viewer-serve = "serve:main"
 rocprof-disasm-loadwidth = "disasm_loadwidth:main"
 
 [tool.setuptools]
-py-modules = ["rocprof_unified_viewer", "disasm_loadwidth"]
+py-modules = ["rocprof_unified_viewer", "serve", "disasm_loadwidth"]

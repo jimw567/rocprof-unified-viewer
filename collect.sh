@@ -26,7 +26,7 @@
 #     builds SIGSEGV during FETCH_SIZE collection.
 set -euo pipefail
 
-ROCM_DIR="${ROCM_DIR:-/proj/gdba/jimwu/rocm/tmp/rocm-0715/rocm}"
+ROCM_DIR="${ROCM_DIR:-}"
 BUILD_DIR=""
 MODEL=""
 OUT_DIR=""
@@ -51,8 +51,8 @@ Usage: collect.sh --build-dir DIR --model M.gguf --out-dir DIR [opts] [-- llama-
                       <out>/stall/<host>/*_counter_collection.csv
                       <out>/fetch/<host>/*_counter_collection.csv
                       <out>/loadwidth.json
-  --rocm DIR        ROCm install to drive rocprofv3 (default: \$ROCM_DIR =
-                    $ROCM_DIR).
+  --rocm DIR        ROCm install to drive rocprofv3 (default: \$ROCM_DIR${ROCM_DIR:+ =
+                    $ROCM_DIR}). REQUIRED (via flag or \$ROCM_DIR).
   -n N              Decode tokens for the sys-trace run (default: $NTOK).
   --pmc-n N         Decode tokens for the PMC runs (default: $PMC_NTOK; keep small,
                     PMC replays every kernel once per counter-set pass).
@@ -92,6 +92,7 @@ done
 [ -n "$BUILD_DIR" ] || { echo "ERROR: --build-dir required" >&2; usage >&2; exit 1; }
 [ -n "$MODEL" ]     || { echo "ERROR: --model required" >&2; exit 1; }
 [ -n "$OUT_DIR" ]   || { echo "ERROR: --out-dir required" >&2; exit 1; }
+[ -n "$ROCM_DIR" ]  || { echo "ERROR: ROCm dir required: set --rocm DIR or \$ROCM_DIR" >&2; exit 1; }
 [ -x "$BUILD_DIR/llama-bench" ] || { echo "ERROR: no llama-bench in $BUILD_DIR" >&2; exit 1; }
 [ -f "$MODEL" ]     || { echo "ERROR: model not found: $MODEL" >&2; exit 1; }
 
