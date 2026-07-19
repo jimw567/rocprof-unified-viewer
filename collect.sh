@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 # collect.sh -- produce every input rocprof-unified-viewer needs, in one shot,
-# on a gfx1151 board. Runs llama-bench under rocprofv3 three times:
+# on a gfx1151 board. First runs llama-bench CLEAN (no rocprofv3) for the honest
+# untraced tok/s, then runs it under rocprofv3 three times:
 #
+#   0. clean run     -> clean_tps.txt  (untraced baseline tok/s; rocprofv3 adds
+#                       overhead -- sys-trace instruments every dispatch, PMC
+#                       replays kernels -- so the traced runs' tok/s is NOT the
+#                       real throughput. This bare run is the number to quote.)
 #   1. --sys-trace   -> *_kernel_trace.csv + *_hip_api_trace.csv  (shared clock,
 #                       so the CPU and GPU lanes overlay)
 #   2. --pmc <stall> -> *_counter_collection.csv  (per-family stall coloring)
@@ -30,7 +35,7 @@ ROCM_DIR="${ROCM_DIR:-}"
 BUILD_DIR=""
 MODEL=""
 OUT_DIR=""
-NTOK=8
+NTOK=64
 PMC_NTOK=2
 KERNEL_REGEX=""
 # Stall-classification counters + raw cycle counters for two derived ratios the
@@ -47,6 +52,7 @@ Usage: collect.sh --build-dir DIR --model M.gguf --out-dir DIR [opts] [-- llama-
   --build-dir DIR   Directory containing llama-bench + libggml-hip.so* (required).
   --model PATH      GGUF model file (required).
   --out-dir DIR     Where inputs are written (required). Layout:
+                      <out>/clean_tps.txt  (untraced baseline tok/s)
                       <out>/trace/<host>/*_kernel_trace.csv, *_hip_api_trace.csv
                       <out>/stall/<host>/*_counter_collection.csv
                       <out>/fetch/<host>/*_counter_collection.csv
@@ -69,6 +75,7 @@ After it finishes, feed the paths to the viewer:
     --pmc-csv    <out>/stall/<host>/*_counter_collection.csv \\
     --fetch-csv  <out>/fetch/<host>/*_counter_collection.csv \\
     --loadwidth-json <out>/loadwidth.json \\
+    --clean-tps-file <out>/clean_tps.txt \\
     --out overlay.html --tokens 2
 EOF
 }
@@ -122,8 +129,19 @@ run_ok() { # $1=glob under dir  $2=dir  $3..=command
   [ "$rc" -eq 0 ] || echo "NOTE: rocprofv3 exited rc=$rc (csv written; harmless postprocess crash)"
 }
 
+# --- 0. clean run: no rocprofv3, so the tok/s is the honest untraced throughput.
+# rocprofv3 (even --sys-trace) perturbs timing; PMC replays kernels and is far
+# worse. Same LD_LIBRARY_PATH as the traced runs so it exercises the same libs.
+echo "=== [0/5] clean run (no rocprofv3) -> untraced tok/s (-n $NTOK) ==="
+( cd "$BUILD_DIR"
+  LD_LIBRARY_PATH="$BUILD_DIR:$ROCM_LIBS:${LD_LIBRARY_PATH:-}" \
+    ./llama-bench -m "$MODEL" -p 0 -n "$NTOK" "${EXTRA[@]}" ) \
+    | tee "$OUT_DIR/clean_tps.txt"
+echo "Wrote $OUT_DIR/clean_tps.txt (untraced baseline; quote this tok/s, not the traced runs')"
+
+echo ""
 # --- 1. sys-trace (real timing; build dir first so llama-bench finds its libs) --
-echo "=== [1/4] sys-trace (-n $NTOK) ==="
+echo "=== [1/5] sys-trace (-n $NTOK) ==="
 ( cd "$BUILD_DIR"
   PATH="$ROCM_DIR/bin:$PATH" \
   LD_LIBRARY_PATH="$BUILD_DIR:$ROCM_LIBS:${LD_LIBRARY_PATH:-}" \
@@ -145,16 +163,16 @@ pmc_run() { # $1=dir  $2..=counters
 }
 
 echo ""
-echo "=== [2/4] PMC stall counters (-n $PMC_NTOK) ==="
+echo "=== [2/5] PMC stall counters (-n $PMC_NTOK) ==="
 pmc_run "$OUT_DIR/stall" $STALL_COUNTERS
 
 echo ""
-echo "=== [3/4] PMC FETCH_SIZE -> achieved DRAM bytes (-n $PMC_NTOK) ==="
+echo "=== [3/5] PMC FETCH_SIZE -> achieved DRAM bytes (-n $PMC_NTOK) ==="
 pmc_run "$OUT_DIR/fetch" FETCH_SIZE
 
 # --- 4. disasm load widths ------------------------------------------------------
 echo ""
-echo "=== [4/4] disasm load widths -> loadwidth.json ==="
+echo "=== [4/5] disasm load widths -> loadwidth.json ==="
 LLVM_NM="$ROCM_DIR/lib/llvm/bin/llvm-nm" \
 LLVM_OBJDUMP="$ROCM_DIR/lib/llvm/bin/llvm-objdump" \
 LLVM_CXXFILT="$ROCM_DIR/lib/llvm/bin/llvm-cxxfilt" \
@@ -170,4 +188,5 @@ echo "    --hip-csv    $OUT_DIR/trace/$HOST/*_hip_api_trace.csv \\"
 echo "    --pmc-csv    $OUT_DIR/stall/$HOST/*_counter_collection.csv \\"
 echo "    --fetch-csv  $OUT_DIR/fetch/$HOST/*_counter_collection.csv \\"
 echo "    --loadwidth-json $OUT_DIR/loadwidth.json \\"
+echo "    --clean-tps-file $OUT_DIR/clean_tps.txt \\"
 echo "    --out overlay.html --tokens 2"

@@ -362,6 +362,36 @@ def load_fetch_bytes_mapped(path, expected_seq):
     return {nm: statistics.mean(vs) for nm, vs in acc.items() if vs}
 
 
+def parse_clean_tps(path):
+    """Parse the decode (tg) throughput from collect.sh's clean_tps.txt -- the
+    untraced llama-bench markdown table. Returns {"test": "tg64", "tps": float,
+    "sd": float or None} for the last tg row, or None if the file is missing or
+    unparseable. This is the honest tok/s: rocprofv3 perturbs the traced runs,
+    so this bare number is what to quote."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+    except OSError:
+        return None
+    best = None
+    for line in text.splitlines():
+        if "|" not in line:
+            continue
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        test = next((c for c in cells if re.fullmatch(r"tg\d+", c)), None)
+        if not test:
+            continue
+        m = re.search(r"([0-9]+\.?[0-9]*)\s*(?:\u00b1|\+/-)\s*([0-9]+\.?[0-9]*)",
+                      cells[-1])
+        if m:
+            best = {"test": test, "tps": float(m.group(1)), "sd": float(m.group(2))}
+        else:
+            m2 = re.search(r"([0-9]+\.?[0-9]*)", cells[-1])
+            if m2:
+                best = {"test": test, "tps": float(m2.group(1)), "sd": None}
+    return best
+
+
 def load_loadwidth(path):
     """Load the disassembly load-width JSON ({family: {vector_loads, scalar_loads,
     lds_loads, dominant_lane_bytes, ...}}) produced from the gfx1151 device code
@@ -661,6 +691,12 @@ def add_common_args(ap):
                          % (DEFAULT_ARCH, PEAK_BW_GBS_BY_ARCH[DEFAULT_ARCH]))
     ap.add_argument("--peak-bw", type=float,
                     help="override peak DRAM bandwidth in GB/s (else from --arch)")
+    ap.add_argument("--clean-tps-file",
+                    help="path to collect.sh's clean_tps.txt (the untraced "
+                         "llama-bench run): parses the decode (tg) row's t/s and "
+                         "shows it in the header as the honest throughput, since "
+                         "rocprofv3 perturbs the traced runs' timing. Silently "
+                         "ignored if the file is missing or unparseable.")
     ap.add_argument("--out", help="output HTML path (required for the generator)")
     ap.add_argument("--tokens", type=int, default=2,
                     help="decode tokens to show in the viewport (default 2)")
@@ -736,6 +772,7 @@ def build_payload(args):
                                   if args.fetch_csv else ({}, {}))
     loadwidth = load_loadwidth(args.loadwidth_json) if args.loadwidth_json else {}
     att_by_fam = load_att_stats(args.att_dir) if args.att_dir else {}
+    clean_tps = parse_clean_tps(args.clean_tps_file) if args.clean_tps_file else None
 
     # Optional GGUF order-map: build the expected per-token matvec tensor sequence
     # in decode execution order. llama.cpp fuses the SwiGLU gate+up into one
@@ -779,10 +816,12 @@ def build_payload(args):
     fam_busy = defaultdict(float)
     fam_count = defaultdict(int)
     ei = 0
+    ti_ctr = 0
     mv_total = mv_mapped = 0
     for idx, (s, e, name, ncol, nblk) in enumerate(baked):
         if idx in tok_boundary_idx:
             ei = 0
+            ti_ctr = 0
         fam = family_of(name)
         finfo = fams.get(fam)
         stall = finfo["stall"] if finfo else "unknown"
@@ -792,7 +831,9 @@ def build_payload(args):
         busy_ns += dur
         fam_busy[fam] += dur
         fam_count[fam] += 1
-        sl = {"s": s - t0, "e": e - t0, "fam": fam, "stall": stall, "blocks": nblk}
+        sl = {"s": s - t0, "e": e - t0, "fam": fam, "stall": stall,
+              "blocks": nblk, "ti": ti_ctr}
+        ti_ctr += 1
         if expected_seq and "mul_mat_vec" in name and ncol:
             mv_total += 1
             ent = expected_seq[ei] if ei < len(expected_seq) else None
@@ -844,6 +885,133 @@ def build_payload(args):
                   "pct": round(100.0 * mv_mapped / mv_total, 1) if mv_total else 0,
                   "seq_len": len(expected_seq)}
                  if expected_seq else None)
+
+    # Per-kernel steady-state stats: decode tokens are structurally identical, so
+    # the Nth kernel of every token is the same dispatch. Aggregate each within-token
+    # position (ti) across ALL post-warmup tokens in the full stream (not just the
+    # baked view) so the selected-kernel panel can show a stable mean +/- spread
+    # instead of one noisy single-dispatch duration (per-token jitter includes the
+    # once-per-token host-serialized GDN edge, launch bubbles, interrupt latency).
+    # Keyed "ti|family" so a rare token with a different kernel count self-segregates
+    # rather than blending mismatched positions. Durations are ns (JS renders us).
+    kstats = {}
+    kstats_ntok = max(0, len(bounds) - 1 - args.skip_tokens)
+    if kstats_ntok > 0:
+        agg = defaultdict(list)
+        for k in range(args.skip_tokens, len(bounds) - 1):
+            for ti, (s, e, nm, _n, _nb) in enumerate(evs[bounds[k]:bounds[k + 1]]):
+                agg[(ti, family_of(nm))].append(e - s)
+        for (ti, fam), durs in agg.items():
+            cnt = len(durs)
+            mean = sum(durs) / cnt
+            std = (sum((d - mean) ** 2 for d in durs) / cnt) ** 0.5 if cnt > 1 else 0.0
+            kstats["%d|%s" % (ti, fam)] = {
+                "n": cnt, "mean": round(mean, 1), "std": round(std, 1),
+                "min": round(min(durs), 1), "max": round(max(durs), 1),
+            }
+
+    # Layer swim-lane: segment the baked GPU slices into per-decode-layer spans
+    # using the order-map's true GGUF block index (map.L). Leading input-norm /
+    # conv slices that precede a layer's first matvec are folded into that layer
+    # (backward fill within each token); each block's kind (GDN vs full-attention)
+    # is inferred from tensor presence (ssm_* -> gated-delta-net).
+    layers = []
+    if expected_seq:
+        block_kind = {}
+        _roles = defaultdict(set)
+        for t in gguf_tensors:
+            m = re.match(r"blk\.(\d+)\.(.*)\.weight$", t["name"])
+            if m:
+                _roles[int(m.group(1))].add(m.group(2))
+        for L, rs in _roles.items():
+            block_kind[L] = "GDN" if any(r.startswith("ssm") for r in rs) else "ATTN"
+        starts = sorted(tok_boundary_idx)
+        n = len(gpu_slices)
+        lay_L = [None] * n
+        for wi in range(len(starts) - 1):
+            st = starts[wi]
+            en = min(starts[wi + 1], n)
+            # backward fill: leading norms take the next matvec's layer index.
+            cur = None
+            for i in range(en - 1, st - 1, -1):
+                mp = gpu_slices[i].get("map")
+                if mp is not None:
+                    cur = mp["L"]
+                lay_L[i] = cur
+            # forward fill: trailing slices past the last matvec keep the last layer.
+            fill = None
+            for i in range(st, en):
+                if lay_L[i] is None:
+                    lay_L[i] = fill
+                else:
+                    fill = lay_L[i]
+            # coalesce consecutive equal-layer runs into one segment.
+            j = st
+            while j < en:
+                L = lay_L[j]
+                k = j
+                while k < en and lay_L[k] == L:
+                    k += 1
+                kind = "head" if L == -1 else block_kind.get(L, "?")
+                name = "head" if L == -1 else ("L%d %s" % (L, kind))
+                layers.append({"s": gpu_slices[j]["s"], "e": gpu_slices[k - 1]["e"],
+                               "kind": kind, "name": name})
+                j = k
+
+    # Phase sub-lane: one level below the layer lane -- group each layer's kernels
+    # into functional sub-blocks (input-norm, q/k/v projections, ssm conv, l2-norm,
+    # gated-delta-net / flash-attn, out proj, ffn, ...). Matvec slices are grouped by
+    # their order-mapped weight role; the rest by kernel family. Phases are coalesced
+    # within a (token, layer) so a sub-block never spans a layer boundary -- these
+    # boundaries are exactly the fusion-candidate edges.
+    phases = []
+    if expected_seq:
+        def _phase_of(sl):
+            mp = sl.get("map")
+            if mp is not None:
+                role = mp.get("role", "")
+                if role in ("attn_qkv", "attn_q", "attn_k", "attn_v"):
+                    return "qkv"
+                if role in ("ssm_in", "ssm_alpha", "ssm_beta"):
+                    return "ssm_in"
+                if role == "attn_gate":
+                    return "gate"
+                if role in ("ssm_out", "attn_output"):
+                    return "o_proj"
+                if role.startswith("ffn"):
+                    return "ffn"
+                if role == "output":
+                    return "head"
+            f = sl["fam"].lower()
+            if "l2_norm" in f: return "l2norm"
+            if "norm" in f: return "norm"
+            if "quantize" in f: return "quant"
+            if "conv" in f: return "conv"
+            if "gated_delta" in f: return "gdn"
+            if "flash_attn" in f or "fattn" in f: return "attn"
+            if "rope" in f: return "rope"
+            if "get_rows" in f: return "gather"
+            if "set_rows" in f: return "scatter"
+            if "bin_bcast" in f: return "binop"
+            if "concat" in f: return "concat"
+            if "unary" in f: return "act"
+            if "copy" in f or "cpy" in f: return "copy"
+            if "mul_mat_vec" in f: return "matvec"
+            if "add" in f: return "add"
+            return (f.split("_", 1)[0] or "op")[:6]
+        ph = [_phase_of(sl) for sl in gpu_slices]
+        for wi in range(len(starts) - 1):
+            st = starts[wi]
+            en = min(starts[wi + 1], n)
+            j = st
+            while j < en:
+                key = (lay_L[j], ph[j])
+                k = j
+                while k < en and (lay_L[k], ph[k]) == key:
+                    k += 1
+                phases.append({"s": gpu_slices[j]["s"], "e": gpu_slices[k - 1]["e"],
+                               "name": ph[j]})
+                j = k
 
     # CPU lane (HIP-API) in the baked span.
     cpu_slices = []
@@ -999,6 +1167,14 @@ def build_payload(args):
         "att_server": False,
         "has_map": bool(expected_seq),
         "map_stats": map_stats,
+        "layers": layers,
+        "has_layers": bool(layers),
+        "phases": phases,
+        "has_phases": bool(phases),
+        "kstats": kstats,
+        "has_kstats": bool(kstats),
+        "kstats_ntok": kstats_ntok,
+        "clean_tps": clean_tps,
         "peak_bw_gbs": peak_bw,
         # gfx1151 (RDNA3.5) scheduling constants for the modeled occupancy row.
         # 20 WGP; each WGP = 2 CU = 4 SIMD32; each SIMD32 holds 16 wave32 slots
@@ -1022,6 +1198,11 @@ def write_overlay(args):
           f"{payload['span_ns']/1e6:.3f} ms "
           f"({payload['busy_ns']/payload['span_ns']*100:.1f}% GPU-busy)",
           file=sys.stderr)
+    ct = payload['clean_tps']
+    if ct:
+        sd = "" if ct['sd'] is None else f" +/- {ct['sd']:.2f}"
+        print(f"  clean {ct['test']}: {ct['tps']:.2f}{sd} tok/s "
+              f"(untraced baseline)", file=sys.stderr)
     ms = payload['map_stats']
     if ms:
         print(f"  gguf order-map: {ms['mapped']}/{ms['total']} "
@@ -1115,6 +1296,12 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
       <button id="zout">zoom &minus;</button>
       <button id="reset">reset</button>
       <button id="markhome">markers &rarr; view</button>
+      <select id="findWhat" title="what to find">
+        <option value="maxgap">largest intra-token gap</option>
+        <option value="mineffbw">lowest eff-BW matvec (mmvq/mmq)</option>
+      </select>
+      <button id="findGo">find</button>
+      <span id="findmsg" class="sub"></span>
       <span id="viewinfo" class="sub"></span>
       <span class="legend" id="legend"></span>
     </div>
@@ -1142,7 +1329,16 @@ const D = __DATA__;
 const cv = document.getElementById('cv');
 const ctx = cv.getContext('2d');
 const CPU_H = 70, GPU_H = 70, PAD_T = 8, GAP = 26, AXIS_H = 22;
-const H = PAD_T + CPU_H + GAP + GPU_H + AXIS_H;
+const LAYER_H = D.has_layers ? 20 : 0;      // per-decode-layer swim lane
+const LGAP = D.has_layers ? 6 : 0;          // gap between GPU lane and layer lane
+const PHASE_H = D.has_phases ? 16 : 0;      // functional sub-block lane (finer)
+const PGAP = D.has_phases ? 3 : 0;
+const H = PAD_T + CPU_H + GAP + GPU_H + LGAP + LAYER_H + PGAP + PHASE_H + AXIS_H;
+const PHASE_COL = {norm:'#5a6b3d', l2norm:'#7a9b4d', quant:'#4a4f5e', qkv:'#3d6b8f',
+  ssm_in:'#3d8f8a', conv:'#8f6b3d', gate:'#8f3d6b', gdn:'#6b3d8f', attn:'#8f3d3d',
+  o_proj:'#3d5a8f', ffn:'#7a5a2d', rope:'#5a5a8f', gather:'#4a7a5a', scatter:'#4a7a6f',
+  binop:'#6a6a4a', concat:'#5a7a7a', act:'#8a7a3d', copy:'#555a66', matvec:'#4a5a6a',
+  add:'#666a55', head:'#777'};
 let view0 = D.tok_starts[D.view_i0];
 let view1 = D.tok_starts[D.view_i1];
 let curI0 = D.view_i0, curI1 = D.view_i1;
@@ -1187,7 +1383,10 @@ document.getElementById('sub').textContent =
   `${D.cpu.length} HIP calls | window GPU-busy ${fmtms(D.busy_ns)} / span `+
   `${fmtms(D.span_ns)}` + (D.has_pmc ? '' : ' | NO PMC (uncolored)') +
   (D.map_stats ? ` | GGUF map ${D.map_stats.mapped}/${D.map_stats.total} matvec `+
-    `(${D.map_stats.pct}%)` : '');
+    `(${D.map_stats.pct}%)` : '') +
+  (D.clean_tps ? ` | clean decode ${D.clean_tps.tps.toFixed(1)}`+
+    (D.clean_tps.sd!=null ? ` +/- ${D.clean_tps.sd.toFixed(1)}` : '')+
+    ` tok/s (untraced)` : '');
 document.getElementById('cpunote').textContent = D.has_cpu ? '' :
   '(no --hip-csv supplied: CPU lane empty)';
 document.getElementById('bwnote').textContent = D.has_bw ?
@@ -1244,10 +1443,19 @@ function draw(){
   ctx.clearRect(0,0,w,H);
   rects = [];
   const cpuY = PAD_T, gpuY = PAD_T + CPU_H + GAP;
+  const gpuBot = gpuY + GPU_H;
+  // finer phase sub-lane sits directly under the GPU lane; the coarse GDN/ATTN
+  // layer lane sits below it.
+  const phaseY = gpuBot + LGAP;
+  const layerY = D.has_phases ? (phaseY + PHASE_H + PGAP) : (gpuBot + LGAP);
+  const axisTop = D.has_layers ? (layerY + LAYER_H)
+                : D.has_phases ? (phaseY + PHASE_H) : gpuBot;
 
   // lane backgrounds
   ctx.fillStyle = '#161922';
   ctx.fillRect(0,cpuY,w,CPU_H); ctx.fillRect(0,gpuY,w,GPU_H);
+  if (D.has_phases){ ctx.fillStyle = '#0f1118'; ctx.fillRect(0,phaseY,w,PHASE_H); }
+  if (D.has_layers){ ctx.fillStyle = '#12141c'; ctx.fillRect(0,layerY,w,LAYER_H); }
 
   // token boundary markers + inter-token idle shading on GPU lane
   ctx.strokeStyle = '#3a4f6a'; ctx.lineWidth = 1;
@@ -1256,8 +1464,8 @@ function draw(){
     const ts = D.tok_starts[k];
     if (ts < view0-1 || ts > view1+1) continue;
     const x = xOf(ts, w);
-    ctx.beginPath(); ctx.moveTo(x,cpuY); ctx.lineTo(x,gpuY+GPU_H); ctx.stroke();
-    ctx.fillText('tok '+k, x+3, gpuY+GPU_H+13);
+    ctx.beginPath(); ctx.moveTo(x,cpuY); ctx.lineTo(x,axisTop); ctx.stroke();
+    ctx.fillText('tok '+k, x+3, axisTop+13);
   }
 
   // GPU slices
@@ -1266,7 +1474,9 @@ function draw(){
     const x = xOf(s.s,w), x2 = xOf(s.e,w);
     const wpx = Math.max(1, x2-x);
     const isSel = selectedFam && s.fam===selectedFam;
-    ctx.globalAlpha = (selectedFam && !isSel) ? 0.25 : 1.0;
+    const inMulti = selectedSlices && selectedSlices.has(s);
+    const dim = (selectedFam && !isSel) || (selectedSlices && !inMulti);
+    ctx.globalAlpha = dim ? 0.25 : 1.0;
     const gcol = D.colors[s.stall] || D.colors.unknown;
     ctx.fillStyle = gcol;
     ctx.fillRect(x, gpuY+4, wpx, GPU_H-8);
@@ -1274,6 +1484,8 @@ function draw(){
     ctx.globalAlpha = 1.0;
     if(isSel){ ctx.strokeStyle='#ffffff'; ctx.lineWidth=1.5;
       ctx.strokeRect(x+0.5, gpuY+4.5, Math.max(1,wpx-1), GPU_H-9); ctx.lineWidth=1; }
+    if(inMulti){ ctx.strokeStyle='#8fe388'; ctx.lineWidth=2;
+      ctx.strokeRect(x+0.5, gpuY+3.5, Math.max(1,wpx-1), GPU_H-7); ctx.lineWidth=1; }
     if(selectedSlice && s===selectedSlice){
       ctx.strokeStyle='#ffffff'; ctx.lineWidth=2;
       ctx.strokeRect(x-0.5, gpuY+2.5, Math.max(2,wpx+1), GPU_H-5); ctx.lineWidth=1;
@@ -1282,6 +1494,38 @@ function draw(){
       ctx.lineTo(cx,gpuY+1); ctx.closePath(); ctx.fill();
     }
     rects.push({x:x,y:gpuY+4,w:wpx,h:GPU_H-8,type:'gpu',p:s});
+  }
+  // layer swim-lane: one colored segment per decode layer (GDN vs full-attn),
+  // labeled with the true GGUF block index; hover shows the layer name + span.
+  if (D.has_layers){
+    for (const L of D.layers){
+      if (L.e < view0 || L.s > view1) continue;
+      const x = xOf(L.s,w), x2 = xOf(L.e,w);
+      const wpx = Math.max(1, x2-x);
+      const lcol = L.kind==='GDN' ? '#3d5a80' : L.kind==='ATTN' ? '#7a4f6d' : '#4a4a4a';
+      ctx.fillStyle = lcol;
+      ctx.fillRect(x, layerY+2, wpx, LAYER_H-4);
+      ctx.strokeStyle = '#0b0d12'; ctx.lineWidth = 1;
+      ctx.strokeRect(x+0.5, layerY+2.5, Math.max(1,wpx-1), LAYER_H-5);
+      boxLabel(L.name, x, wpx, layerY + LAYER_H/2, lcol);
+      rects.push({x:x,y:layerY+2,w:wpx,h:LAYER_H-4,type:'layer',p:L});
+    }
+  }
+  // phase sub-lane: functional sub-blocks within each layer (finer than GDN/ATTN),
+  // colored by phase; the boundaries mark where fusion would cross a functional edge.
+  if (D.has_phases){
+    for (const P of D.phases){
+      if (P.e < view0 || P.s > view1) continue;
+      const x = xOf(P.s,w), x2 = xOf(P.e,w);
+      const wpx = Math.max(1, x2-x);
+      const pcol = PHASE_COL[P.name] || '#556';
+      ctx.fillStyle = pcol;
+      ctx.fillRect(x, phaseY+1, wpx, PHASE_H-2);
+      ctx.strokeStyle = '#0b0d12'; ctx.lineWidth = 1;
+      ctx.strokeRect(x+0.5, phaseY+1.5, Math.max(1,wpx-1), PHASE_H-3);
+      boxLabel(P.name, x, wpx, phaseY + PHASE_H/2, pcol);
+      rects.push({x:x,y:phaseY+1,w:wpx,h:PHASE_H-2,type:'phase',p:P});
+    }
   }
   // CPU slices (host may nest; draw thin stacked)
   for (const c of D.cpu){
@@ -1304,17 +1548,16 @@ function draw(){
     const t = view0 + span*i/5, x = xOf(t,w);
     ctx.fillText(fmtus(t-view0), Math.min(x+2,w-40), H-6);
     ctx.strokeStyle='#5a6070'; ctx.beginPath();
-    ctx.moveTo(x,gpuY+GPU_H); ctx.lineTo(x,gpuY+GPU_H+6); ctx.stroke();
+    ctx.moveTo(x,axisTop); ctx.lineTo(x,axisTop+6); ctx.stroke();
   }
 
   // measurement markers A/B (draggable; full height so you can line up an edge)
-  const gpuBot = gpuY+GPU_H;
   [[markA,'#00e5ff','A'],[markB,'#ffd400','B']].forEach(m=>{
     const t=m[0], col=m[1], lab=m[2];
     if (t<view0 || t>view1) return;
     const x=xOf(t,w);
     ctx.strokeStyle=col; ctx.lineWidth=1.5;
-    ctx.beginPath(); ctx.moveTo(x,PAD_T); ctx.lineTo(x,gpuBot); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(x,PAD_T); ctx.lineTo(x,axisTop); ctx.stroke();
     ctx.lineWidth=1;
     ctx.fillStyle=col; ctx.fillRect(x-6,PAD_T,12,12);
     ctx.fillStyle='#000'; ctx.font='bold 10px sans-serif';
@@ -1354,7 +1597,7 @@ function draw(){
   document.getElementById('viewinfo').textContent =
     `${tlabel} | ${fmtms(span)} | GPU busy ${gp.toFixed(0)}% `+
     `idle ${ip.toFixed(0)}% | A-B dt ${fmtdur(Math.abs(markB-markA))} | `+
-    `drag=zoom-box  shift+drag/arrows=pan  scroll/+-=zoom  drag A/B=measure  click=select kernel`;
+    `drag=select kernels  ctrl/cmd+click=add/remove 1  ctrl/cmd+drag=add range  scroll/+-=zoom  shift+drag/arrows=pan  drag A/B=measure (snaps to edges; alt=free)  click=1 kernel  esc=clear`;
 }
 
 // summary table
@@ -1368,9 +1611,11 @@ tb.innerHTML = D.summary.map(r=>{
 // timeline selects a SINGLE kernel (bright outline) and shows its details below.
 let selectedFam = null;
 let selectedSlice = null;
+let selectedSlices = null;       // Set of D.gpu slices (box multi-select), or null
 function setSelection(fam){
   selectedFam = fam;
   selectedSlice = null;          // family mode clears single-kernel selection
+  selectedSlices = null;         // ...and box multi-selection
   const rows = tb.querySelectorAll('tr');
   rows.forEach(tr=>tr.classList.toggle('sel', fam!==null && tr.dataset.fam===fam));
   if(fam){ const el=[...rows].find(tr=>tr.dataset.fam===fam);
@@ -1378,11 +1623,36 @@ function setSelection(fam){
   updateDetail(); draw();
 }
 function selectSlice(sl){        // sl is a slice object from D.gpu (or null)
-  selectedSlice = sl; selectedFam = null;
+  selectedSlice = sl; selectedFam = null; selectedSlices = null;
   const rows = tb.querySelectorAll('tr');
   rows.forEach(tr=>tr.classList.toggle('sel', sl && tr.dataset.fam===sl.fam));
   if(sl){ const el=[...rows].find(tr=>tr.dataset.fam===sl.fam);
           if(el) el.scrollIntoView({block:'nearest'}); }
+  updateDetail(); draw();
+}
+// box multi-select: gather every GPU slice overlapping the dragged time range.
+// add=true (Ctrl/Cmd+drag) unions into the current selection instead of replacing.
+function selectBox(t0,t1,add){
+  const set = (add && selectedSlices) ? new Set(selectedSlices) : new Set();
+  if(add && !selectedSlices && selectedSlice) set.add(selectedSlice);
+  for(const s of D.gpu){ if(s.e>=t0 && s.s<=t1) set.add(s); }
+  selectedSlices = set.size ? set : null;
+  selectedSlice = null; selectedFam = null;
+  const fams = new Set([...(selectedSlices||[])].map(s=>s.fam));
+  tb.querySelectorAll('tr').forEach(tr=>tr.classList.toggle('sel', fams.has(tr.dataset.fam)));
+  updateDetail(); draw();
+}
+// Ctrl/Cmd+click: add or remove ONE slice from the multi-select set. Seeds a new
+// set from the current single/box selection so you can refine right after a lasso;
+// removing the last member clears back to no selection.
+function toggleSlice(sl){
+  const set = selectedSlices ? new Set(selectedSlices) : new Set();
+  if(!selectedSlices && selectedSlice) set.add(selectedSlice);
+  if(set.has(sl)) set.delete(sl); else set.add(sl);
+  selectedSlices = set.size ? set : null;
+  selectedSlice = null; selectedFam = null;
+  const fams = new Set([...(selectedSlices||[])].map(s=>s.fam));
+  tb.querySelectorAll('tr').forEach(tr=>tr.classList.toggle('sel', fams.has(tr.dataset.fam)));
   updateDetail(); draw();
 }
 // Rule-based per-kernel bottleneck verdict. Thresholds are heuristics tuned on
@@ -1431,9 +1701,143 @@ function diagnose(fc){
 // details panel below the lanes for the single selected kernel
 const dp = document.getElementById('detail');
 function updateDetail(){
+  if(selectedSlices){ renderMultiSelect(); return; }
   if(selectedSlice){ renderSelectedKernel(); return; }
   if(selectedFam){ renderFamilyMembers(); return; }
   dp.style.display='none'; dp.innerHTML='';
+}
+// Box-selection view: aggregate the selected GPU slices by family (count, summed
+// kernel time, share of the selection) -- a quick "what did I just lasso" summary.
+function renderMultiSelect(){
+  const sl=[...selectedSlices];
+  const groups=new Map(); let totDur=0;
+  for(const s of sl){
+    const dur=s.e-s.s; totDur+=dur;
+    let g=groups.get(s.fam);
+    if(!g){ g={fam:s.fam,stall:s.stall,n:0,dur:0}; groups.set(s.fam,g); }
+    g.n++; g.dur+=dur;
+  }
+  const gs=[...groups.values()].sort((a,b)=>b.dur-a.dur);
+  let left=`<h2>Selection</h2>`+
+    `<div class="sub" style="margin-bottom:6px">${sl.length} kernel${sl.length===1?'':'s'}, `+
+    `${gs.length} famil${gs.length===1?'y':'ies'} &mdash; total kernel time ${fmtus(totDur)}</div>`;
+  left+=`<table><thead><tr><th style="text-align:left">family</th>`+
+     `<th style="text-align:left">count</th><th style="text-align:left">kernel time</th>`+
+     `<th style="text-align:left">% of sel</th></tr></thead><tbody>`;
+  for(const g of gs){
+    const col=D.colors[g.stall]||D.colors.unknown;
+    left+=`<tr><td><span class="fam-dot" style="background:${col}"></span>${g.fam}</td>`+
+       `<td>${g.n}</td><td>${fmtus(g.dur)}</td>`+
+       `<td>${(g.dur/totDur*100).toFixed(1)}%</td></tr>`;
+  }
+  left+=`</tbody></table>`;
+  // Two columns: family breakdown on the left, fusion analysis in the wide space
+  // on the right (falls back to stacking on narrow panes via flex-wrap).
+  let h=`<div style="display:flex;gap:28px;align-items:flex-start;flex-wrap:wrap">`+
+     `<div style="flex:0 1 auto">${left}</div>`+
+     `<div style="flex:1 1 340px;min-width:300px">${fusionSection(sl, gs, totDur)}</div>`+
+     `</div>`+
+     `<div class="sub" style="margin-top:6px">Drag again to reselect; click one kernel for its `+
+     `full detail; Esc clears.</div>`;
+  dp.innerHTML=h; dp.style.display='block';
+}
+// Fusion-opportunity analysis for a lasso selection of (usually small) kernels.
+// Two questions: (1) how much END-TO-END time could fusing them reclaim -- the
+// inter-kernel idle (launch + scheduling gaps between the selected dispatches);
+// (2) would merging the distinct families' resources blow the VGPR file (spill)
+// or the LDS budget (occupancy drop). Register/LDS totals are modeled two ways:
+// max() = perfect reuse (kernels run as sequential phases, regs freed between),
+// sum() = no reuse (everything live at once) -- the true fused cost is between.
+function fusionSection(sl, gs, totDur){
+  const KB=b=>b>=1024?(b/1024).toFixed(1)+' KB':b+' B';
+  let minS=Infinity, maxE=-Infinity;
+  for(const s of sl){ if(s.s<minS)minS=s.s; if(s.e>maxE)maxE=s.e; }
+  const wall=maxE-minS, busy=totDur;
+  const bySt=[...sl].sort((a,b)=>a.s-b.s);
+  let gapIdle=0;
+  for(let i=1;i<bySt.length;i++){ const g=bySt[i].s-bySt[i-1].e; if(g>0) gapIdle+=g; }
+  const winPct=wall>0?gapIdle/wall*100:0;
+  const rows=gs.map(g=>({g, fc:D.fam_counters[g.fam]||{}}));
+  const vgprs=rows.map(r=>r.fc.vgpr||0);
+  const ldss =rows.map(r=>r.fc.lds_static||0);
+  const scr  =rows.map(r=>r.fc.scratch||0);
+  const Ws   =rows.map(r=>r.fc.wave?Math.round(r.fc.wg/r.fc.wave):0);
+  const vMax=Math.max(0,...vgprs), vSum=vgprs.reduce((a,b)=>a+b,0);
+  const lMax=Math.max(0,...ldss),  lSum=ldss.reduce((a,b)=>a+b,0);
+  const anyScratch=scr.some(x=>x>0);
+  const Wf=Math.max(0,...Ws);           // most wave-heavy block sets the fused occupancy
+  const hw=D.hw;
+  // gfx1151 (RDNA3.5, wave32): each SIMD32 shares a 1536-VGPR file across up to 16
+  // resident waves, so 1536/16 = 96 VGPR/wave is the most a wave can use and still
+  // hit full 16-wave occupancy; every VGPR above that costs resident waves. v0-v255
+  // is the architectural max -> above 256 the compiler spills to scratch.
+  const VMAX_THREAD=256;                                              // architectural v0-v255 max -> spill above
+  const VGPR_FULL_OCC = hw ? Math.floor(hw.vgpr_per_simd/hw.slots_per_simd) : 96;  // 1536/16 = 96/wave for 16 waves
+  const occFor=(V,L)=>{
+    if(!hw||!Wf) return null;
+    const slotsWGP=hw.simd_per_wgp*hw.slots_per_simd;
+    const vgprWGP =hw.simd_per_wgp*hw.vgpr_per_simd;
+    const bSlots=Math.floor(slotsWGP/Wf);
+    const bVgpr =V>0?Math.floor(vgprWGP/(Wf*V)):bSlots;
+    const bLds  =L>0?Math.floor(hw.lds_per_wgp/L):Infinity;
+    let lim='slots', resid=bSlots;
+    if(bVgpr<resid){lim='VGPR';resid=bVgpr;}
+    if(bLds<resid){lim='LDS';resid=bLds;}
+    return {occ:resid>0?Math.round(resid*Wf/slotsWGP*100):0, lim, resid};
+  };
+  const occBest=occFor(vMax,lMax), occWorst=occFor(vSum,lSum);
+  let h=`<h2>Fusion analysis</h2>`;
+  h+=`<table><tbody>`+
+     `<tr><td>span (wall)</td><td>${fmtus(wall)}</td></tr>`+
+     `<tr><td>busy (sum kernels)</td><td>${fmtus(busy)}</td></tr>`+
+     `<tr><td>inter-kernel idle</td><td style="color:${gapIdle>0?'#8fe388':'#9aa6b2'}">`+
+       `${fmtus(gapIdle)} <span class="r">(reclaimable by fusion; ${winPct.toFixed(1)}% of span)</span></td></tr>`+
+     `</tbody></table>`;
+  h+=`<table style="margin-top:6px"><thead><tr><th style="text-align:left">family</th>`+
+     `<th style="text-align:left">VGPR</th><th style="text-align:left">LDS/blk</th>`+
+     `<th style="text-align:left">scratch</th><th style="text-align:left">occ</th></tr></thead><tbody>`;
+  for(const r of rows){
+    const fc=r.fc, col=D.colors[r.g.stall]||D.colors.unknown;
+    h+=`<tr><td><span class="fam-dot" style="background:${col}"></span>${r.g.fam}</td>`+
+       `<td>${fc.vgpr||'<span class="r">-</span>'}</td>`+
+       `<td>${fc.lds_static?KB(fc.lds_static):'0'}</td>`+
+       `<td style="color:${fc.scratch?'#ff6b6b':'inherit'}">${fc.scratch?KB(fc.scratch):'0'}</td>`+
+       `<td>${fc.occ?fc.occ+'%':'<span class="r">-</span>'}</td></tr>`;
+  }
+  h+=`</tbody></table>`;
+  if(hw && Wf){
+    h+=`<table style="margin-top:6px"><tbody>`+
+       `<tr><td>fused VGPR/wave</td><td>${vMax} .. ${vSum} `+
+         `<span class="r">(reuse .. no-reuse; ${VGPR_FULL_OCC}=full occ, ${VMAX_THREAD}=spill)</span></td></tr>`+
+       `<tr><td>fused LDS/block</td><td>${KB(lSum)} `+
+         `<span class="r">/ ${KB(hw.lds_per_wgp)} per-WGP budget</span></td></tr>`;
+    if(occBest && occWorst)
+      h+=`<tr><td>fused occupancy (modeled)</td><td>~${occWorst.occ}% .. ${occBest.occ}% `+
+         `<span class="r">(${occWorst.lim} .. ${occBest.lim}-bound)</span></td></tr>`;
+    h+=`</tbody></table>`;
+  }
+  // A fused kernel allocates one register file for its whole body, so it inherits
+  // AT LEAST the largest member's VGPR/wave even under perfect reuse -- which forces
+  // that wave's (possibly low) occupancy onto every folded-in kernel. So vMax, not
+  // just vSum, drives the verdict: past 96/wave you drop below 16 resident waves.
+  const risks=[];
+  if(anyScratch) risks.push('a selected kernel already spills to scratch');
+  if(vSum>VMAX_THREAD) risks.push(`no-reuse VGPR ${vSum} exceeds the ${VMAX_THREAD}/wave architectural max (v0-v${VMAX_THREAD-1}) &rarr; scratch spill unless the compiler reuses registers`);
+  else if(occBest && occBest.occ<50) risks.push(`the largest kernel uses ${vMax} VGPR/wave (> ${VGPR_FULL_OCC}/wave for full 16-wave occupancy); even perfect reuse caps the fused kernel at ~${occBest.occ}% occupancy and drags every folded-in kernel down to it`);
+  if(hw && lSum>hw.lds_per_wgp) risks.push(`combined LDS ${KB(lSum)} exceeds the ${KB(hw.lds_per_wgp)} per-WGP budget`);
+  let verdict, vc;
+  if(gapIdle<=0 || winPct<2){
+    verdict='Low payoff -- almost no inter-kernel idle to reclaim; fusion would only save launch bookkeeping.'; vc='#9aa6b2';
+  } else if(risks.length){
+    verdict='Fusible but risky -- '+risks.join('; ')+'. Weigh the '+fmtus(gapIdle)+' idle win against the spill / occupancy cost.'; vc='#ffb454';
+  } else {
+    verdict='Good candidate -- '+fmtus(gapIdle)+' reclaimable idle, and the combined VGPR/LDS stay within budget'+
+      (occWorst?` (modeled occ >=${occWorst.occ}%)`:``)+'. Fusing removes the launch gaps without spilling.'; vc='#8fe388';
+  }
+  h+=`<div style="margin:8px 0 0;padding:6px 9px;border-left:3px solid ${vc};`+
+     `background:rgba(255,255,255,.05);border-radius:3px;line-height:1.35">`+
+     `<b style="color:${vc}">FUSION</b> <span style="color:#c8d0da">${verdict}</span></div>`;
+  return h;
 }
 // Family view: when a per-kernel-family row is selected (no single slice), list
 // every order-mapped shape in that family with its packed footprint + effective BW.
@@ -1497,7 +1901,16 @@ function renderSelectedKernel(){
         `<b style="color:${dg.c}">${dg.t}</b> `+
         `<span style="color:#c8d0da">${dg.a}</span></div>`:``)+
     `<table><tbody>`+
-    `<tr><td>duration</td><td>${fmtus(s.e-s.s)}</td></tr>`;
+    `<tr><td>duration</td><td>${fmtus(s.e-s.s)} <span class="r">(this dispatch)</span></td></tr>`;
+  // Steady-state average of this within-token kernel position across all post-warmup
+  // tokens -- decode is periodic so the Nth kernel is the same dispatch every token;
+  // the mean +/- spread is a far more stable cost signal than one noisy dispatch.
+  if(D.has_kstats){
+    const ks=D.kstats[s.ti+'|'+s.fam];
+    if(ks && ks.n>1)
+      h+=`<tr><td>duration (avg)</td><td style="color:#8fe388">${fmtus(ks.mean)} &plusmn; ${fmtus(ks.std)} `+
+         `<span class="r">(${fmtus(ks.min)}..${fmtus(ks.max)}, n=${ks.n} of ${D.kstats_ntok} tokens)</span></td></tr>`;
+  }
   if(s.map){
     const m=s.map, KB=b=>b>=1048576?(b/1048576).toFixed(1)+' MB':(b/1024).toFixed(1)+' KB';
     const nOk=m.nmatch?'#8fe388':'#ff6b6b';
@@ -1789,6 +2202,12 @@ cv.addEventListener('mousemove', e=>{
         `<div class="r">Occ ${fc.occ}%  LDSbc ${fc.lds}  WrStall ${fc.wr}  Wav ${fc.wav}</div>`+
         `<div style="color:${D.colors[s.stall]};font-weight:600">\u2192 dominant stall: ${s.stall}</div>`
         :`<div class="r">(no PMC data)</div>`);
+  } else if(hit.type==='layer'){
+    const L=hit.p;
+    html=`<div class="k">${L.name}</div><div class="r">layer span ${fmtus(L.e-L.s)}</div>`;
+  } else if(hit.type==='phase'){
+    const P=hit.p;
+    html=`<div class="k">${P.name}</div><div class="r">phase span ${fmtus(P.e-P.s)}</div>`;
   } else {
     const c=hit.p;
     html=`<div class="k">${c.name}</div><div class="r">host dur ${fmtus(c.e-c.s)}</div>`;
@@ -1841,20 +2260,39 @@ window.addEventListener('keydown', e=>{
     setView(view0+step, view1+step);
   } else if(e.key==='+'||e.key==='='){ e.preventDefault(); zoomAt(0.5,0.6); }
   else if(e.key==='-'||e.key==='_'){ e.preventDefault(); zoomAt(0.5,1/0.6); }
+  else if(e.key==='Escape'){ if(selectedSlices||selectedSlice||selectedFam){ selectSlice(null); } }
 });
 
-// left-drag = rubber-band zoom (draw a box, release to zoom to that X range);
-// shift+left-drag = pan.
+// left-drag = rubber-band multi-select (lasso the GPU slices in the X range);
+// shift+left-drag = pan; scroll / +- / arrows = zoom+pan.
 let dragging=false, dragX=0, dv0=0, dv1=0;   // pan state
-let rbActive=false, rbX0=0, rbY0=0, rbX1=0;  // rubber-band state (+down y for click)
+let rbActive=false, rbX0=0, rbY0=0, rbX1=0, rbCtrl=false;  // rubber-band state (+down y for click, +ctrl/cmd for add/toggle)
 function tOf(px){ return view0 + px/cv.clientWidth*(view1-view0); }
+// sorted list of every GPU + CPU slice boundary (ns) for marker edge-snapping
+const SNAP_EDGES = (()=>{
+  const s=new Set();
+  for(const g of D.gpu){ s.add(g.s); s.add(g.e); }
+  for(const c of D.cpu){ s.add(c.s); s.add(c.e); }
+  return [...s].sort((a,b)=>a-b);
+})();
+const SNAP_PX = 8;                           // snap when a slice edge is within this many px
+// snap a time (ns) to the nearest slice edge if it's within SNAP_PX on screen; the
+// pixel test means snapping is coarse when zoomed out and precise when zoomed in.
+function snapT(t){
+  if(!SNAP_EDGES.length) return t;
+  let lo=0, hi=SNAP_EDGES.length-1;
+  while(lo<hi){ const mid=(lo+hi)>>1; if(SNAP_EDGES[mid]<t) lo=mid+1; else hi=mid; }
+  let best=SNAP_EDGES[lo], bd=Math.abs(best-t);
+  if(lo>0){ const d=Math.abs(SNAP_EDGES[lo-1]-t); if(d<bd){ best=SNAP_EDGES[lo-1]; bd=d; } }
+  return (bd/(view1-view0)*cv.clientWidth <= SNAP_PX) ? best : t;
+}
 function overlay(){                          // paint the selection box atop draw()
   if(!rbActive) return;
   const gpuBot=PAD_T+CPU_H+GAP+GPU_H;
   const x=Math.min(rbX0,rbX1), wpx=Math.abs(rbX1-rbX0);
   ctx.save();
-  ctx.fillStyle='rgba(120,170,255,0.20)';
-  ctx.strokeStyle='rgba(120,170,255,0.9)'; ctx.lineWidth=1;
+  ctx.fillStyle='rgba(143,227,136,0.18)';
+  ctx.strokeStyle='rgba(143,227,136,0.9)'; ctx.lineWidth=1;
   ctx.fillRect(x,PAD_T,wpx,gpuBot-PAD_T);
   ctx.strokeRect(x+0.5,PAD_T+0.5,wpx,gpuBot-PAD_T);
   ctx.restore();
@@ -1867,22 +2305,28 @@ cv.addEventListener('mousedown', e=>{
   if(Math.min(dA,dB)<=6){ markDrag = (dA<=dB?1:2); cv.style.cursor='ew-resize'; return; }
   if(e.shiftKey){ dragging=true; dragX=e.clientX; dv0=view0; dv1=view1;
     cv.style.cursor='grabbing'; }
-  else { rbActive=true; rbX0=mx; rbY0=e.clientY-r.top; rbX1=mx; cv.style.cursor='crosshair'; }
+  else { rbActive=true; rbCtrl=e.ctrlKey||e.metaKey; rbX0=mx; rbY0=e.clientY-r.top; rbX1=mx; cv.style.cursor='cell'; }
 });
-// hit-test a point against the drawn rects; select the GPU slice's family (or clear)
-function clickSelect(mx,my){
+// hit-test a point against the drawn rects; select the GPU slice's family (or clear).
+// toggle=true (Ctrl/Cmd+click) adds/removes the hit slice from the multi-select set.
+function clickSelect(mx,my,toggle){
   for(let i=rects.length-1;i>=0;i--){const q=rects[i];
     if(mx>=q.x&&mx<=q.x+q.w&&my>=q.y&&my<=q.y+q.h){
-      if(q.type==='gpu'){ selectSlice(selectedSlice===q.p ? null : q.p); return; }
+      if(q.type==='gpu'){
+        if(toggle) toggleSlice(q.p);
+        else selectSlice(selectedSlice===q.p ? null : q.p);
+        return;
+      }
       break;
     }}
-  selectSlice(null);
+  if(!toggle) selectSlice(null);   // plain click on empty clears; modifier-click keeps selection
 }
 window.addEventListener('mousemove', e=>{
   if(markDrag){
     const r=cv.getBoundingClientRect();
     const mx=Math.min(cv.clientWidth, Math.max(0, e.clientX-r.left));
-    if(markDrag===1) markA=tOf(mx); else markB=tOf(mx);
+    const t = e.altKey ? tOf(mx) : snapT(tOf(mx));  // Alt = free placement (no snap)
+    if(markDrag===1) markA=t; else markB=t;
     draw(); return;
   }
   if(dragging){
@@ -1900,8 +2344,9 @@ window.addEventListener('mouseup', ()=>{
   if(dragging){ dragging=false; cv.style.cursor=''; }
   if(rbActive){
     rbActive=false; cv.style.cursor='';
-    if(Math.abs(rbX1-rbX0)>=4) setView(tOf(Math.min(rbX0,rbX1)), tOf(Math.max(rbX0,rbX1)));
-    else clickSelect(rbX0, rbY0);   // no drag = a click: select the kernel under it
+    if(Math.abs(rbX1-rbX0)>=4){
+      selectBox(tOf(Math.min(rbX0,rbX1)), tOf(Math.max(rbX0,rbX1)), rbCtrl);  // drag = lasso (ctrl/cmd = add to selection)
+    } else clickSelect(rbX0, rbY0, rbCtrl);   // no drag = click: select one kernel (ctrl/cmd = toggle in/out)
   }
 });
 // bring both markers back into the current viewport (button + double-click)
@@ -1910,6 +2355,98 @@ function markersToView(){
 }
 document.getElementById('markhome').onclick=markersToView;
 cv.addEventListener('dblclick', markersToView);
+
+// --- Find: extensible "jump to X" registry ---------------------------------
+// Each finder returns {t0,t1,label} (a time span to frame + a status string) or
+// null. Add entries here + an <option> in #findWhat to grow the menu.
+function findMaxIntraTokenGap(){
+  // Largest gap between consecutive GPU slices that does NOT cross a token
+  // boundary. tok_starts are the per-token first-dispatch times; a gap whose
+  // span contains one is the inter-token relaunch gap, which we exclude.
+  const g=[...D.gpu].sort((a,b)=>a.s-b.s);
+  const ts=(D.tok_starts||[]).slice().sort((a,b)=>a-b);
+  const crossesBoundary=(a,b)=>{ // is there a tok_start T with a < T <= b ?
+    let lo=0,hi=ts.length; while(lo<hi){const m=(lo+hi)>>1; if(ts[m]<=a) lo=m+1; else hi=m;}
+    return lo<ts.length && ts[lo]<=b;
+  };
+  let best=null;
+  for(let i=0;i+1<g.length;i++){
+    const gap=g[i+1].s-g[i].e;
+    if(gap<=0) continue;
+    if(crossesBoundary(g[i].e,g[i+1].s)) continue;   // token-boundary gap
+    if(!best||gap>best.gap) best={gap,a:g[i],b:g[i+1]};
+  }
+  if(!best) return null;
+  const dot=s=>`<span class="fam-dot" style="background:${D.colors[s.stall]||D.colors.unknown}"></span>`;
+  const detail=`<h2>Find: largest intra-token gap</h2>`+
+    `<div class="sub" style="margin-bottom:8px">GPU idle between two consecutive `+
+    `kernels within one decode token (token-boundary gaps excluded).</div>`+
+    `<table><tbody>`+
+    `<tr><td>gap (GPU idle)</td><td><b>${fmtdur(best.gap)}</b></td></tr>`+
+    `<tr><td>ending kernel (before gap)</td><td>${dot(best.a)}${best.a.fam} `+
+      `<span class="sub">(${fmtus(best.a.e-best.a.s)})</span></td></tr>`+
+    `<tr><td>starting kernel (after gap)</td><td>${dot(best.b)}${best.b.fam} `+
+      `<span class="sub">(${fmtus(best.b.e-best.b.s)})</span></td></tr>`+
+    `</tbody></table>`;
+  return {t0:best.a.e, t1:best.b.s, detail,
+          label:`largest intra-token gap: ${fmtdur(best.gap)} `+
+                `(${best.a.fam} &rarr; ${best.b.fam})`};
+}
+function findMinEffBw(){
+  // matvec/matmul dispatch with the lowest effective (useful-work) bandwidth =
+  // theoretical packed weight bytes / kernel time. Low eff-BW = the kernel is
+  // launch/latency-dominated relative to the data it moves, or is slow for its
+  // shape -- the honest optimization target (over-fetch-immune by construction).
+  // Ranked by the steady-state MEAN duration (kstats) when available so a single
+  // once-per-token bubble does not skew the pick; falls back to this dispatch's
+  // own time. Only order-mapped mmvq/mmq slices carry packed bytes.
+  const isMM=f=>/mul_mat_vec|mul_mat_q|mmvq|mmq/i.test(f);
+  let best=null;
+  for(const s of D.gpu){
+    if(!isMM(s.fam) || !s.map || !s.map.packed) continue;
+    const ks=(D.has_kstats && D.kstats[s.ti+'|'+s.fam])||null;
+    const durns=(ks&&ks.n>1)?ks.mean:(s.e-s.s);
+    if(durns<=0) continue;
+    const effbw=s.map.packed/durns;   // bytes/ns == GB/s
+    if(!best||effbw<best.effbw) best={effbw,s,ks};
+  }
+  if(!best) return null;
+  const s=best.s, m=s.map, pct=best.effbw/D.peak_bw_gbs*100;
+  const avg=(best.ks&&best.ks.n>1)?` (mean of ${best.ks.n})`:` (single dispatch)`;
+  return {t0:s.s, t1:s.e, select:s,
+    label:`lowest eff-BW matvec: ${best.effbw.toFixed(1)} GB/s `+
+          `(${pct.toFixed(1)}% of peak)${avg} - ${m.role} L${m.L<0?'out':m.L}`};
+}
+const FINDERS={maxgap:findMaxIntraTokenGap, mineffbw:findMinEffBw};
+function runFind(){
+  const msg=document.getElementById('findmsg');
+  const fn=FINDERS[document.getElementById('findWhat').value];
+  const r=fn?fn():null;
+  if(!r){ msg.textContent='nothing found'; return; }
+  // Frame the span with ~1.5x padding on each side so the gap is centered and
+  // its bracketing kernels are visible; drop A/B on the exact gap edges so the
+  // measurement readout shows the gap width.
+  const w=Math.max(r.t1-r.t0,1), pad=w*1.5;
+  setView(r.t0-pad, r.t1+pad);
+  markA=r.t0; markB=r.t1;
+  msg.innerHTML=r.label;
+  if(r.select){
+    // Reuse the full click-through detail panel (weight, shape, eff-BW, avg
+    // duration, PMC, ...) for a found kernel; selectSlice() redraws.
+    selectSlice(r.select);
+  } else if(r.detail){
+    // Show the bracketing kernels in the detail pane; clear any prior selection
+    // so updateDetail() won't overwrite it until the user clicks a kernel next.
+    selectedSlice=null; selectedSlices=null; selectedFam=null;
+    tb.querySelectorAll('tr').forEach(tr=>tr.classList.remove('sel'));
+    dp.innerHTML=r.detail; dp.style.display='block';
+    draw();
+  } else {
+    draw();
+  }
+}
+document.getElementById('findGo').onclick=runFind;
+document.getElementById('findWhat').onchange=()=>{document.getElementById('findmsg').textContent='';};
 
 resize();
 </script>

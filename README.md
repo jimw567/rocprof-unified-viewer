@@ -250,6 +250,7 @@ click -> trace -> fold loop against an existing decoded `--att-dir`.
 | `--att-dir` | - | decoded rocprofv3 `--att` dir: per-instruction stalls in detail panel |
 | `--gguf` | - | GGUF model: order-map matvec dispatch -> weight (shape/pad/over-fetch) |
 | `--build-dir` | - | llama.cpp build dir: baked into the detail-panel ATT command as a full path (no env vars to fill in) |
+| `--clean-tps-file` | - | `collect.sh`'s `clean_tps.txt` (untraced llama-bench run): shows the honest decode tok/s in the header, since rocprofv3 perturbs the traced runs |
 | `--arch` | `gfx1151` | selects peak DRAM BW for the roofline |
 | `--peak-bw` | (from arch) | override peak DRAM bandwidth in GB/s |
 | `--out` | (required) | output HTML path |
