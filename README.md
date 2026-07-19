@@ -271,6 +271,11 @@ the per-device numbers (gfx1151 vs gfx1150).
 
 ![RDNA 3.5 WGP: VGPR file, LDS banks, wave slots, and gfx1151/gfx1150 constants](docs/rdna35-details.png)
 
+The same diagram is available from the generated overlay: the **RDNA 3.5 HW**
+toolbar button opens it in a modal. It is embedded as a base64 data URI, so the
+overlay stays a single self-contained file (no path to `docs/` to resolve once the
+HTML is moved or web-shared).
+
 ## gfx1151 / ROCm gotchas
 
 These are baked into `collect.sh`, but if you run rocprofv3 by hand:

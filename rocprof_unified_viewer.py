@@ -49,6 +49,7 @@ Example:
 """
 
 import argparse
+import base64
 import csv
 import json
 import os
@@ -390,6 +391,20 @@ def parse_clean_tps(path):
             if m2:
                 best = {"test": test, "tps": float(m2.group(1)), "sd": None}
     return best
+
+
+def load_hw_diagram():
+    """Base64 data-URI of docs/rdna35-details.png (the RDNA 3.5 WGP diagram) so the
+    overlay can show it inline WITHOUT breaking the self-contained-single-file
+    property -- no relative path to resolve once the HTML is moved or web-shared.
+    Returns "" if the file is absent (older checkout / stripped install)."""
+    p = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                     "docs", "rdna35-details.png")
+    try:
+        with open(p, "rb") as fh:
+            return "data:image/png;base64," + base64.b64encode(fh.read()).decode("ascii")
+    except OSError:
+        return ""
 
 
 def load_loadwidth(path):
@@ -1181,6 +1196,9 @@ def build_payload(args):
         # and a 1536-entry VGPR file (wave32); 128 KB LDS shared per WGP.
         "hw": {"wgp": 20, "simd_per_wgp": 4, "slots_per_simd": 16,
                "vgpr_per_simd": 1536, "lds_per_wgp": 131072},
+        # RDNA 3.5 WGP diagram (base64 PNG) shown by the "RDNA 3.5 HW" toolbar
+        # button; embedded so the overlay stays a single self-contained file.
+        "hw_diagram": load_hw_diagram(),
     }
     return payload
 
@@ -1301,6 +1319,7 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
         <option value="mineffbw">lowest eff-BW matvec (mmvq/mmq)</option>
       </select>
       <button id="findGo">find</button>
+      <button id="hwbtn" title="RDNA 3.5 WGP hardware reference" style="display:none">RDNA 3.5 HW</button>
       <span id="findmsg" class="sub"></span>
       <span id="viewinfo" class="sub"></span>
       <span class="legend" id="legend"></span>
@@ -1324,6 +1343,20 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
   </div>
 </div>
 <div id="hover"></div>
+<div id="hwmodal" style="display:none;position:fixed;inset:0;z-index:9999;
+  background:rgba(0,0,0,.72);align-items:center;justify-content:center;padding:24px">
+  <div style="position:relative;max-width:96vw;max-height:92vh;background:#0d1017;
+    border:1px solid #2a2f3a;border-radius:6px;padding:12px 12px 8px;overflow:auto">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+      <b style="color:#c8d0da">RDNA 3.5 WGP hardware reference</b>
+      <button id="hwclose">close &times;</button>
+    </div>
+    <img id="hwimg" alt="RDNA 3.5 WGP: VGPR file, LDS banks, wave slots, gfx1151/gfx1150 constants"
+      style="display:block;max-width:100%;height:auto;background:#fff;border-radius:3px">
+    <div class="sub" style="margin-top:6px">The fusion-analysis panel models occupancy
+      from these constants: 96 VGPR/wave = full 16-wave occupancy, 256 = scratch spill.</div>
+  </div>
+</div>
 <script>
 const D = __DATA__;
 const cv = document.getElementById('cv');
@@ -2447,6 +2480,23 @@ function runFind(){
 }
 document.getElementById('findGo').onclick=runFind;
 document.getElementById('findWhat').onchange=()=>{document.getElementById('findmsg').textContent='';};
+
+// RDNA 3.5 hardware-reference modal (embedded PNG data-URI; button hidden if the
+// diagram was not baked into the payload).
+(function(){
+  const modal=document.getElementById('hwmodal');
+  if(D.hw_diagram){
+    document.getElementById('hwimg').src=D.hw_diagram;
+    const btn=document.getElementById('hwbtn');
+    btn.style.display='';
+    const open=()=>{ modal.style.display='flex'; };
+    const close=()=>{ modal.style.display='none'; };
+    btn.onclick=open;
+    document.getElementById('hwclose').onclick=close;
+    modal.addEventListener('click', e=>{ if(e.target===modal) close(); });
+    window.addEventListener('keydown', e=>{ if(e.key==='Escape' && modal.style.display!=='none'){ e.stopPropagation(); close(); } }, true);
+  }
+})();
 
 resize();
 </script>
