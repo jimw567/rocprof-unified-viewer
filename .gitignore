@@ -8,3 +8,4 @@ loadwidth.json
 dist/
 build/
 .venv/
+Thumbs.db

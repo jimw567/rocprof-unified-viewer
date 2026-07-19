@@ -260,6 +260,17 @@ click -> trace -> fold loop against an existing decoded `--att-dir`.
 | `--gap-threshold-us` | `150` | inter-dispatch gap marking a token boundary |
 | `--title` | `llama.cpp decode overlay (gfx1151)` | HTML title |
 
+## RDNA 3.5 hardware reference
+
+The selected-kernel **fusion-analysis** panel models occupancy from the RDNA 3.5
+(gfx1151) WGP layout: 20 WGP, each = 2 CU = 4 SIMD32, each SIMD32 holds 16 wave32
+slots over a 1536-VGPR file, so 1536/16 = **96 VGPR/wave** is the most a wave can
+use and still hit full 16-wave occupancy (above that costs resident waves; above
+256 spills to scratch). The diagram below is the reference for those constants and
+the per-device numbers (gfx1151 vs gfx1150).
+
+![RDNA 3.5 WGP: VGPR file, LDS banks, wave slots, and gfx1151/gfx1150 constants](docs/rdna35-details.png)
+
 ## gfx1151 / ROCm gotchas
 
 These are baked into `collect.sh`, but if you run rocprofv3 by hand:
