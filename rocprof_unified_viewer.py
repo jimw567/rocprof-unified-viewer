@@ -1295,6 +1295,8 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
   #tbl tbody tr{cursor:pointer;}
   #tbl tbody tr:hover{background:#1b2130;}
   #tbl tbody tr.sel{background:#2a3550;box-shadow:inset 3px 0 0 #ffffff;}
+  #detail tr.shrow{cursor:pointer;}
+  #detail tr.shrow:hover{background:#1b2130;}
   #tbl tfoot td{position:sticky;bottom:0;background:var(--panel);color:#cfd6e4;
                 font-weight:600;border-top:1px solid var(--line);}
   #tbl tfoot tr:first-child td{border-top:2px solid #4a5165;}
@@ -1318,7 +1320,8 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
         <option value="maxgap">largest intra-token gap</option>
         <option value="mineffbw">lowest eff-BW matvec (mmvq/mmq)</option>
       </select>
-      <button id="findGo">find</button>
+      <button id="findGo" title="find (click again for next-largest)">find next</button>
+      <button id="findPrev" title="previous (larger) match">find prev</button>
       <button id="hwbtn" title="RDNA 3.5 WGP hardware reference" style="display:none">RDNA 3.5 HW</button>
       <span id="findmsg" class="sub"></span>
       <span id="viewinfo" class="sub"></span>
@@ -1459,15 +1462,24 @@ function textOn(bg){
 // Draw a slice's name INSIDE its box, but only when the box is wide enough to
 // hold the whole name (no clipping/ellipsis). Plain fillText (no outline) so it
 // renders as crisply as the axis/token labels; inherits the box's globalAlpha.
+// The label is pinned to the VISIBLE left edge of the box: when zoomed in so the
+// box's real left edge is scrolled off-screen, the name sticks at the viewport
+// edge (Perfetto-style) instead of vanishing with the off-screen edge. It is
+// still never allowed to spill past the box's right edge.
 function boxLabel(label, x, wpx, midY, bg){
-  if (wpx < 14) return;                       // too thin to bother measuring
+  const W = cv.clientWidth;
+  const vx0 = Math.max(x, 0), vx1 = Math.min(x + wpx, W);
+  const vis = vx1 - vx0;                        // on-screen width of this box
+  if (vis < 14) return;                         // too little visible to bother
   ctx.font = '10px sans-serif';
   const tw = ctx.measureText(label).width;
-  if (tw + 8 > wpx) return;                    // name would not fully fit
+  if (tw + 8 > vis) return;                      // name would not fully fit in view
+  let tx = Math.max(x, 0) + 4;                   // pin to the visible left edge
+  tx = Math.min(tx, (x + wpx) - tw - 4);         // but keep it inside the box's right
   const prevBaseline = ctx.textBaseline;
   ctx.textBaseline = 'middle';
   ctx.fillStyle = textOn(bg);
-  ctx.fillText(label, x+4, midY);
+  ctx.fillText(label, tx, midY);
   ctx.textBaseline = prevBaseline;
 }
 
@@ -1873,56 +1885,77 @@ function fusionSection(sl, gs, totDur){
   return h;
 }
 // Family view: when a per-kernel-family row is selected (no single slice), list
-// every order-mapped shape in that family with its packed footprint + effective BW.
+// every order-mapped dispatch in that family with its packed footprint + effective BW.
 function renderFamilyMembers(){
   const fam=selectedFam;
   const KB=b=>b>=1048576?(b/1048576).toFixed(1)+' MB':(b/1024).toFixed(1)+' KB';
-  const groups=new Map();
-  for(const s of D.gpu){
-    if(s.fam!==fam || !s.map) continue;
-    const m=s.map, key=m.role+'|'+m.K+'x'+m.trueN+'|'+m.q;
-    let g=groups.get(key);
-    if(!g){ g={role:m.role,K:m.K,N:m.trueN,q:m.q,packed:m.packed,fused:m.fused,es:0,ep:0,dur:0,of:0,ofn:0,n:0}; groups.set(key,g); }
-    g.es+=m.effbw||0; g.ep+=m.effbw_pct||0; g.dur+=(s.e-s.s); g.n++;
-    if(m.overfetch){ g.of+=m.overfetch; g.ofn++; }
-  }
-  const gs=[...groups.values()].sort((a,b)=>b.packed-a.packed);
+  // One row per dispatch -- NO aggregation. A per-shape mean would hide a bimodal
+  // split (the same attn_q shape runs a stable ~57us at some layers and ~68us at
+  // others -- structurally identical work, different by layer position), and would
+  // also blend in the ~+24us interrupt-latency timestamp artifact that hits ~5% of
+  // gfx1151 dispatches. Listing every dispatch keeps each measured time honest and
+  // lets both effects be seen directly. Rows are ordered so dispatches with the
+  // same role+shape are adjacent, then by layer, then by execution time -- so
+  // repeats of one weight sit together for eyeballing the spread.
+  const rows=[];
+  for(const s of D.gpu){ if(s.fam===fam && s.map) rows.push(s); }
+  rows.sort((a,b)=>{
+    const ma=a.map, mb=b.map;
+    if(ma.role!==mb.role) return ma.role<mb.role?-1:1;
+    if(ma.K!==mb.K) return ma.K-mb.K;
+    if(ma.trueN!==mb.trueN) return ma.trueN-mb.trueN;
+    if(ma.q!==mb.q) return ma.q<mb.q?-1:1;
+    if(ma.L!==mb.L) return ma.L-mb.L;
+    return a.s-b.s;
+  });
   let h=`<h2>Kernel family/Token</h2>`+
     `<div style="color:#7fd1ff;word-break:break-all;margin-bottom:6px">${fam}`+
-    `<span class="r"> (${gs.length} distinct shape${gs.length===1?'':'s'})</span></div>`;
-  if(!gs.length){
+    `<span class="r"> (${rows.length} dispatch${rows.length===1?'':'es'})</span></div>`;
+  if(!rows.length){
     h+=`<div class="sub">No order-mapped dispatches in this family`+
        (D.has_map?`.`:` -- run with --gguf to attach shape / packed footprint / effective BW.`)+`</div>`;
     dp.innerHTML=h; dp.style.display='block'; return;
   }
   h+=`<table><thead><tr><th style="text-align:left">role</th>`+
+     `<th style="text-align:left">layer</th>`+
      `<th style="text-align:left">shape [K x N]</th><th style="text-align:left">packed</th>`+
      `<th style="text-align:left">kernel time</th>`+
      `<th style="text-align:left">eff BW</th><th style="text-align:left">eff BW %</th>`+
-     `<th style="text-align:left">over-fetch</th>`+
-     `<th style="text-align:left">cnt/tok</th></tr></thead><tbody>`;
-  for(const g of gs){
-    const eb=g.n?g.es/g.n:0, ep=g.n?g.ep/g.n:0, dt=g.n?g.dur/g.n:0;
-    const of=g.ofn?(g.of/g.ofn):0;
-    h+=`<tr><td style="color:#ffd479">${g.role}</td>`+
-       `<td>${g.K} x ${g.N} <span class="r">${g.q}</span></td>`+
-       `<td>${KB(g.packed)}${g.fused?` <span class="r">(${g.fused})</span>`:``}</td>`+
-       `<td>${fmtus(dt)}</td>`+
+     `<th style="text-align:left">over-fetch</th></tr></thead><tbody>`;
+  // Shade alternating role+shape+layer groups so a weight's repeats cluster visually.
+  let prevKey=null, band=0;
+  rows.forEach((s,i)=>{
+    const m=s.map, dur=s.e-s.s;
+    const eb=dur?(m.packed/dur):0;
+    const ep=D.peak_bw_gbs?(eb/D.peak_bw_gbs*100):0;
+    const key=m.role+'|'+m.K+'x'+m.trueN+'|'+m.q+'|L'+m.L;
+    if(key!==prevKey){ band^=1; prevKey=key; }
+    h+=`<tr class="shrow" data-idx="${i}" title="frame this dispatch in the timeline"`+
+       (band?` style="background:rgba(255,255,255,.04)"`:``)+`>`+
+       `<td style="color:#ffd479">${m.role}</td>`+
+       `<td>${m.L<0?'out':('L'+m.L)}</td>`+
+       `<td>${m.K} x ${m.trueN} <span class="r">${m.q}</span></td>`+
+       `<td>${KB(m.packed)}${m.fused?` <span class="r">(${m.fused})</span>`:``}</td>`+
+       `<td>${fmtus(dur)}</td>`+
        `<td style="color:#8fe388">${eb.toFixed(1)} GB/s</td>`+
        `<td style="color:#8fe388">${ep.toFixed(1)}%</td>`+
-       `<td>${of?of.toFixed(2)+'x':'<span class="r">-</span>'}</td>`+
-       `<td>${(g.n/(D.n_tokens_baked||1)).toFixed(1)}</td></tr>`;
-  }
-  const tot=gs.reduce((a,g)=>a+g.n,0);
+       `<td>${m.overfetch?m.overfetch.toFixed(2)+'x':'<span class="r">-</span>'}</td></tr>`;
+  });
   h+=`</tbody></table>`+
-     `<div class="sub" style="margin-top:6px">All order-mapped dispatches of `+
-     `<b>${fam}</b> in the baked span, grouped by role + shape. <b>packed</b> = theoretical `+
-     `on-disk weight bytes (gate+up folded when fused); <b>kernel time</b> + <b>eff BW</b> `+
-     `(= packed / dispatch time) are means over the ${tot} dispatches `+
-     `(over-fetch-immune, vs peak ${D.peak_bw_gbs} GB/s). <b>cnt/tok</b> = `+
-     `dispatches per baked token (${D.n_tokens_baked} baked). `+
-     `Click any timeline slice for its full per-dispatch panel.</div>`;
+     `<div class="sub" style="margin-top:6px">Every order-mapped dispatch of `+
+     `<b>${fam}</b> in the baked span (${D.n_tokens_baked} tokens), one row per dispatch `+
+     `(no averaging), ordered so same role+shape sit together. <b>packed</b> = theoretical `+
+     `on-disk weight bytes (gate+up folded when fused); <b>kernel time</b> = this dispatch's `+
+     `measured Start->End (raw; ~5% of gfx1151 dispatches carry a ~+24us interrupt-latency `+
+     `timestamp artifact -- visible as a lone inflated row); <b>eff BW</b> = packed / kernel `+
+     `time (over-fetch-immune, vs peak ${D.peak_bw_gbs} GB/s). `+
+     `Click a row to frame that dispatch in the timeline.</div>`;
   dp.innerHTML=h; dp.style.display='block';
+  // Row click frames + selects that exact dispatch, reusing find's framing.
+  dp.querySelectorAll('tr.shrow').forEach(tr=>{
+    tr.onclick=()=>{ const s=rows[+tr.dataset.idx];
+      if(s) applyFindResult({t0:s.s, t1:s.e, select:s}); };
+  });
 }
 function renderSelectedKernel(){
   const s=selectedSlice, fc=D.fam_counters[s.fam]||{};
@@ -2204,6 +2237,22 @@ tb.querySelectorAll('tr').forEach(tr=>{
 
 // hover
 const hv = document.getElementById('hover');
+// Hit-test the drawn rects at (mx,my): exact containment first (topmost/last-drawn
+// slice wins), then a nearest-rect fallback within HIT_SLOP px in the SAME lane.
+// Sub-pixel-narrow slices draw only ~1px wide, so an exact-only test makes them
+// nearly impossible to point at; the slop gives every slice a usable catch radius
+// without shifting which slice wins where cells are wide enough to hit exactly.
+const HIT_SLOP=4;
+function hitTest(mx,my){
+  for(let i=rects.length-1;i>=0;i--){const q=rects[i];
+    if(mx>=q.x&&mx<=q.x+q.w&&my>=q.y&&my<=q.y+q.h) return q;}
+  let best=null, bd=HIT_SLOP;
+  for(let i=rects.length-1;i>=0;i--){const q=rects[i];
+    if(my<q.y||my>q.y+q.h) continue;               // only rects in the pointed-at lane
+    const d = mx<q.x ? q.x-mx : (mx>q.x+q.w ? mx-(q.x+q.w) : 0);
+    if(d<bd){bd=d; best=q;}}
+  return best;
+}
 cv.addEventListener('mousemove', e=>{
   if(dragging||rbActive||markDrag){hv.style.display='none';return;}
   const r = cv.getBoundingClientRect();
@@ -2211,9 +2260,7 @@ cv.addEventListener('mousemove', e=>{
   // cursor hint when hovering a marker line
   const wC=cv.clientWidth;
   cv.style.cursor = Math.min(Math.abs(mx-xOf(markA,wC)),Math.abs(mx-xOf(markB,wC)))<=6 ? 'ew-resize' : '';
-  let hit=null;
-  for (let i=rects.length-1;i>=0;i--){const q=rects[i];
-    if(mx>=q.x&&mx<=q.x+q.w&&my>=q.y&&my<=q.y+q.h){hit=q;break;}}
+  let hit=hitTest(mx,my);
   if(!hit){hv.style.display='none';return;}
   let html='';
   if(hit.type==='gpu'){
@@ -2343,15 +2390,12 @@ cv.addEventListener('mousedown', e=>{
 // hit-test a point against the drawn rects; select the GPU slice's family (or clear).
 // toggle=true (Ctrl/Cmd+click) adds/removes the hit slice from the multi-select set.
 function clickSelect(mx,my,toggle){
-  for(let i=rects.length-1;i>=0;i--){const q=rects[i];
-    if(mx>=q.x&&mx<=q.x+q.w&&my>=q.y&&my<=q.y+q.h){
-      if(q.type==='gpu'){
-        if(toggle) toggleSlice(q.p);
-        else selectSlice(selectedSlice===q.p ? null : q.p);
-        return;
-      }
-      break;
-    }}
+  const q=hitTest(mx,my);
+  if(q && q.type==='gpu'){
+    if(toggle) toggleSlice(q.p);
+    else selectSlice(selectedSlice===q.p ? null : q.p);
+    return;
+  }
   if(!toggle) selectSlice(null);   // plain click on empty clears; modifier-click keeps selection
 }
 window.addEventListener('mousemove', e=>{
@@ -2392,38 +2436,55 @@ cv.addEventListener('dblclick', markersToView);
 // --- Find: extensible "jump to X" registry ---------------------------------
 // Each finder returns {t0,t1,label} (a time span to frame + a status string) or
 // null. Add entries here + an <option> in #findWhat to grow the menu.
+// The second of the two baked/displayed decode tokens: [tok_starts[view_i1-1],
+// tok_starts[view_i1]). Finders scope to it because it is a complete token cycle
+// (the first displayed token can be entered mid-relaunch), so a match maps to a
+// real, self-contained token. Returns null if there aren't two token boundaries.
+function secondTokenWin(){
+  const ts=D.tok_starts||[];
+  const hi=D.view_i1, lo=hi-1;
+  if(lo<0 || hi>=ts.length) return null;
+  return {t0:ts[lo], t1:ts[hi]};
+}
+// Identity of a slice as kernel + weight shape (role, [K x N], quant), so the
+// same kernel/shape recurring across the model's ~40 layers collapses to one
+// entry in the find list. Falls back to the family name for unmapped slices.
+function shapeKey(s){
+  const m=s.map;
+  return m ? (s.fam+'#'+m.role+'#'+m.K+'x'+m.trueN+'#'+m.q) : s.fam;
+}
 function findMaxIntraTokenGap(){
-  // Largest gap between consecutive GPU slices that does NOT cross a token
-  // boundary. tok_starts are the per-token first-dispatch times; a gap whose
-  // span contains one is the inter-token relaunch gap, which we exclude.
-  const g=[...D.gpu].sort((a,b)=>a.s-b.s);
-  const ts=(D.tok_starts||[]).slice().sort((a,b)=>a-b);
-  const crossesBoundary=(a,b)=>{ // is there a tok_start T with a < T <= b ?
-    let lo=0,hi=ts.length; while(lo<hi){const m=(lo+hi)>>1; if(ts[m]<=a) lo=m+1; else hi=m;}
-    return lo<ts.length && ts[lo]<=b;
-  };
-  let best=null;
+  // Largest gap between consecutive GPU slices within the second decode token.
+  // Scoped to one full token, so no token boundary can fall inside the window.
+  const win=secondTokenWin();
+  const g=[...D.gpu].filter(x=> !win || (x.s>=win.t0 && x.s<win.t1))
+                    .sort((a,b)=>a.s-b.s);
+  const dot=s=>`<span class="fam-dot" style="background:${D.colors[s.stall]||D.colors.unknown}"></span>`;
+  // Dedup by the (bracketing kernel+shape) pair, keeping the largest instance of
+  // each recurring gap type so the same edge does not repeat once per layer.
+  const byKey=new Map();
   for(let i=0;i+1<g.length;i++){
     const gap=g[i+1].s-g[i].e;
     if(gap<=0) continue;
-    if(crossesBoundary(g[i].e,g[i+1].s)) continue;   // token-boundary gap
-    if(!best||gap>best.gap) best={gap,a:g[i],b:g[i+1]};
+    const a=g[i], b=g[i+1];
+    const key=shapeKey(a)+' -> '+shapeKey(b);
+    const cur=byKey.get(key);
+    if(cur && (cur.t1-cur.t0)>=gap) continue;   // already have a bigger instance
+    const detail=`<h2>Find: intra-token gap</h2>`+
+      `<div class="sub" style="margin-bottom:8px">GPU idle between two consecutive `+
+      `kernels within the second (full) decode token.</div>`+
+      `<table><tbody>`+
+      `<tr><td>gap (GPU idle)</td><td><b>${fmtdur(gap)}</b></td></tr>`+
+      `<tr><td>ending kernel (before gap)</td><td>${dot(a)}${a.fam} `+
+        `<span class="sub">(${fmtus(a.e-a.s)})</span></td></tr>`+
+      `<tr><td>starting kernel (after gap)</td><td>${dot(b)}${b.fam} `+
+        `<span class="sub">(${fmtus(b.e-b.s)})</span></td></tr>`+
+      `</tbody></table>`;
+    byKey.set(key,{t0:a.e, t1:b.s, detail,
+      label:`intra-token gap: ${fmtdur(gap)} (${a.fam} &rarr; ${b.fam})`});
   }
-  if(!best) return null;
-  const dot=s=>`<span class="fam-dot" style="background:${D.colors[s.stall]||D.colors.unknown}"></span>`;
-  const detail=`<h2>Find: largest intra-token gap</h2>`+
-    `<div class="sub" style="margin-bottom:8px">GPU idle between two consecutive `+
-    `kernels within one decode token (token-boundary gaps excluded).</div>`+
-    `<table><tbody>`+
-    `<tr><td>gap (GPU idle)</td><td><b>${fmtdur(best.gap)}</b></td></tr>`+
-    `<tr><td>ending kernel (before gap)</td><td>${dot(best.a)}${best.a.fam} `+
-      `<span class="sub">(${fmtus(best.a.e-best.a.s)})</span></td></tr>`+
-    `<tr><td>starting kernel (after gap)</td><td>${dot(best.b)}${best.b.fam} `+
-      `<span class="sub">(${fmtus(best.b.e-best.b.s)})</span></td></tr>`+
-    `</tbody></table>`;
-  return {t0:best.a.e, t1:best.b.s, detail,
-          label:`largest intra-token gap: ${fmtdur(best.gap)} `+
-                `(${best.a.fam} &rarr; ${best.b.fam})`};
+  // Ranked largest gap first; "next" walks toward smaller gaps.
+  return [...byKey.values()].sort((x,y)=>(y.t1-y.t0)-(x.t1-x.t0));
 }
 function findMinEffBw(){
   // matvec/matmul dispatch with the lowest effective (useful-work) bandwidth =
@@ -2434,35 +2495,41 @@ function findMinEffBw(){
   // once-per-token bubble does not skew the pick; falls back to this dispatch's
   // own time. Only order-mapped mmvq/mmq slices carry packed bytes.
   const isMM=f=>/mul_mat_vec|mul_mat_q|mmvq|mmq/i.test(f);
-  let best=null;
+  const win=secondTokenWin();
+  // Dedup by kernel+shape, keeping the lowest-eff-BW instance so a matvec that
+  // recurs identically across layers shows once (at its worst case) in the list.
+  const byKey=new Map();
   for(const s of D.gpu){
+    if(win && (s.s<win.t0 || s.s>=win.t1)) continue;   // scope to the 2nd token
     if(!isMM(s.fam) || !s.map || !s.map.packed) continue;
     const ks=(D.has_kstats && D.kstats[s.ti+'|'+s.fam])||null;
     const durns=(ks&&ks.n>1)?ks.mean:(s.e-s.s);
     if(durns<=0) continue;
     const effbw=s.map.packed/durns;   // bytes/ns == GB/s
-    if(!best||effbw<best.effbw) best={effbw,s,ks};
+    const key=shapeKey(s);
+    const cur=byKey.get(key);
+    if(cur && cur.effbw<=effbw) continue;   // already have a lower-eff-BW instance
+    const m=s.map, pct=effbw/D.peak_bw_gbs*100;
+    const avg=(ks&&ks.n>1)?` (mean of ${ks.n})`:` (single dispatch)`;
+    byKey.set(key,{effbw, t0:s.s, t1:s.e, select:s,
+      label:`eff-BW matvec: ${effbw.toFixed(1)} GB/s `+
+            `(${pct.toFixed(1)}% of peak)${avg} - ${m.role} L${m.L<0?'out':m.L}`});
   }
-  if(!best) return null;
-  const s=best.s, m=s.map, pct=best.effbw/D.peak_bw_gbs*100;
-  const avg=(best.ks&&best.ks.n>1)?` (mean of ${best.ks.n})`:` (single dispatch)`;
-  return {t0:s.s, t1:s.e, select:s,
-    label:`lowest eff-BW matvec: ${best.effbw.toFixed(1)} GB/s `+
-          `(${pct.toFixed(1)}% of peak)${avg} - ${m.role} L${m.L<0?'out':m.L}`};
+  // Ranked lowest eff-BW first; "next" walks toward higher eff-BW.
+  return [...byKey.values()].sort((x,y)=>x.effbw-y.effbw);
 }
 const FINDERS={maxgap:findMaxIntraTokenGap, mineffbw:findMinEffBw};
-function runFind(){
-  const msg=document.getElementById('findmsg');
-  const fn=FINDERS[document.getElementById('findWhat').value];
-  const r=fn?fn():null;
-  if(!r){ msg.textContent='nothing found'; return; }
-  // Frame the span with ~1.5x padding on each side so the gap is centered and
-  // its bracketing kernels are visible; drop A/B on the exact gap edges so the
-  // measurement readout shows the gap width.
+// Each finder returns a list ranked most-significant first (largest gap / lowest
+// eff-BW). findState walks that ranked list: "find" (or re-clicking it) steps to
+// the next result, "prev" steps back; both wrap. Changing the finder resets it.
+let findState={what:null, list:[], idx:0};
+function applyFindResult(r){
+  // Frame the span with ~1.5x padding on each side so the region is centered and
+  // its bracketing kernels are visible; markers sit on the exact edges so the
+  // measurement readout shows the width.
   const w=Math.max(r.t1-r.t0,1), pad=w*1.5;
   setView(r.t0-pad, r.t1+pad);
   markA=r.t0; markB=r.t1;
-  msg.innerHTML=r.label;
   if(r.select){
     // Reuse the full click-through detail panel (weight, shape, eff-BW, avg
     // duration, PMC, ...) for a found kernel; selectSlice() redraws.
@@ -2478,8 +2545,33 @@ function runFind(){
     draw();
   }
 }
-document.getElementById('findGo').onclick=runFind;
-document.getElementById('findWhat').onchange=()=>{document.getElementById('findmsg').textContent='';};
+function runFind(dir){
+  const msg=document.getElementById('findmsg');
+  const what=document.getElementById('findWhat').value;
+  if(findState.what!==what || !findState.list.length){
+    const fn=FINDERS[what];
+    findState.list = fn?fn():[];
+    findState.what = what;
+    findState.idx = 0;                 // fresh find starts at the top rank
+  } else {
+    const n=findState.list.length;
+    findState.idx = ((findState.idx + dir) % n + n) % n;   // step + wrap
+  }
+  const list=findState.list;
+  if(!list.length){ msg.textContent='nothing found'; return; }
+  const r=list[findState.idx];
+  applyFindResult(r);   // populates the detail pane (via selectSlice or r.detail)
+  msg.textContent='';   // status lives in the detail pane now, not the toolbar
+  const banner=`<div class="sub" style="margin-bottom:8px">`+
+    `<b>find</b> #${findState.idx+1}/${list.length} &middot; ${r.label}</div>`;
+  dp.insertAdjacentHTML('afterbegin', banner);
+  dp.style.display='block';
+}
+document.getElementById('findGo').onclick=()=>runFind(1);
+document.getElementById('findPrev').onclick=()=>runFind(-1);
+document.getElementById('findWhat').onchange=()=>{
+  findState.what=null; findState.list=[]; findState.idx=0;
+  document.getElementById('findmsg').textContent='';};
 
 // RDNA 3.5 hardware-reference modal (embedded PNG data-URI; button hidden if the
 // diagram was not baked into the payload).
