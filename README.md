@@ -179,6 +179,93 @@ ATT filters by kernel **symbol**, so a trace of `mul_mat_vec_q` captures every
 quant/shape variant of it; the viewer keys the folded stalls by the same family
 name (quant suffix included) as the rest of the overlay, so they line up.
 
+By default `collect-att.sh` runs a short `llama-bench` decode as the workload.
+For single-kernel optimization you can point ATT at a **single-op evaluator**
+instead, with `--runner "CMD"` -- the command runs with its working directory set
+to `--build-dir`, so a bundled binary is `./name`. This isolates one op (no full
+model graph), which means far fewer cut-off dispatches and controlled shapes. For
+example, using the llama.cpp `test-backend-ops` perf harness:
+
+```bash
+./collect-att.sh --kernel 'mul_mat_vec_q' \
+    --build-dir /path/to/build/bin --out-dir att-mmvq --rocm /path/to/rocm \
+    --runner './test-backend-ops perf -o MUL_MAT -p type_a=q4_K'
+```
+
+With `--runner`, `--model` is not required and `-n` / trailing `-- llama-bench
+flags` do not apply (put any workload flags inside the quoted runner string). The
+companion server exposes the same option as `serve.py --runner "CMD"`.
+
+#### Open debug view (annotated ISA)
+
+The summary above is a top-N digest. For single-kernel optimization the detail
+panel also offers an **Open debug view** button (shown once ATT data is loaded for
+that kernel). It opens a **new browser tab** with the kernel's *complete*
+program-order disassembly -- every instruction with its address, hit count,
+latency, stall, stall%, and idle cycles -- with a stall heat bar and a text filter,
+so you can scan a few thousand instructions for the hot PCs on a full screen. The
+tab is written client-side from data already embedded in the page, so it works both
+from a static HTML file and from the companion server (after **Trace now**).
+
+Hovering any instruction shows a tooltip with a one-line description of that opcode,
+drawn from a built-in RDNA3.5 ISA glossary (keyed on the mnemonic, matched after
+stripping `_e32`/`_e64`/`_dpp` encoding suffixes). So you can read a raw disassembly
+without cross-referencing the AMD "RDNA3.5" Instruction Set Architecture reference.
+The glossary is embedded only when a debug view exists, so the no-ATT path is
+unchanged.
+
+Special registers and wait-counters in the operand text are also hoverable: tokens
+like `vmcnt`, `vscnt`, `lgkmcnt`, `expcnt`, `scc`, `exec`, `vcc`, `m0` are underlined
+and show what they mean on hover (e.g. `s_waitcnt vmcnt(0)` explains that `vmcnt` is
+the outstanding vector-memory-load counter). This resolves the two things you need to
+read a wait-heavy decode kernel -- what the opcode does and which hardware counter it
+is blocking on -- without leaving the page.
+
+Linking ISA back to **source lines** requires the traced code object to carry DWARF
+line tables. A default release build of `libggml-hip.so` has none, so the debug
+view is **ISA-only** and shows a note to that effect. To enable source linking,
+build ggml-hip with line info (`-gline-tables-only`, or `-g`) and re-trace; the
+decoder then populates per-instruction line info and the view becomes a
+**synchronized two-pane** layout: the program-order ISA on the left (the driving
+pane), source on the right (per-line stall heat). Clicking an instruction jumps to
+its source line; clicking a source line highlights and scrolls to its instructions.
+Source text is embedded by basename only -- the absolute build path never reaches
+the HTML.
+
+#### Step mode (executed order)
+
+When the trace also decoded per-wave execution streams, the debug view adds a
+**Step** control that walks one representative wave's instructions in *executed*
+order (following real branches and loops), rather than static program order. Use
+**Prev/Next** (or the arrow keys) to advance one executed instruction at a time, and
+the **src line** buttons (or **H**/**L**) to jump to the next/previous distinct
+source line. Both panes highlight and scroll to the current step, and a readout
+shows the step index, the elapsed cycle offset, and the per-step **dwell** (cycles
+until the next issue) -- so a long dwell on an `s_waitcnt` reveals exactly where the
+wave stalls on memory. This reflects the one sampled wave, not an average over all
+waves.
+
+#### Wave View (occupancy global view)
+
+When per-wave state timelines were decoded, the debug view header shows a **Wave
+View** button that opens a full-screen occupancy view laid out like
+rocprof-compute-viewer's Global View: a structured left gutter of **SE / SA / CU /
+SM / SL / ID** columns identifies each wave, every captured wave is one horizontal
+lane, all lanes share a single (absolute) cycle axis, and each lane is colored by the
+wave's hardware state over time -- **Exec** (green), **Wait** (amber, e.g. blocked on
+`s_waitcnt`), **Stall** (red), and **Idle** (grey). Lanes are sorted by hardware
+location (SE, CU, SIMD, slot, wave id) with a separator between SIMD groups. Because
+the lanes are cycle-aligned you can see the whole dispatch's wave occupancy at a
+glance: how many waves are resident concurrently, how their lifetimes stagger as slots
+free up, and how much of each wave's life is spent waiting on memory versus executing
+-- for a bandwidth-bound decode kernel the lanes are overwhelmingly amber. Hover any
+lane for its full coordinates, state, cycle, begin/end/duration, and kernel. A
+group-by selector also offers an aggregate-by-slot mode (all waves that shared a slot
+overlaid on one lane). SA is not carried in the ATT wave records (single-SA capture),
+so it renders 0. Each wave's timeline is downsampled and run-length encoded at
+generation time, so the view stays a few tens of KB regardless of dispatch length.
+Press **Esc** or **Close** to return.
+
 ### Live tracing (companion server)
 
 The copy-paste ATT round-trip above works but is clunky. `serve.py` closes the

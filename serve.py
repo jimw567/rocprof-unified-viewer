@@ -38,8 +38,9 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-from rocprof_unified_viewer import (add_common_args, build_payload,
-                                    load_att_stats, render_html)
+from rocprof_unified_viewer import (ISA_GLOSSARY, REG_GLOSSARY, add_common_args,
+                                    build_payload, load_att_code, load_att_stats,
+                                    render_html)
 
 # --- global server state (set in main) --------------------------------------
 _ARGS = None
@@ -106,12 +107,18 @@ def _run_att_on_host(host, sym, out_dir):
     # everything anyway. Never shell=True.
     sh_args = ["--", "--kernel", sym,
                "--build-dir", _ARGS.build_dir,
-               "--model", _ARGS.model,
                "--out-dir", out_dir,
                "--rocm", _ARGS.rocm]
-    bench = shlex.split(_ARGS.bench_flags) if _ARGS.bench_flags else []
-    if bench:
-        sh_args += ["--"] + bench
+    if _ARGS.runner:
+        # Single-kernel evaluator instead of the full llama-bench graph. The
+        # runner string is passed as one collect-att.sh arg (it word-splits it);
+        # --model / --bench-flags do not apply in this mode.
+        sh_args += ["--runner", _ARGS.runner]
+    else:
+        sh_args += ["--model", _ARGS.model]
+        bench = shlex.split(_ARGS.bench_flags) if _ARGS.bench_flags else []
+        if bench:
+            sh_args += ["--"] + bench
     argv = _ssh_base(host) + ["bash", "-s"] + [shlex.quote(a) for a in sh_args]
     try:
         proc = subprocess.run(argv, input=script_src, capture_output=True,
@@ -141,7 +148,7 @@ def _do_trace(sym):
                               "exclusive) -- try again shortly"}
     try:
         if _ARGS.stub_att_dir:
-            stats = load_att_stats(_ARGS.stub_att_dir)
+            src_dir = _ARGS.stub_att_dir
             host = "stub"
         else:
             host, rows = _pick_free_host()
@@ -150,18 +157,20 @@ def _do_trace(sym):
                              "error": "no reachable host in $%s (%s)"
                                       % (_ARGS.hosts_env,
                                          ":".join(r["host"] for r in rows) or "empty")}
-            out_dir = os.path.join(_out_base(), "att-" + sym)
-            os.makedirs(out_dir, exist_ok=True)
-            ok, log = _run_att_on_host(host, sym, out_dir)
+            src_dir = os.path.join(_out_base(), "att-" + sym)
+            os.makedirs(src_dir, exist_ok=True)
+            ok, log = _run_att_on_host(host, sym, src_dir)
             if not ok:
                 return 500, {"ok": False, "error": log, "host": host}
-            stats = load_att_stats(out_dir)
+        stats = load_att_stats(src_dir)
+        code = load_att_code(src_dir)
         if not stats:
             return 500, {"ok": False, "host": host,
                          "error": "trace produced no populated dispatches "
                                   "(all cut off) -- retry"}
         _ATT_CACHE.update(stats)
-        return 200, {"ok": True, "host": host, "fam_stats": stats}
+        return 200, {"ok": True, "host": host, "fam_stats": stats,
+                     "fam_code": code}
     finally:
         _TRACE_LOCK.release()
 
@@ -256,6 +265,13 @@ def main():
     ap.add_argument("--bench-flags", default="-fa 1",
                     help="llama-bench flags passed through to collect-att.sh after "
                          "-- (default '-fa 1'; must match how the trace was collected)")
+    ap.add_argument("--runner",
+                    help="run a single-kernel evaluator under ATT instead of the "
+                         "full llama-bench decode graph (passed to collect-att.sh "
+                         "--runner; cwd = --build-dir). Fewer cutoff dispatches, "
+                         "controlled shapes. Example: "
+                         "'./test-backend-ops perf -o MUL_MAT -p type_a=q4_K'. "
+                         "When set, --model / --bench-flags are not used.")
     ap.add_argument("--trace-timeout", type=int, default=300,
                     help="seconds to wait for a board ATT trace (default 300)")
     ap.add_argument("--stub-att-dir",
@@ -272,11 +288,17 @@ def main():
             ap.error("--rocm (or $ROCM_DIR) is required unless --stub-att-dir is set")
         if not args.build_dir:
             ap.error("--build-dir is required unless --stub-att-dir is set")
-        if not args.model:
-            ap.error("--model (or --gguf) is required unless --stub-att-dir is set")
+        if not args.model and not args.runner:
+            ap.error("--model (or --gguf) is required unless --stub-att-dir or "
+                     "--runner is set")
 
     _PAYLOAD = build_payload(args)
     _PAYLOAD["att_server"] = True
+    # In live-server mode the debug view is produced on demand via "Trace now",
+    # so embed the full ISA + register glossaries even when no --att-dir was
+    # given at startup (build_payload only embeds them when att code is present).
+    _PAYLOAD["isa_gloss"] = ISA_GLOSSARY
+    _PAYLOAD["reg_gloss"] = REG_GLOSSARY
     _ALLOWED_SYMS = {fam.split("[", 1)[0] for fam in _PAYLOAD["fam_counters"]}
     _HTML = render_html(_PAYLOAD).encode()
 

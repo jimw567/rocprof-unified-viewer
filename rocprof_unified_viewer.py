@@ -58,6 +58,12 @@ import statistics
 import sys
 from collections import defaultdict
 
+try:
+    from isa_glossary import ISA_GLOSSARY, REG_GLOSSARY
+except ImportError:
+    ISA_GLOSSARY = {}
+    REG_GLOSSARY = {}
+
 
 # --- stall classification thresholds (tunable) --------------------------------
 # Derived from gfx1151 4B decode PMC: mul_mat_vec_q = MemBusy 77 / L2 8 (memory);
@@ -443,12 +449,20 @@ def load_att_stats(att_dir):
         try:
             with open(path) as fh:
                 for r in csv.DictReader(fh):
-                    src = (r.get("Source") or "").strip()
-                    if src:
-                        cur = family_of(src)
-                    if not cur:
-                        continue
                     instr = (r.get("Instruction") or "").strip()
+                    # A family-header row's Instruction is the `;`-prefixed mangled
+                    # symbol; its Source column carries the demangled name. Only
+                    # these rows set the family. Instruction rows keep the current
+                    # family even though a debug (`-g`) build now puts a source
+                    # path in their Source column -- treating that as a new family
+                    # would spawn one bogus family per source line.
+                    if instr.startswith(";"):
+                        src = (r.get("Source") or "").strip()
+                        if src:
+                            cur = family_of(src)
+                        continue
+                    if not cur or not instr:
+                        continue
 
                     def _i(k):
                         try:
@@ -490,6 +504,420 @@ def load_att_stats(att_dir):
                     for i, v in top],
             "byclass": [[op, st] for op, st in byclass],
         }
+    return out
+
+
+def _att_src_split(s):
+    """Return (fullpath, line) for the deepest real source location in a decoded
+    ATT Source chain, or (None, None) if it is blank / not a real file:line. The
+    chain is inline-expanded, e.g.
+    `hip_runtime.h:248 -> hip_runtime.h:272 -> mmvq.cu:1034`; the final `->` segment
+    is the actual source file/line."""
+    s = (s or "").strip()
+    if not s:
+        return None, None
+    if "->" in s:
+        s = s.rsplit("->", 1)[-1].strip()
+    path, sep, line = s.rpartition(":")
+    if not sep or not path:
+        return None, None
+    if not (line == "?" or line.isdigit()):
+        return None, None                    # not a file:line (e.g. a C++ signature)
+    return path, line
+
+
+def _att_src_terminal(s):
+    """Reduce a decoded ATT Source chain to the deepest real source location as
+    `basename:line` (path stripped so the generated HTML never leaks absolute build
+    paths). Returns "" when no line info is present, so callers can gate on it."""
+    path, line = _att_src_split(s)
+    if path is None:
+        return ""
+    return (os.path.basename(path) or path) + ":" + line
+
+
+def _load_att_wave(dispatch_dir, ci2row):
+    """Load one representative wave's stitched EXECUTED-instruction stream from a
+    decoded ATT dispatch dir, for the debug view's Step mode.
+
+    Each traced dispatch dir holds per-wave files `se*_sm*_sl*_wv*.json`. Each has
+    `{duration, name, num_insts, num_stitched, wave{...}}`; `wave.instructions` is a
+    list of 5-tuples, one per EXECUTED instruction in issue order (following real
+    branches/loops), where col0 is a monotonic cycle timestamp and col4 is the
+    0-based index into that dispatch's full code.json `code` array. We pick the wave
+    with the most stitched instructions (richest trace) and remap each executed
+    step's code-index onto the position of that instruction in the embedded `rows`
+    list (via ci2row), so the client can highlight the ISA row + source line and show
+    the per-step cycle delta. Steps whose code-index is not an embedded instruction
+    row (e.g. a function-header row) are dropped.
+
+    Returns {wave, nexec, t0, stream:[[rowpos, cycle], ...]} or None."""
+    import glob
+    if not dispatch_dir or not ci2row:
+        return None
+    best = None                  # (num_stitched, instructions)
+    for p in glob.glob(os.path.join(dispatch_dir, "se*_sm*_sl*_wv*.json")):
+        try:
+            with open(p) as fh:
+                doc = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        wv = doc.get("wave") or {}
+        insts = wv.get("instructions") or []
+        if not insts:
+            continue
+        ns = doc.get("num_stitched") or len(insts)
+        if best is None or ns > best[0]:
+            best = (ns, insts, os.path.basename(p))
+    if best is None:
+        return None
+    _ns, insts, name = best
+    stream = []
+    for it in insts:
+        if not isinstance(it, list) or len(it) < 5:
+            continue
+        try:
+            cyc, ci = int(it[0]), int(it[4])
+        except (ValueError, TypeError):
+            continue
+        pos = ci2row.get(ci)
+        if pos is None:
+            continue                         # header/non-instruction row: skip
+        stream.append([pos, cyc])
+    if not stream:
+        return None
+    return {"wave": name, "nexec": len(stream), "t0": stream[0][1],
+            "stream": stream}
+
+
+_WAVE_NB = 900   # horizontal bucket budget for the Wave View global view
+
+
+def load_att_waves(dispatch_dir):
+    """Load ALL captured waves' state timelines from one decoded ATT dispatch dir,
+    for the debug view's "Wave View" global view (the rocprof-compute-viewer-style
+    occupancy panel: every wave is a lane, the shared X axis is cycles, each lane is
+    colored by hardware state over time).
+
+    Each per-wave file `se*_sm*_sl*_wv*.json` carries `wave.timeline`, a run-length
+    list of `[state, cycles]` segments that sums exactly to the wave's duration
+    (`end - begin`). States are 1=Idle, 2=Exec, 3=Wait, 4=Stall. We align every wave
+    on a single global cycle span [t0, t1] = [min begin, max end] and downsample each
+    timeline onto a fixed grid of `_WAVE_NB` buckets (dominant state per bucket), then
+    run-length encode. This bounds the embedded payload regardless of wave count or
+    dispatch length (~19 KB for ~70 waves) while staying pixel-faithful to a fixed-width
+    canvas. Waves are sorted by (se, simd, slot, wave-id) so lanes group by SIMD.
+
+    Returns {t0, t1, nb, states, waves:[{lab, cu, simd, slot, wv, begin, end,
+             rle:[[state,count],...]}]} or None. Bucket state 0 means the wave was not
+    resident there (drawn as background)."""
+    import glob
+    import re
+    if not dispatch_dir:
+        return None
+    raw = []
+    for p in glob.glob(os.path.join(dispatch_dir, "se*_sm*_sl*_wv*.json")):
+        m = re.match(r"se(\d+)_sm(\d+)_sl(\d+)_wv(\d+)", os.path.basename(p))
+        if not m:
+            continue
+        try:
+            with open(p) as fh:
+                doc = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        w = doc.get("wave") or {}
+        tl = w.get("timeline") or []
+        begin, end = w.get("begin"), w.get("end")
+        if not tl or begin is None or end is None:
+            continue
+        se, sm, sl, wv = (int(m.group(1)), int(m.group(2)),
+                          int(m.group(3)), int(m.group(4)))
+        raw.append((se, sm, int(w.get("cu", 0)), sl, wv, int(begin), int(end), tl))
+    if not raw:
+        return None
+    t0 = min(r[5] for r in raw)
+    t1 = max(r[6] for r in raw)
+    span = max(1, t1 - t0)
+    bw = span / float(_WAVE_NB)
+
+    def _rle(begin, tl):
+        perb = {}
+        cur = begin
+        for seg in tl:
+            if not isinstance(seg, list) or len(seg) < 2:
+                continue
+            st, clen = seg[0], seg[1]
+            s, e = cur, cur + clen
+            cur = e
+            if clen <= 0:
+                continue
+            b0 = int((s - t0) / bw)
+            b1 = int((e - 1 - t0) / bw)
+            if b1 < 0:
+                continue
+            b0 = max(0, b0)
+            b1 = min(_WAVE_NB - 1, b1)
+            for b in range(b0, b1 + 1):
+                bs = max(s, t0 + b * bw)
+                be = min(e, t0 + (b + 1) * bw)
+                ov = be - bs
+                if ov <= 0:
+                    continue
+                dd = perb.setdefault(b, {})
+                dd[st] = dd.get(st, 0) + ov
+        arr = [0] * _WAVE_NB
+        for b, dd in perb.items():
+            arr[b] = max(dd, key=dd.get)
+        rle = []
+        for v in arr:
+            if rle and rle[-1][0] == v:
+                rle[-1][1] += 1
+            else:
+                rle.append([v, 1])
+        return rle
+
+    waves = []
+    for se, sm, cu, sl, wv, begin, end, tl in sorted(
+            raw, key=lambda r: (r[0], r[1], r[3], r[4])):
+        waves.append({"lab": "se%d sm%d sl%d wv%d" % (se, sm, sl, wv),
+                      "se": se, "cu": cu, "simd": sm, "slot": sl, "wv": wv,
+                      "begin": begin, "end": end, "rle": _rle(begin, tl)})
+    return {"t0": t0, "t1": t1, "nb": _WAVE_NB,
+            "states": ["", "Idle", "Exec", "Wait", "Stall"], "waves": waves}
+
+
+def _demangle_short(sym):
+    """Extract a readable short name from an Itanium-mangled kernel symbol as it
+    appears in occupancy.json's `dispatches` map (e.g.
+    `_ZL22mul_mat_vec_q_wvsplitkIL9ggml_type12E...` -> `mul_mat_vec_q_wvsplitk[Q4_K]`).
+    Placeholder entries like `0 / 0x0` or a raw address are not kernels -> None.
+    No c++filt dependency: parse the length-prefixed name directly and, when the
+    signature encodes a `(ggml_type)N` first template arg, append the quant tag so
+    labels line up with family_of() used everywhere else."""
+    if not sym or not isinstance(sym, str):
+        return None
+    if sym[0].isdigit():                 # "0 / 0x0", "0 / 0x76e4..." placeholders
+        return None
+    m = re.match(r"_Z[NL]?(\d+)(.*)", sym)
+    if not m:
+        return sym
+    n = int(m.group(1))
+    name = m.group(2)[:n]
+    if not name:
+        return sym
+    g = re.search(r"9ggml_type(\d+)", sym)
+    if g:
+        t = int(g.group(1))
+        name += "[" + _GGML_TYPES.get(t, "type%d" % t) + "]"
+    return name
+
+
+def load_att_occupancy(dispatch_dir):
+    """Reconstruct rocprof-compute-viewer's Global View from one decoded ATT
+    dispatch dir's `occupancy.json`. Unlike the per-wave `se*_wv*.json` files (which
+    exist only for the single thread-traced SIMD -> at most 64 lanes = 1 WGP), the
+    occupancy table samples wave scheduling across EVERY CU the trace observed, so it
+    is the source of the "more than 64 slots" global waterfall.
+
+    Schema: `occupancy_fields` names 11 columns; key "0" is the event table. Each row
+    is a wave alloc/free event: a lane is (cu, simd, wave_id); `start`=1 opens an
+    occupied interval at `time`, `start`=0 closes it; `kernel_id` indexes the
+    `dispatches` name map so each interval is colored by which kernel held the slot.
+
+    We reconstruct per-lane RAW cycle intervals (no bucketing) so the client can
+    render them directly on a cycle axis -- gaps between successive waves stay exact
+    at any zoom level, and each interval is one wave residency (colored by run order).
+    Returns {t0, t1, kernels:{shifted_id: name_or_None}, lanes:[{cu,simd,wv,
+    iv:[[start_rel, end_rel, shifted_id], ...]}]} or None. start_rel/end_rel are
+    cycles relative to t0. Real kernel ids are stored shifted by +1 so kernel_id 0
+    (a valid placeholder) does not collide with any background sentinel."""
+    if not dispatch_dir:
+        return None
+    path = os.path.join(dispatch_dir, "occupancy.json")
+    try:
+        with open(path) as fh:
+            occ = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    fields = occ.get("occupancy_fields") or []
+    rows = occ.get("0") or []
+    if not fields or not rows:
+        return None
+    idx = {f: i for i, f in enumerate(fields)}
+    need = ("time", "cu", "simd", "wave_id", "start", "kernel_id")
+    if any(k not in idx for k in need):
+        return None
+    ti, ci, si, wi, sti, ki = (idx["time"], idx["cu"], idx["simd"],
+                               idx["wave_id"], idx["start"], idx["kernel_id"])
+    disp = occ.get("dispatches") or {}
+    # shifted-id name map: real kernel_id N -> slot N+1; value None for placeholders.
+    kernels = {}
+    for k, sym in disp.items():
+        try:
+            kid = int(k)
+        except (TypeError, ValueError):
+            continue
+        kernels[str(kid + 1)] = _demangle_short(sym)
+
+    from collections import defaultdict
+    evs = defaultdict(list)
+    for r in rows:
+        try:
+            evs[(int(r[ci]), int(r[si]), int(r[wi]))].append(
+                (int(r[ti]), int(r[sti]), int(r[ki])))
+        except (TypeError, ValueError, IndexError):
+            continue
+    if not evs:
+        return None
+    t0 = min(r[ti] for r in rows)
+    t1 = max(r[ti] for r in rows)
+
+    def _intervals(lane_evs):
+        """Reconstruct [start_rel, end_rel, shifted_kid] from alloc/free events."""
+        out = []
+        open_t = open_k = None
+        for t, s, k in sorted(lane_evs):
+            if s == 1:
+                open_t, open_k = t, k
+            elif open_t is not None:
+                if t > open_t:
+                    out.append([open_t - t0, t - t0, open_k + 1])
+                open_t = None
+        return out
+
+    lanes = []
+    for (cu, simd, wv) in sorted(evs):
+        iv = _intervals(evs[(cu, simd, wv)])
+        if not iv:
+            continue                              # lane never resident in window
+        lanes.append({"cu": cu, "simd": simd, "wv": wv, "iv": iv})
+    if not lanes:
+        return None
+    return {"t0": t0, "t1": t1, "kernels": kernels, "lanes": lanes}
+
+
+def load_att_code(att_dir):
+    """Parse the full per-instruction ISA disassembly from decoded ATT
+    `ui_output_*_dispatch_*/code.json` files, per kernel FAMILY, for the
+    single-kernel debug view. Unlike load_att_stats (which reads the pre-aggregated
+    top-N stats CSV), this keeps the COMPLETE program-order instruction listing with
+    per-PC Vaddr/Hit/Latency/Stall/Idle.
+
+    code.json `code` rows are 10-tuples:
+    [ISA, _, LineNumber, Source, Codeobj, Vaddr, Hit, Latency, Stall, Idle].
+    Function-block header rows are the ones whose ISA (col 0) is a `;`-prefixed
+    symbol comment; their Source (col 3) is the demangled kernel signature, which
+    family_of() maps onto the same family slices as load_att_stats. The instruction
+    rows that follow are not `;`-prefixed; when the device code object was built with
+    DWARF line tables (`-gline-tables-only`/`-g`) their Source column carries the
+    decoded inline source chain (e.g. `hip_runtime.h:272 -> mmvq.cu:1034`), otherwise
+    it is blank. (LineNumber (col 2) is only an instruction ordinal, not a source
+    line, and sqtt_funcmap stays empty even with line info -- neither is the gate.)
+
+    To bound HTML payload size, only ONE representative dispatch per family is kept:
+    the one with the most instruction rows that recorded a hit (the richest profile).
+
+    Returns {family: {sym, n_disp, stall, lat, idle,
+                      rows: [{a(vaddr), isa, hit, lat, st, idle, src}], has_src,
+                      src_files}}.
+    Each row's `src` is the deepest real source location (`basename:line`) resolved
+    from the Source chain, or "" when no line info is present; has_src is True when
+    any kept instruction row resolved a source location (the traced code object had
+    DWARF line tables). src_files maps each referenced file's basename to its full
+    text (as a list of lines), read at generation time, so the debug view can show
+    ISA side-by-side with source. Only the basename is embedded (never the absolute
+    build path); files that are missing/unreadable/oversized are simply omitted."""
+    import glob
+    best = {}                    # fam -> (n_hit_rows, dispatch_dict)
+    ndisp = defaultdict(int)
+    for path in sorted(glob.glob(os.path.join(att_dir, "**",
+                                              "ui_output_*_dispatch_*",
+                                              "code.json"),
+                                 recursive=True)):
+        try:
+            with open(path) as fh:
+                doc = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        code = doc.get("code") or []
+        fam_data = {}
+        cur = cur_sym = None
+        for i, r in enumerate(code):
+            if not isinstance(r, list) or len(r) < 10:
+                continue
+            isa = r[0].strip() if isinstance(r[0], str) else ""
+            col3 = r[3].strip() if isinstance(r[3], str) else ""
+            if isa.startswith(";"):
+                # function-header row: col3 is the demangled kernel signature.
+                if col3:
+                    cur, cur_sym = family_of(col3), col3
+                continue
+            if not cur or not isa:
+                continue
+            # basename:line for display; full path (kept per-dispatch only) to read
+            # the source file at generation time -- the path never reaches the HTML.
+            spath, sline = _att_src_split(col3)
+            src = (os.path.basename(spath) + ":" + sline) if spath else ""
+
+            def _i(x):
+                try:
+                    return int(x or 0)
+                except (ValueError, TypeError):
+                    return 0
+            vaddr, hit, lat, st, idle = (_i(r[5]), _i(r[6]), _i(r[7]),
+                                         _i(r[8]), _i(r[9]))
+            d = fam_data.setdefault(cur, {"sym": cur_sym, "rows": [], "ci": [],
+                                          "stall": 0, "lat": 0, "idle": 0,
+                                          "nhit": 0, "has_src": False,
+                                          "srcpaths": set(), "_dir": ""})
+            d["_dir"] = os.path.dirname(path)
+            d["ci"].append(i)
+            d["rows"].append({"a": vaddr, "isa": isa, "hit": hit,
+                              "lat": lat, "st": st, "idle": idle, "src": src})
+            d["stall"] += st
+            d["lat"] += lat
+            d["idle"] += idle
+            if hit:
+                d["nhit"] += 1
+            if spath:
+                d["has_src"] = True
+                d["srcpaths"].add(spath)
+        for fam, d in fam_data.items():
+            if not d["nhit"]:
+                continue                     # dispatch empty/cut off for this family
+            ndisp[fam] += 1
+            if fam not in best or d["nhit"] > best[fam][0]:
+                best[fam] = (d["nhit"], d)
+    out = {}
+    max_src_bytes = 512 * 1024
+    _occ_cache = {}    # dispatch dir -> occupancy (shared object; dedup at emit)
+    for fam, (_n, d) in best.items():
+        # Read each referenced source file once (keyed by basename, path discarded).
+        src_files = {}
+        for p in sorted(d.get("srcpaths") or ()):
+            base = os.path.basename(p)
+            if base in src_files:
+                continue
+            try:
+                if os.path.getsize(p) > max_src_bytes:
+                    continue
+                with open(p, encoding="utf-8", errors="replace") as fh:
+                    src_files[base] = fh.read().split("\n")
+            except OSError:
+                continue
+        # Executed-order stream (for the debug view's Step mode): remap the picked
+        # dispatch's representative wave onto embedded row positions.
+        ci2row = {ci: pos for pos, ci in enumerate(d.get("ci") or [])}
+        exec_stream = _load_att_wave(d.get("_dir") or "", ci2row)
+        waves = load_att_waves(d.get("_dir") or "")
+        ddir = d.get("_dir") or ""
+        if ddir not in _occ_cache:
+            _occ_cache[ddir] = load_att_occupancy(ddir)
+        occ = _occ_cache[ddir]
+        out[fam] = {"sym": d["sym"], "n_disp": ndisp[fam], "stall": d["stall"],
+                    "lat": d["lat"], "idle": d["idle"], "rows": d["rows"],
+                    "has_src": d.get("has_src", False), "src_files": src_files,
+                    "exec": exec_stream, "waves": waves, "occ": occ}
     return out
 
 
@@ -723,6 +1151,12 @@ def add_common_args(ap):
     ap.add_argument("--gap-threshold-us", type=float, default=150.0,
                     help="inter-dispatch gap (us) that marks a token boundary "
                          "(default 150)")
+    ap.add_argument("--kv-context-tokens", type=int, default=-1,
+                    help="context length (tokens) to size the KV-cache traffic in "
+                         "the 'eff token BW%%' footer metric. KV bytes/token = "
+                         "n_attn_layers * head_count_kv * (key_len+value_len) * 2 "
+                         "* n_ctx. Default -1 infers n_ctx from the clean-tps "
+                         "'tgNN' test name; 0 excludes KV (weights only).")
     ap.add_argument("--title", default="rocprof unified viewer (gfx1151)")
 
 
@@ -787,6 +1221,22 @@ def build_payload(args):
                                   if args.fetch_csv else ({}, {}))
     loadwidth = load_loadwidth(args.loadwidth_json) if args.loadwidth_json else {}
     att_by_fam = load_att_stats(args.att_dir) if args.att_dir else {}
+    att_code_by_fam = load_att_code(args.att_dir) if args.att_dir else {}
+    # Occupancy is dispatch-wide: many families share the SAME occ object (identical
+    # 640-lane table). Pool distinct occ objects into att_occ_pool and replace each
+    # family's inline occ with an index (occ_ref) so the HTML embeds it ONCE, not 18x.
+    att_occ_pool = []
+    _occ_seen = {}
+    for _fam, _c in att_code_by_fam.items():
+        _o = _c.pop("occ", None)
+        if _o is None:
+            _c["occ_ref"] = -1
+            continue
+        _key = id(_o)
+        if _key not in _occ_seen:
+            _occ_seen[_key] = len(att_occ_pool)
+            att_occ_pool.append(_o)
+        _c["occ_ref"] = _occ_seen[_key]
     clean_tps = parse_clean_tps(args.clean_tps_file) if args.clean_tps_file else None
 
     # Optional GGUF order-map: build the expected per-token matvec tensor sequence
@@ -794,8 +1244,9 @@ def build_payload(args):
     # dispatch at decode, so try both dropping and keeping ffn_up and pick whichever
     # candidate's N-sequence best matches the actual matvec dispatches in one token.
     expected_seq = []
+    gguf_meta = {}
     if args.gguf:
-        gguf_tensors, _ = load_gguf_tensors(args.gguf)
+        gguf_tensors, gguf_meta = load_gguf_tensors(args.gguf)
         # Reference token = the matvec N-stream between the first two boundaries in
         # the baked span (a full steady-state token).
         ref = [n for (s, e, nm, n, _nb) in evs[bounds[args.skip_tokens]:
@@ -811,6 +1262,29 @@ def build_payload(args):
                 best = (score, cand, drop, hits, m)
         if best:
             expected_seq = best[1]
+
+    # KV-cache DRAM traffic per decode step, for the "eff token BW%" roofline: a
+    # decode step re-reads the FULL K/V cache accumulated over the context. Sizes
+    # analytically from GGUF meta -- KV bytes = n_attn_layers * head_count_kv *
+    # (key_len + value_len) * 2 (f16) * n_ctx. n_attn_layers is the count of GGUF
+    # blocks that own an attn_k projection (the hybrid GDN model has attention on
+    # only a subset of blocks). Negligible vs weights at short context; the point
+    # is it grows linearly with n_ctx and eventually rivals weight traffic.
+    kv_bytes_per_tok = 0
+    kv_ctx = 0
+    if expected_seq:
+        arch = gguf_meta.get("general.architecture", "")
+        gk = lambda suffix, d=0: gguf_meta.get("%s.%s" % (arch, suffix), d)
+        head_kv = gk("attention.head_count_kv", 0)
+        key_len = gk("attention.key_length", 0)
+        val_len = gk("attention.value_length", 0)
+        n_attn = len({e["L"] for e in expected_seq if e["role"] == "attn_k"})
+        kv_ctx = args.kv_context_tokens
+        if kv_ctx < 0:
+            m = re.search(r"tg(\d+)", (clean_tps or {}).get("test", "") or "")
+            kv_ctx = int(m.group(1)) if m else 0
+        if head_kv and key_len and val_len and n_attn and kv_ctx > 0:
+            kv_bytes_per_tok = n_attn * head_kv * (key_len + val_len) * 2 * kv_ctx
 
     # Per-weight measured DRAM bytes: order-map the FETCH run itself so weights
     # sharing an N (ffn_down vs attn_output at N=2560) get exact measurements
@@ -1176,12 +1650,24 @@ def build_payload(args):
         "has_loadw": bool(loadwidth),
         "att_by_fam": att_by_fam,
         "has_att": bool(att_by_fam),
+        "att_code_by_fam": att_code_by_fam,
+        "att_occ_pool": att_occ_pool,
+        "has_att_code": bool(att_code_by_fam),
+        # RDNA3.5 ISA one-line opcode glossary (mnemonic -> description), embedded
+        # only when the debug view exists, so the view can show a hover tooltip
+        # explaining each raw instruction. Keyed on the lowercased first token.
+        "isa_gloss": ISA_GLOSSARY if att_code_by_fam else {},
+        # Special-register / wait-counter glossary (operand token -> description),
+        # so hovering vmcnt/lgkmcnt/SCC/EXEC/VCC/M0 etc. in an ISA line explains it.
+        "reg_gloss": REG_GLOSSARY if att_code_by_fam else {},
         "att_cmd": att_cmd,
         # Live-tracing mode: false for the static export; serve.py flips this true
         # so the client shows a "Trace now" button instead of the copy command.
         "att_server": False,
         "has_map": bool(expected_seq),
         "map_stats": map_stats,
+        "kv_bytes_per_tok": kv_bytes_per_tok,
+        "kv_ctx": kv_ctx,
         "layers": layers,
         "has_layers": bool(layers),
         "phases": phases,
@@ -1337,7 +1823,7 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
   </div>
   <div class="right">
     <div class="panel grow">
-      <h2>Per-kernel-family (baked span)</h2>
+      <h2>Per-kernel-family/token (baked span)</h2>
       <table id="tbl"><thead><tr>
         <th>family</th><th>cnt/tok</th><th>time%</th><th>stall</th>
       </tr></thead><tbody></tbody><tfoot></tfoot></table>
@@ -1884,6 +2370,37 @@ function fusionSection(sl, gs, totDur){
      `<b style="color:${vc}">FUSION</b> <span style="color:#c8d0da">${verdict}</span></div>`;
   return h;
 }
+// 1D gap-clustering of a shape group's kernel times (ns) to surface multi-modal
+// structure. items=[{d,L}]. A new cluster starts wherever the gap between two
+// sorted durations exceeds max(3us, 6% of the median) -- wide enough to ignore
+// the normal per-dispatch jitter but catch the attn_q ~57/70us fast/slow split
+// and the lone ~+24us timestamp-artifact tail. Returns clusters low->high with
+// center (median), count, span, and the distinct layers that landed in each.
+function clusterDur(items){
+  const v=items.slice().sort((a,b)=>a.d-b.d);
+  const med=v[Math.floor(v.length/2)].d;
+  const thr=Math.max(3000, med*0.06);
+  const cl=[]; let cur=[v[0]];
+  for(let i=1;i<v.length;i++){
+    if(v[i].d-v[i-1].d>thr){ cl.push(cur); cur=[v[i]]; } else cur.push(v[i]);
+  }
+  cl.push(cur);
+  return cl.map(c=>{
+    const ds=c.map(x=>x.d);
+    const layers=[...new Set(c.map(x=>x.L))].sort((a,b)=>a-b);
+    return {c:ds[Math.floor(ds.length/2)], n:c.length, lo:ds[0], hi:ds[ds.length-1], layers};
+  });
+}
+// A dispatch carries an effective-BW number only when it is an order-mapped
+// weight-streaming matvec (mmvq / mmq / wvsplitk), which is inherently DRAM-BW
+// bound. So "BW-bound" for the eff-BW < 80% red flag keys off the matvec identity,
+// NOT the PMC dominant-stall bucket -- wvsplitk buckets as "lds" (it stages
+// activations in LDS, hence bank conflicts) yet is still streaming weights from
+// DRAM. Also accept memory/lds stall for any other mapped streaming kernel.
+function isBwBound(fam){
+  const fc=D.fam_counters[fam]||{};
+  return /mul_mat_vec|mul_mat_q/.test(fam) || fc.stall==='memory' || fc.stall==='lds';
+}
 // Family view: when a per-kernel-family row is selected (no single slice), list
 // every order-mapped dispatch in that family with its packed footprint + effective BW.
 function renderFamilyMembers(){
@@ -1895,16 +2412,29 @@ function renderFamilyMembers(){
   // also blend in the ~+24us interrupt-latency timestamp artifact that hits ~5% of
   // gfx1151 dispatches. Listing every dispatch keeps each measured time honest and
   // lets both effects be seen directly. Rows are ordered so dispatches with the
-  // same role+shape are adjacent, then by layer, then by execution time -- so
-  // repeats of one weight sit together for eyeballing the spread.
-  const rows=[];
-  for(const s of D.gpu){ if(s.fam===fam && s.map) rows.push(s); }
+  // same shape [K x N] are adjacent (then role, layer, execution time) -- so
+  // repeats of one shape sit together for eyeballing the spread.
+  // allRows = every order-mapped dispatch of this family across ALL baked tokens;
+  // used only to compute per-layer modes robustly (more samples per layer wash out
+  // the ~5% +24us artifact). The DISPLAYED table is scoped to a single complete
+  // token cycle (this panel is "Kernel family/Token"), so it stays ~one token's
+  // worth of rows instead of n_tokens_baked copies.
+  const allRows=[];
+  for(const s of D.gpu){ if(s.fam===fam && s.map) allRows.push(s); }
+  const win=secondTokenWin();
+  const rows = win ? allRows.filter(s=> s.s>=win.t0 && s.s<win.t1) : allRows.slice();
+  if(!rows.length && allRows.length) rows.push(...allRows);
+  // Sort by SHAPE first (K, trueN, quant), then role, then layer, then exec time.
+  // Shape-primary keeps dispatches of identical [K x N] adjacent even when they
+  // belong to different roles that happen to share a shape (e.g. attn_k and attn_v
+  // are both 2560 x 1024 Q4_K in this model) -- role-first would wedge an unrelated
+  // shape between them.
   rows.sort((a,b)=>{
     const ma=a.map, mb=b.map;
-    if(ma.role!==mb.role) return ma.role<mb.role?-1:1;
     if(ma.K!==mb.K) return ma.K-mb.K;
     if(ma.trueN!==mb.trueN) return ma.trueN-mb.trueN;
     if(ma.q!==mb.q) return ma.q<mb.q?-1:1;
+    if(ma.role!==mb.role) return ma.role<mb.role?-1:1;
     if(ma.L!==mb.L) return ma.L-mb.L;
     return a.s-b.s;
   });
@@ -1916,19 +2446,55 @@ function renderFamilyMembers(){
        (D.has_map?`.`:` -- run with --gguf to attach shape / packed footprint / effective BW.`)+`</div>`;
     dp.innerHTML=h; dp.style.display='block'; return;
   }
+  // Per-shape modes -> per-LAYER lookup, rendered as a table column (below) so
+  // each dispatch row shows which mode its layer belongs to. Within each
+  // role+shape+quant group, reduce every LAYER to its median kernel time, then
+  // cluster those per-layer medians. The fast/slow split (e.g. attn_q ~57us vs
+  // ~70us) is layer-LOCKED -- each layer is individually tight but sits at a
+  // different center -- so clustering the raw pooled dispatches would smear the
+  // modes into one continuum (per-dispatch jitter + the ~5% +24us timestamp
+  // artifact bridge the gap). Per-layer medians are robust to that artifact.
+  const med=a=>{const v=a.slice().sort((x,y)=>x-y);return v[Math.floor(v.length/2)];};
+  const shp=new Map();
+  for(const s of allRows){ const m=s.map;
+    const k=m.role+'|'+m.K+'x'+m.trueN+'|'+m.q;
+    if(!shp.has(k)) shp.set(k,new Map());
+    const bl=shp.get(k); if(!bl.has(m.L)) bl.set(m.L,[]);
+    bl.get(m.L).push(s.e-s.s);
+  }
+  // layerMode: shapeKey|L -> {ci, n, c}  (mode index low->high, mode count, center ns)
+  const layerMode=new Map();
+  for(const [k,byL] of shp){
+    const items=[...byL.entries()].map(([L,ds])=>({d:med(ds),L}));
+    const cl = items.length>=2 ? clusterDur(items) : [{c:items[0].d,n:1,layers:[items[0].L]}];
+    cl.forEach((c,ci)=>c.layers.forEach(L=>layerMode.set(k+'|'+L,{ci,n:cl.length,c:c.c})));
+  }
+  const modeName=['','unimodal','bimodal','trimodal'];
+  const modeCol=(ci,n)=> n<=1 ? '#8aa0b4'
+      : n===2 ? (ci===0?'#8fe388':'#ff9f6b')
+      : ['#8fe388','#ffd479','#ff9f6b','#ff6b6b','#c58cff'][Math.min(ci,4)];
   h+=`<table><thead><tr><th style="text-align:left">role</th>`+
      `<th style="text-align:left">layer</th>`+
      `<th style="text-align:left">shape [K x N]</th><th style="text-align:left">packed</th>`+
      `<th style="text-align:left">kernel time</th>`+
      `<th style="text-align:left">eff BW</th><th style="text-align:left">eff BW %</th>`+
-     `<th style="text-align:left">over-fetch</th></tr></thead><tbody>`;
+     `<th style="text-align:left">over-fetch</th>`+
+     `<th style="text-align:left">modes</th></tr></thead><tbody>`;
+  // Order-mapped matvec families whose achieved BW falls short of ~peak are the
+  // ones worth flagging -- eff BW < 80% on a BW-bound kernel means it is leaving
+  // DRAM bandwidth on the table (unlike a compute-bound kernel, where low eff BW
+  // is expected and not a defect). See isBwBound(): matvec identity, not the PMC
+  // stall bucket (wvsplitk buckets as "lds" but is still weight-streaming).
+  const memBound=isBwBound(fam);
   // Shade alternating role+shape+layer groups so a weight's repeats cluster visually.
   let prevKey=null, band=0;
   rows.forEach((s,i)=>{
     const m=s.map, dur=s.e-s.s;
     const eb=dur?(m.packed/dur):0;
     const ep=D.peak_bw_gbs?(eb/D.peak_bw_gbs*100):0;
-    const key=m.role+'|'+m.K+'x'+m.trueN+'|'+m.q+'|L'+m.L;
+    const lowBW=memBound && ep>0 && ep<80;
+    const bwCol=lowBW?'#ff6b6b':'#8fe388';
+    const key=m.K+'x'+m.trueN+'|'+m.q+'|'+m.role+'|L'+m.L;
     if(key!==prevKey){ band^=1; prevKey=key; }
     h+=`<tr class="shrow" data-idx="${i}" title="frame this dispatch in the timeline"`+
        (band?` style="background:rgba(255,255,255,.04)"`:``)+`>`+
@@ -1937,18 +2503,26 @@ function renderFamilyMembers(){
        `<td>${m.K} x ${m.trueN} <span class="r">${m.q}</span></td>`+
        `<td>${KB(m.packed)}${m.fused?` <span class="r">(${m.fused})</span>`:``}</td>`+
        `<td>${fmtus(dur)}</td>`+
-       `<td style="color:#8fe388">${eb.toFixed(1)} GB/s</td>`+
-       `<td style="color:#8fe388">${ep.toFixed(1)}%</td>`+
-       `<td>${m.overfetch?m.overfetch.toFixed(2)+'x':'<span class="r">-</span>'}</td></tr>`;
+       `<td style="color:${bwCol}">${eb.toFixed(1)} GB/s</td>`+
+       `<td style="color:${bwCol}">${ep.toFixed(1)}%${lowBW?' <span class="r">(BW-bound)</span>':''}</td>`+
+       `<td>${m.overfetch?m.overfetch.toFixed(2)+'x':'<span class="r">-</span>'}</td>`+
+       (()=>{const md=layerMode.get(m.role+'|'+m.K+'x'+m.trueN+'|'+m.q+'|'+m.L);
+         if(!md||md.n<=1) return `<td><span class="r">unimodal</span></td>`;
+         return `<td style="color:${modeCol(md.ci,md.n)};white-space:nowrap">`+
+           `${modeName[md.n]||md.n+'-modal'} <b>${md.ci+1}/${md.n}</b> `+
+           `<span class="r">@${fmtus(md.c)}</span></td>`;})()+`</tr>`;
   });
   h+=`</tbody></table>`+
      `<div class="sub" style="margin-top:6px">Every order-mapped dispatch of `+
-     `<b>${fam}</b> in the baked span (${D.n_tokens_baked} tokens), one row per dispatch `+
-     `(no averaging), ordered so same role+shape sit together. <b>packed</b> = theoretical `+
+     `<b>${fam}</b> in one complete decode token, one row per dispatch `+
+     `(no averaging), ordered so same shape [K x N] sit together. <b>packed</b> = theoretical `+
      `on-disk weight bytes (gate+up folded when fused); <b>kernel time</b> = this dispatch's `+
      `measured Start->End (raw; ~5% of gfx1151 dispatches carry a ~+24us interrupt-latency `+
-     `timestamp artifact -- visible as a lone inflated row); <b>eff BW</b> = packed / kernel `+
-     `time (over-fetch-immune, vs peak ${D.peak_bw_gbs} GB/s). `+
+     `timestamp artifact -- visible as a lone inflated row); <b>modes</b> = this shape's `+
+     `across-layer kernel-time clusters (per-layer medians, gap &gt; max(3&micro;s, 6% median)); `+
+     `<b>k/N @center</b> marks which of N modes this layer falls in (fastest green -> slowest `+
+     `orange), so a bimodal/trimodal fast/slow layer split is visible per row; <b>eff BW</b> = `+
+     `packed / kernel time (over-fetch-immune, vs peak ${D.peak_bw_gbs} GB/s). `+
      `Click a row to frame that dispatch in the timeline.</div>`;
   dp.innerHTML=h; dp.style.display='block';
   // Row click frames + selects that exact dispatch, reusing find's framing.
@@ -1960,8 +2534,16 @@ function renderFamilyMembers(){
 function renderSelectedKernel(){
   const s=selectedSlice, fc=D.fam_counters[s.fam]||{};
   const dg=diagnose(fc);
+  const hasCode = !!((D.att_code_by_fam||{})[s.fam]);
+  const dbgBtn = hasCode
+    ? `<button id="attdbg" style="cursor:pointer;background:#2a3a52;color:#dbe6f5;`+
+      `border:1px solid #3a5578;border-radius:3px;padding:3px 12px;font-size:12px;`+
+      `flex:0 0 auto;white-space:nowrap">Open Trace View</button>`
+    : ``;
   let h=`<h2>Selected kernel</h2>`+
-    `<div style="color:#7fd1ff;word-break:break-all;margin-bottom:6px">${s.fam}</div>`+
+    `<div style="display:flex;align-items:flex-start;gap:8px;margin-bottom:6px;flex-wrap:wrap">`+
+    `<div style="color:#7fd1ff;word-break:break-all;flex:0 1 auto">${s.fam}</div>`+
+    dbgBtn+`</div>`+
     (dg?`<div style="margin:0 0 8px;padding:6px 9px;border-left:3px solid ${dg.c};`+
         `background:rgba(255,255,255,.05);border-radius:3px;line-height:1.35">`+
         `<b style="color:${dg.c}">${dg.t}</b> `+
@@ -1989,8 +2571,10 @@ function renderSelectedKernel(){
     if(m.padK) h+=`<tr><td>K block padding</td><td>+${m.padK} <span class="r">(to 256-elem quant block)</span></td></tr>`;
     h+=`<tr><td>packed weights</td><td>${KB(m.packed)} <span class="r">(theoretical, on-disk`+
        (m.fused?`, ${m.fused} fused`:``)+`)</span></td></tr>`;
-    if(m.effbw) h+=`<tr><td>effective BW</td><td style="color:#8fe388">${m.effbw} GB/s `+
-       `(${m.effbw_pct}% of ${D.peak_bw_gbs}) <span class="r">(useful: packed / this dispatch time)</span></td></tr>`;
+    if(m.effbw){ const memBound=isBwBound(s.fam), lowBW=memBound && m.effbw_pct>0 && m.effbw_pct<80;
+      h+=`<tr><td>effective BW</td><td style="color:${lowBW?'#ff6b6b':'#8fe388'}">${m.effbw} GB/s `+
+       `(${m.effbw_pct}% of ${D.peak_bw_gbs})${lowBW?' <span class="r">(BW-bound, <80% peak)</span>':''} `+
+       `<span class="r">(useful: packed / this dispatch time)</span></td></tr>`; }
     if(m.measured){ const src=m.mexact?'per-weight (order-mapped)':'family+N avg';
       h+=`<tr><td>FETCH_SIZE</td><td>${KB(m.measured)} <span class="r">(measured DRAM read, ${src})</span></td></tr>`+
          `<tr><td>over-fetch</td><td>${m.overfetch}x <span class="r">(FETCH_SIZE / packed; ${src})</span></td></tr>`; }
@@ -2163,6 +2747,438 @@ function renderSelectedKernel(){
   if(cp) cp.onclick=()=>copyCmd(cmd);
   const tb2=document.getElementById('atttrace');
   if(tb2) tb2.onclick=()=>traceKernelLive(sym, s.fam);
+  const db=document.getElementById('attdbg');
+  if(db) db.onclick=()=>openDebugView(s.fam);
+}
+
+// Open a new browser tab with a self-contained debug view for one kernel family,
+// built client-side from D.att_code_by_fam (no server round-trip). When the trace
+// carries DWARF line info (has_src + embedded source), it is a SYNCHRONIZED two-pane
+// view: source on the left (per-line stall heat), full program-order ISA on the
+// right. Clicking a source line highlights + scrolls to its instructions; clicking
+// an instruction highlights + scrolls to its source line. Without line info it falls
+// back to the ISA-only table. Source text is embedded by basename only (no paths).
+function openDebugView(fam){
+  const c=(D.att_code_by_fam||{})[fam];
+  if(!c){ alert('No decoded ISA for this kernel yet -- trace it first.'); return; }
+  const w=window.open('','_blank');
+  if(!w){ alert('Popup blocked -- allow popups for this page to open the debug view.'); return; }
+  const maxStall=c.rows.reduce((m,r)=>Math.max(m,r.st||0),0)||1;
+  const srcFiles=c.src_files||{};
+  const split=!!(c.has_src && Object.keys(srcFiles).length);
+  const payload={fam:fam, sym:c.sym, n_disp:c.n_disp, stall:c.stall, lat:c.lat,
+                 idle:c.idle, has_src:!!c.has_src, rows:c.rows, maxStall:maxStall,
+                 src_files:srcFiles, split:split, exec:c.exec||null,
+                 waves:c.waves||null,
+                 occ:((c.occ_ref!=null&&c.occ_ref>=0)?(D.att_occ_pool||[])[c.occ_ref]:(c.occ||null)),
+                 gloss:(D.isa_gloss||{}), regGloss:(D.reg_gloss||{})};
+  const fileOpts=Object.keys(srcFiles).map(f=>`<option value="`+esc(f)+`">`+esc(f)+`</option>`).join('');
+  const doc=`<!doctype html><html><head><meta charset="utf-8">`+
+    `<title>ISA debug -- `+esc(fam)+`</title><style>`+
+    `*{box-sizing:border-box}`+
+    `body{margin:0;background:#0d1117;color:#d7dde5;display:flex;flex-direction:column;`+
+    `height:100vh;font:15px/1.5 -apple-system,Segoe UI,Roboto,sans-serif}`+
+    `header{flex:0 0 auto;background:#161b22;border-bottom:1px solid #2a3340;padding:10px 16px}`+
+    `h1{margin:0 0 4px;font-size:20px;color:#dbe6f5}`+
+    `.sym{font-family:monospace;font-size:14px;color:#8b98a8;word-break:break-all}`+
+    `.tot{margin-top:6px;font-size:14px;color:#c8d0da}`+
+    `.note{margin-top:6px;font-size:14px;color:#e0b341}`+
+    `#f{margin-top:8px;width:340px;max-width:60%;padding:5px 9px;background:#0d1117;`+
+    `color:#d7dde5;border:1px solid #3a4553;border-radius:3px;font-size:14px}`+
+    `#main{flex:1 1 auto;display:flex;min-height:0}`+
+    `section{display:flex;flex-direction:column;min-width:0;min-height:0}`+
+    `#isapane{flex:1 1 56%;border-right:1px solid #2a3340}#srcpane{flex:1 1 44%}`+
+    `.phdr{flex:0 0 auto;padding:6px 12px;background:#12161c;border-bottom:1px solid #2a3340;`+
+    `color:#9fb0c4;font-size:13px}`+
+    `.hint{color:#6f7d8f;font-size:12px;margin-left:6px}`+
+    `.scroll{flex:1 1 auto;overflow:auto;min-height:0}`+
+    `#src{font-family:monospace;font-size:14px;line-height:1.5;padding-bottom:40vh}`+
+    `.sl{display:flex;align-items:baseline;white-space:pre;cursor:pointer;`+
+    `border-left:3px solid transparent}`+
+    `.sl:hover{background:#161b22}.sl.hotl{background:#2a1a17}`+
+    `.sl.selline{background:#243044;border-left-color:#4d90fe}`+
+    `.sln{flex:0 0 54px;text-align:right;padding-right:10px;color:#5a6675;user-select:none}`+
+    `.shb{flex:0 0 54px}.sbar{display:inline-block;height:8px;background:#ff6b6b;`+
+    `border-radius:2px;vertical-align:middle}`+
+    `.sst{flex:0 0 46px;text-align:right;padding-right:8px;color:#8b98a8;font-size:11px}`+
+    `.sc{flex:1 1 auto;color:#d7dde5}`+
+    `table{border-collapse:collapse;width:100%;font-size:14px}`+
+    `th,td{padding:3px 10px;text-align:right;white-space:nowrap}`+
+    `th{position:sticky;top:0;background:#1a2029;color:#9fb0c4;text-align:right;`+
+    `border-bottom:1px solid #2a3340}`+
+    `td.isa,th.isa{text-align:left;font-family:monospace;color:#d7dde5;white-space:pre}`+
+    `td.src,th.src{text-align:left;font-family:monospace;color:#7fa7d8;white-space:nowrap}`+
+    `td.a{text-align:right;font-family:monospace;color:#6f7d8f}`+
+    `tbody tr{cursor:pointer}tbody tr:hover td{background:#161b22}`+
+    `tr.sel td{background:#243044}`+
+    `.bar{display:inline-block;height:9px;background:#ff6b6b;border-radius:2px;`+
+    `vertical-align:middle}`+
+    `.hot td.isa{color:#ffd7b0}`+
+    `tr.step td{background:#3a2f10 !important;box-shadow:inset 3px 0 #e0b341}`+
+    `tr.step td.isa{color:#ffe0a0}`+
+    `.sl.stepline{background:#3a2f10;border-left-color:#e0b341}`+
+    `#stepbar{margin-top:8px;display:flex;align-items:center;gap:6px;flex-wrap:wrap}`+
+    `#stepbar button{background:#1f2733;color:#d7dde5;border:1px solid #3a4553;`+
+    `border-radius:3px;padding:4px 10px;font-size:13px;cursor:pointer}`+
+    `#stepbar button:hover{background:#2a3340}`+
+    `#stepinfo{font-family:monospace;font-size:13px;color:#e0b341;margin-left:6px}`+
+    `#tip{position:fixed;z-index:20;max-width:520px;background:#1a2029;color:#d7dde5;`+
+    `border:1px solid #3a4553;border-radius:4px;padding:6px 10px;`+
+    `font:13px/1.45 -apple-system,Segoe UI,Roboto,sans-serif;`+
+    `box-shadow:0 4px 14px rgba(0,0,0,.5);pointer-events:none;display:none}`+
+    `#tip b{color:#ffd7b0;font-family:monospace}`+
+    `.reg{color:#7fd0ff;cursor:help;text-decoration:underline dotted #4a6a80}`+
+    `#wvbtn{margin-left:12px;background:#1f2733;color:#d7dde5;border:1px solid #3a4553;`+
+    `border-radius:3px;padding:4px 12px;font-size:13px;cursor:pointer}`+
+    `#wvbtn:hover{background:#2a3340}`+
+    `#wavepane{position:fixed;inset:0;z-index:30;background:#0d1117;display:none;`+
+    `flex-direction:column}#wavepane.show{display:flex}`+
+    `#wvbar{flex:0 0 auto;display:flex;align-items:center;gap:14px;padding:10px 16px;`+
+    `background:#161b22;border-bottom:1px solid #2a3340;flex-wrap:wrap}`+
+    `#wvbar h2{margin:0;font-size:16px;color:#dbe6f5}`+
+    `#wvbar .lg{display:inline-flex;align-items:center;gap:5px;font-size:12px;color:#9fb0c4;margin-right:10px}`+
+    `#wvbar .sw{display:inline-block;width:13px;height:13px;border-radius:2px}`+
+    `#wvlegend{display:flex;flex-wrap:wrap;align-items:center}`+
+    `#wvhint{font-size:12px;color:#6f7d8f}`+
+    `#wvbar .wvzb{background:#1f2733;color:#d7dde5;border:1px solid #3a4553;border-radius:3px;`+
+    `padding:3px 9px;font-size:12px;cursor:pointer}#wvbar .wvzb:hover{background:#2a3340}`+
+    `#wvclose{margin-left:auto;background:#1f2733;color:#d7dde5;border:1px solid #3a4553;`+
+    `border-radius:3px;padding:4px 14px;font-size:13px;cursor:pointer}`+
+    `#wvclose:hover{background:#2a3340}`+
+    `#wvwrap{flex:1 1 auto;overflow:auto;min-height:0}#wvcanvas{display:block}`+
+    `</style></head><body>`+
+    `<header><h1>ISA debug view`+(split?` -- source-linked`:``)+`</h1>`+
+    `<div class="sym">`+esc(payload.sym||fam)+`</div>`+
+    `<div class="tot">`+payload.rows.length+` instructions &middot; `+
+    payload.n_disp+` dispatch(es), ~1 SIMD &middot; `+
+    fmtc(payload.stall)+` stall / `+fmtc(payload.lat)+` latency / `+
+    fmtc(payload.idle)+` idle cyc`+
+    (payload.occ?`<button id="wvbtn">Occupancy View</button>`:``)+`</div>`+
+    (payload.has_src?``:`<div class="note">Source lines unavailable: the traced `+
+      `code object has no DWARF line tables (build ggml-hip with `+
+      `-gline-tables-only/-g and re-trace to link ISA to source). Showing ISA only.`+
+      `</div>`)+
+    (payload.exec?`<div id="stepbar"><button id="sprev">&#9664; Prev</button>`+
+      `<button id="snext">Next &#9654;</button>`+
+      `<button id="slprev">&#9664; src line</button>`+
+      `<button id="slnext">src line &#9654;</button>`+
+      `<span id="stepinfo"></span>`+
+      `<span class="hint">one sampled wave, executed order &middot; keys: `+
+      `&larr;/&rarr; step, H/L source-line</span></div>`:``)+
+    `<input id="f" placeholder="filter instructions (e.g. s_waitcnt, global_load)">`+
+    `</header>`+
+    `<div id="main">`+
+    `<section id="isapane"><div class="phdr">ISA (program order)`+
+    (split?` <span class="hint">click a row to jump to its source line</span>`:``)+
+    `<span class="hint">hover an instruction for its ISA description</span>`+
+    `</div><div class="scroll"><table><thead><tr>`+
+    (split?`<th class="src">source</th>`:``)+
+    `<th>addr</th><th class="isa">ISA</th><th>hits</th><th>latency</th>`+
+    `<th>stall</th><th>stall%</th><th>idle</th></tr></thead>`+
+    `<tbody id="b"></tbody></table></div></section>`+
+    (split?`<section id="srcpane"><div class="phdr">source: <select id="file">`+
+      fileOpts+`</select><span class="hint">click a line to jump to its instructions</span>`+
+      `</div><div class="scroll"><div id="src"></div></div></section>`:``)+
+    `</div>`+
+    (payload.occ?`<div id="wavepane"><div id="wvbar"><h2>Occupancy View</h2>`+
+      `<button class="wvzb" id="wvzout">time &minus;</button>`+
+      `<button class="wvzb" id="wvzin">time +</button>`+
+      `<button class="wvzb" id="wvrout">rows &minus;</button>`+
+      `<button class="wvzb" id="wvrin">rows +</button>`+
+      `<button class="wvzb" id="wvfit">fit</button>`+
+      `<span id="wvhint"></span>`+
+      `<span id="wvlegend"></span>`+
+      `<button id="wvclose">Close (Esc)</button></div>`+
+      `<div id="wvwrap"><canvas id="wvcanvas"></canvas></div></div>`:``)+
+    `<div id="tip"></div>`+
+    `<scr`+`ipt>`+
+    `var D=`+JSON.stringify(payload).replace(/</g,'\\u003c')+`;`+
+    `function esc(s){return(''+s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}`+
+    `function fmtc(n){n=+n||0;return n>=1e6?(n/1e6).toFixed(1)+'M':n>=1e3?(n/1e3).toFixed(1)+'k':(''+n);}`+
+    `var SPLIT=!!D.split,SEL=null,GLOSS=D.gloss||{};`+
+    // RDNA3.5 opcode glossary lookup: match the ISA mnemonic (first token), then
+    // retry after stripping encoding suffixes the disassembler adds (_e32/_e64/dpp).
+    `var GSFX=['_e64_dpp','_e32','_e64','_dpp8','_dpp','_sdwa'];`+
+    `function mnemOf(isa){var s=(''+isa).trim();var i=s.search(/\\s/);`+
+    `return (i<0?s:s.slice(0,i)).toLowerCase();}`+
+    `function lookGloss(m){if(!m)return '';if(GLOSS[m])return GLOSS[m];`+
+    `for(var i=0;i<GSFX.length;i++){var x=GSFX[i];`+
+    `if(m.length>x.length&&m.slice(-x.length)===x){var b=m.slice(0,-x.length);`+
+    `if(GLOSS[b])return GLOSS[b];}}return '';}`+
+    // Special-register / wait-counter glossary: wrap recognized operand tokens in the
+    // ISA text so hovering vmcnt/lgkmcnt/scc/exec/vcc/m0 etc. shows their meaning.
+    `var REGG=D.regGloss||{};`+
+    `var REGRX=(function(){var k=Object.keys(REGG);if(!k.length)return null;`+
+    `k.sort(function(a,b){return b.length-a.length;});`+
+    `return new RegExp('\\\\b('+k.join('|')+')\\\\b','gi');})();`+
+    `function annotIsa(isa){var s=esc(isa);if(!REGRX)return s;`+
+    `return s.replace(REGRX,function(m){var d=REGG[m.toLowerCase()];`+
+    `return d?'<span class=reg data-reg=\"'+m.toLowerCase()+'\">'+m+'</span>':m;});}`+
+    `var STEP=!!D.exec,ES=D.exec?D.exec.stream:null,T0=D.exec?D.exec.t0:0,EX=null,POS2EX={};`+
+    `if(ES){for(var ei=0;ei<ES.length;ei++){if(POS2EX[ES[ei][0]]==null)POS2EX[ES[ei][0]]=ei;}}`+
+    `var LA={};for(var i=0;i<D.rows.length;i++){var r=D.rows[i];if(!r.src)continue;`+
+    `var a=LA[r.src]||(LA[r.src]={st:0,hit:0,idle:0,lat:0});`+
+    `a.st+=r.st||0;a.hit+=r.hit||0;a.idle+=r.idle||0;a.lat+=r.lat||0;}`+
+    `var FILES=Object.keys(D.src_files||{});`+
+    `function fstall(f){var s=0;for(var k in LA){if(k.indexOf(f+':')===0)s+=LA[k].st;}return s;}`+
+    `FILES.sort(function(x,y){return fstall(y)-fstall(x);});`+
+    `var curFile=FILES[0]||'';`+
+    `function drawISA(q){q=(q||'').toLowerCase();var tot=D.stall||1,b=[];`+
+    `for(var i=0;i<D.rows.length;i++){var r=D.rows[i];`+
+    `if(q&&r.isa.toLowerCase().indexOf(q)<0)continue;`+
+    `var pct=100*(r.st||0)/tot,bw=Math.round(60*(r.st||0)/(D.maxStall||1));`+
+    `b.push('<tr data-idx='+i+' data-key=\"'+esc(r.src||'')+'\" class=\"'+(pct>=5?'hot':'')+'\">'+`+
+    `(SPLIT?'<td class=src>'+esc(r.src||'')+'</td>':'')+`+
+    `'<td class=a>0x'+(r.a||0).toString(16)+'</td>'+`+
+    `'<td class=isa>'+annotIsa(r.isa)+'</td>'+`+
+    `'<td>'+fmtc(r.hit)+'</td><td>'+fmtc(r.lat)+'</td>'+`+
+    `'<td>'+fmtc(r.st)+'</td>'+`+
+    `'<td>'+pct.toFixed(1)+'% <span class=bar style=\"width:'+bw+'px\"></span></td>'+`+
+    `'<td>'+fmtc(r.idle)+'</td></tr>');}`+
+    `document.getElementById('b').innerHTML=b.join('');bindISA();applyISASel(false);`+
+    `if(STEP&&EX!=null)applyStepISA(false);}`+
+    `function bindISA(){var rows=document.querySelectorAll('#b tr');`+
+    `for(var i=0;i<rows.length;i++){rows[i].onclick=function(){`+
+    `var idx=+this.getAttribute('data-idx');`+
+    `if(ES&&POS2EX[idx]!=null){EX=POS2EX[idx];stepRender(true);}`+
+    `if(SPLIT){var k=this.getAttribute('data-key');if(k)selectKey(k,true,false);}};}}`+
+    `function renderSrc(){var lines=D.src_files[curFile]||[],mx=1;`+
+    `for(var k in LA){if(k.indexOf(curFile+':')===0&&LA[k].st>mx)mx=LA[k].st;}`+
+    `var tot=D.stall||1,h=[];`+
+    `for(var L=1;L<=lines.length;L++){var key=curFile+':'+L,a=LA[key];`+
+    `var pct=a?100*a.st/tot:0,bw=a?Math.round(48*a.st/mx):0;`+
+    `h.push('<div class=\"sl'+(a&&pct>=3?' hotl':'')+'\" data-key=\"'+key+'\">'+`+
+    `'<span class=sln>'+L+'</span>'+`+
+    `'<span class=shb>'+(a?'<span class=sbar style=\"width:'+bw+'px\"></span>':'')+'</span>'+`+
+    `'<span class=sst>'+(a?fmtc(a.st):'')+'</span>'+`+
+    `'<span class=sc>'+esc(lines[L-1]||'')+'</span></div>');}`+
+    `document.getElementById('src').innerHTML=h.join('');bindSrc();applySrcSel(false);`+
+    `if(STEP&&EX!=null&&SPLIT)applyStepSrc(false);}`+
+    `function bindSrc(){var ls=document.querySelectorAll('#src .sl');`+
+    `for(var i=0;i<ls.length;i++){ls[i].onclick=function(){`+
+    `selectKey(this.getAttribute('data-key'),false,true);};}}`+
+    `function selectKey(key,scSrc,scIsa){SEL=key;`+
+    `if(SPLIT){var f=key.split(':')[0];`+
+    `if(f&&D.src_files[f]&&f!==curFile){curFile=f;var s=document.getElementById('file');`+
+    `if(s)s.value=f;renderSrc();}applySrcSel(scSrc);}applyISASel(scIsa);}`+
+    `function applySrcSel(scroll){var ls=document.querySelectorAll('#src .sl'),hit=null;`+
+    `for(var i=0;i<ls.length;i++){if(SEL&&ls[i].getAttribute('data-key')===SEL){`+
+    `ls[i].classList.add('selline');if(!hit)hit=ls[i];}else ls[i].classList.remove('selline');}`+
+    `if(scroll&&hit)hit.scrollIntoView({block:'center'});}`+
+    `function applyISASel(scroll){var rows=document.querySelectorAll('#b tr'),first=null;`+
+    `for(var i=0;i<rows.length;i++){if(SEL&&rows[i].getAttribute('data-key')===SEL){`+
+    `rows[i].classList.add('sel');if(!first)first=rows[i];}else rows[i].classList.remove('sel');}`+
+    `if(scroll&&first)first.scrollIntoView({block:'center'});}`+
+    // --- Step mode: walk one sampled wave's executed-instruction stream ---
+    `function applyStepISA(scroll){var rows=document.querySelectorAll('#b tr'),hit=null;`+
+    `var pos=(EX!=null&&ES)?ES[EX][0]:-1;`+
+    `for(var i=0;i<rows.length;i++){if(+rows[i].getAttribute('data-idx')===pos){`+
+    `rows[i].classList.add('step');if(!hit)hit=rows[i];}else rows[i].classList.remove('step');}`+
+    `if(scroll&&hit)hit.scrollIntoView({block:'center'});}`+
+    `function applyStepSrc(scroll){var ls=document.querySelectorAll('#src .sl'),hit=null;`+
+    `var pos=(EX!=null&&ES)?ES[EX][0]:-1,key=(pos>=0&&D.rows[pos])?D.rows[pos].src:'';`+
+    `for(var i=0;i<ls.length;i++){if(key&&ls[i].getAttribute('data-key')===key){`+
+    `ls[i].classList.add('stepline');if(!hit)hit=ls[i];}else ls[i].classList.remove('stepline');}`+
+    `if(scroll&&hit)hit.scrollIntoView({block:'center'});}`+
+    `function stepReadout(){var el=document.getElementById('stepinfo');if(!el)return;`+
+    `if(EX==null||!ES){el.textContent='';return;}`+
+    `var cyc=ES[EX][1],dwell=(EX+1<ES.length)?ES[EX+1][1]-cyc:0,row=D.rows[ES[EX][0]]||{};`+
+    `el.textContent='step '+(EX+1)+'/'+ES.length+'  @ +'+(cyc-T0)+' cyc  dwell '+dwell+' cyc'+`+
+    `(row.src?'  '+row.src:'');}`+
+    `function stepRender(scroll){if(EX==null||!ES)return;`+
+    `var row=D.rows[ES[EX][0]]||{},key=row.src||'';`+
+    `if(SPLIT&&key){var f=key.split(':')[0];`+
+    `if(f&&D.src_files[f]&&f!==curFile){curFile=f;var s=document.getElementById('file');`+
+    `if(s)s.value=f;renderSrc();}}`+
+    `applyStepISA(scroll);if(SPLIT)applyStepSrc(scroll);stepReadout();}`+
+    `function ensureUnfiltered(){var f=document.getElementById('f');`+
+    `if(f&&f.value){f.value='';drawISA('');}}`+
+    `function stepTo(k){if(!ES)return;EX=Math.max(0,Math.min(ES.length-1,k));`+
+    `ensureUnfiltered();stepRender(true);}`+
+    `function stepBy(d){if(!ES)return;stepTo(EX==null?0:EX+d);}`+
+    `function stepLine(dir){if(EX==null||!ES)return;`+
+    `var cur=D.rows[ES[EX][0]]?D.rows[ES[EX][0]].src:'';`+
+    `for(var k=EX+dir;k>=0&&k<ES.length;k+=dir){`+
+    `var s=D.rows[ES[k][0]]?D.rows[ES[k][0]].src:'';`+
+    `if(s&&s!==cur){stepTo(k);return;}}}`+
+    `drawISA('');`+
+    // opcode hover tooltip: delegated on the (persistent) ISA tbody so it survives
+    // re-render. pointer-events:none on #tip keeps row clicks/step working.
+    `var TIP=document.getElementById('tip'),B=document.getElementById('b');`+
+    `function hideTip(){if(TIP)TIP.style.display='none';}`+
+    `function posTip(e){if(!TIP)return;var x=e.clientX+14,y=e.clientY+16;`+
+    `var w=TIP.offsetWidth,h=TIP.offsetHeight;`+
+    `if(x+w>innerWidth)x=Math.max(4,e.clientX-w-14);`+
+    `if(y+h>innerHeight)y=Math.max(4,e.clientY-h-16);`+
+    `TIP.style.left=x+'px';TIP.style.top=y+'px';}`+
+    `if(B&&TIP){B.addEventListener('mouseover',function(e){`+
+    `var rg=e.target&&e.target.closest?e.target.closest('span.reg'):null;`+
+    `if(rg){var rk=rg.getAttribute('data-reg'),rd=REGG[rk];if(rd){`+
+    `TIP.innerHTML='<b>'+esc(rk)+'</b> - '+esc(rd);TIP.style.display='block';posTip(e);return;}}`+
+    `var td=e.target&&e.target.closest?e.target.closest('td.isa'):null;`+
+    `if(!td){hideTip();return;}var m=mnemOf(td.textContent),g=lookGloss(m);`+
+    `if(!g){hideTip();return;}`+
+    `TIP.innerHTML='<b>'+esc(m)+'</b> - '+esc(g);TIP.style.display='block';posTip(e);});`+
+    `B.addEventListener('mousemove',function(e){if(TIP.style.display==='block')posTip(e);});`+
+    `B.addEventListener('mouseout',function(e){var to=e.relatedTarget;`+
+    `if(!to||!to.closest||!to.closest('td.isa'))hideTip();});}`+
+    `if(SPLIT){var fs=document.getElementById('file');`+
+    `if(fs){fs.value=curFile;fs.onchange=function(){curFile=this.value;renderSrc();};}renderSrc();}`+
+    `document.getElementById('f').addEventListener('input',function(e){drawISA(e.target.value);});`+
+    `if(STEP){var _p=document.getElementById('sprev');if(_p)_p.onclick=function(){stepBy(-1);};`+
+    `var _n=document.getElementById('snext');if(_n)_n.onclick=function(){stepBy(1);};`+
+    `var _lp=document.getElementById('slprev');if(_lp)_lp.onclick=function(){stepLine(-1);};`+
+    `var _ln=document.getElementById('slnext');if(_ln)_ln.onclick=function(){stepLine(1);};`+
+    `document.addEventListener('keydown',function(e){var t=e.target;`+
+    `if(t&&(t.id==='f'||t.tagName==='SELECT'||t.tagName==='INPUT'))return;var k=e.key;`+
+    `if(k==='ArrowRight'||k==='ArrowDown'||k==='n'||k==='j'){stepBy(1);e.preventDefault();}`+
+    `else if(k==='ArrowLeft'||k==='ArrowUp'||k==='p'||k==='k'){stepBy(-1);e.preventDefault();}`+
+    `else if(k==='L'||k==='l'){stepLine(1);e.preventDefault();}`+
+    `else if(k==='H'||k==='h'){stepLine(-1);e.preventDefault();}});`+
+    `EX=0;stepRender(false);}`+
+    // --- Occupancy View: RCV Global-View-style panel, FILTERED to the selected
+    // kernel. occupancy.json samples wave scheduling across ALL CUs the trace saw;
+    // each lane is (CU, SIMD, wave_id) and each interval is colored by which kernel
+    // held the slot. Because one ATT capture spans several back-to-back dispatches,
+    // we keep only the intervals whose kernel == the selected family and drop lanes
+    // that never ran it -- so the view shows just this kernel's footprint over CUs.
+    `if(D.occ){`+
+    `var KN=D.occ.kernels||{};`+
+    // shifted kernel ids whose name matches the selected family (same kernel may be
+    // re-dispatched several times in the capture window -> several matching ids)
+    `var TGT={};for(var kk in KN){if(KN[kk]&&KN[kk]===D.fam)TGT[kk]=1;}`+
+    `var wpane=document.getElementById('wavepane'),wcan=document.getElementById('wvcanvas'),`+
+    `wwrap=document.getElementById('wvwrap'),wbtn=document.getElementById('wvbtn'),`+
+    `wclose=document.getElementById('wvclose'),whint=document.getElementById('wvhint');`+
+    `var AX=26,ROWH=0,PLOTW=0,WOPEN=false,WROWS=[],ROWZ=1;`+
+    // gutter columns mirror RCV's Global View, prefixed with a sequential group
+    // ordinal (#) so the number of distinct SM groups shown is countable at a glance.
+    // SA is not carried in ATT records (single-SA capture) so it renders 0.
+    `var WCOLS=[['#','seq'],['SE','se'],['SA','sa'],['WG','cu'],['SM','sm']];`+
+    `var CW=26,GUT=WCOLS.length*CW+10;`+
+    `function AM(){return D.occ;}`+
+    // Within a single lane (WG/SIMD/wave-slot) the kernel appears as one or more
+    // contiguous resident RUNS separated by gaps (the slot drains, then another wave
+    // of the same kernel is scheduled into it). We color each run by its ORDINAL in
+    // that lane -- 1st run green, 2nd amber, 3rd green... -- so consecutive waves that
+    // time-share a slot are visually distinct. Value codes: 0=background,1=even,2=odd.
+    `var BURSTCOL=['#0d1117','#3fb950','#e8912a'];`+          // 0=bg,1=odd-run,2=even-run
+    `function colorOf(v){return BURSTCOL[v]||'#30363d';}`+
+    // Per lane, keep only THIS kernel's raw cycle intervals [s,e,run] where run is the
+    // 1-based ordinal of the wave in that slot -> color alternates 1,2,1,2.. Because
+    // intervals carry exact cycles (no bucketing), gaps of ANY size survive at any zoom.
+    `var NBURST=0;`+
+    `function laneWaves(iv){var out=[],run=0;`+
+    `for(var r=0;r<iv.length;r++){if(TGT[iv[r][2]]){run++;`+
+    `out.push([iv[r][0],iv[r][1],1+((run-1)%2)]);}}`+
+    `if(run>NBURST)NBURST=run;return out;}`+
+    `function regroup(){WROWS=[];var ls=D.occ.lanes.slice();`+
+    `ls.sort(function(a,b){return (a.cu-b.cu)||(a.simd-b.simd)||(a.wv-b.wv);});`+
+    `for(var i=0;i<ls.length;i++){var l=ls[i],w=laneWaves(l.iv);if(!w.length)continue;`+
+    `WROWS.push({grp:l.cu+'/'+l.simd,coords:{se:0,sa:0,cu:l.cu,sm:l.simd,sl:-1,id:l.wv},`+
+    `waves:w});}}`+
+    `regroup();`+
+    // data window in CYCLES (relative to occ t0): first wave start .. last wave end,
+    // across all lanes -> default view fills the axis, axis reads 0 at the first wave.
+    `var DC0=1e18,DC1=0;`+
+    `for(var di=0;di<WROWS.length;di++){var ww=WROWS[di].waves;`+
+    `if(ww.length){if(ww[0][0]<DC0)DC0=ww[0][0];if(ww[ww.length-1][1]>DC1)DC1=ww[ww.length-1][1];}}`+
+    `if(DC1<=DC0){DC0=0;DC1=Math.max(1,D.occ.t1-D.occ.t0);}`+
+    // zoom/pan window over CYCLES; V0,V1 are cycle offsets from DC0-anchored origin.
+    `var WV0=DC0,WV1=DC1,WMINC=8,wpan=false,wpx=0,wpv0=0,wpv1=0;`+
+    `function clampWV(){var s=WV1-WV0;if(s<WMINC){var m=(WV0+WV1)/2;WV0=m-WMINC/2;WV1=m+WMINC/2;}}`+
+    `function cx(c){return GUT+PLOTW*(c-WV0)/(WV1-WV0);}`+
+    `function zoomWV(frac,factor){var s=WV1-WV0,ns=s*factor,ft=WV0+frac*s;`+
+    `WV0=ft-frac*ns;WV1=ft+(1-frac)*ns;clampWV();drawWaves();}`+
+    `function fmtk(v){return v>=1000?(v/1000).toFixed(v>=10000?0:1)+'k':(''+Math.round(v));}`+
+    `function drawWaves(){var dpr=window.devicePixelRatio||1,W=wwrap.clientWidth||900,`+
+    `n=WROWS.length;`+
+    `var baseH=Math.max(3,Math.min(26,Math.floor((wwrap.clientHeight-AX)/Math.max(1,n))));`+
+    `ROWH=Math.max(2,Math.min(40,Math.round(baseH*ROWZ)));`+
+    `var H=AX+n*ROWH;PLOTW=W-GUT-14;if(PLOTW<50)PLOTW=50;`+
+    `wcan.style.width=W+'px';wcan.style.height=H+'px';`+
+    `wcan.width=Math.floor(W*dpr);wcan.height=Math.floor(H*dpr);`+
+    `var g=wcan.getContext('2d');g.setTransform(dpr,0,0,dpr,0,0);`+
+    `g.clearRect(0,0,W,H);g.font='11px ui-monospace,Menlo,Consolas,monospace';`+
+    `g.textBaseline='middle';`+
+    // header band: column titles over the gutter, absolute-cycle ticks over the plot
+    `g.fillStyle='#161b22';g.fillRect(0,0,W,AX);`+
+    `g.fillStyle='#c8d0da';g.textAlign='center';`+
+    `for(var c=0;c<WCOLS.length;c++)g.fillText(WCOLS[c][0],c*CW+CW/2,AX/2);`+
+    `var ND=6;for(var t=0;t<=ND;t++){var fx=GUT+PLOTW*t/ND;`+
+    `g.fillStyle='#3a4553';g.fillRect(Math.round(fx),AX,1,H-AX);`+
+    `g.fillStyle='#9fb0c4';g.textAlign=(t===0?'left':(t===ND?'right':'center'));`+
+    `g.fillText(fmtk(WV0+(WV1-WV0)*t/ND-DC0),fx,AX/2);}`+
+    // gutter coords drawn ONCE per group (centered), bars per lane.
+    `function gut(row,y0,y1,seq){if(!row.coords)return;var cc=row.coords,`+
+    `cv=[seq,cc.se,cc.sa,cc.cu,cc.sm];g.textAlign='center';`+
+    `var yc=(y0+y1)/2;if(y1-y0<9)return;`+
+    `for(var c=0;c<WCOLS.length;c++){g.fillStyle=(c===0?'#7fd0ff':'#c8d0da');`+
+    `g.fillText(''+cv[c],c*CW+CW/2,yc);}}`+
+    `var gs=0,gseq=0;`+
+    `for(var i=0;i<n;i++){var row=WROWS[i],y=AX+i*ROWH,wl=row.waves;`+
+    `if(i>0&&row.grp!==WROWS[i-1].grp){gut(WROWS[gs],AX+gs*ROWH,y,gseq);gseq++;`+
+    `g.strokeStyle='#2a3340';g.beginPath();g.moveTo(0,y+0.5);g.lineTo(W,y+0.5);g.stroke();gs=i;}`+
+    `for(var wi=0;wi<wl.length;wi++){var s=wl[wi][0],e=wl[wi][1],col=wl[wi][2];`+
+    `var x0=cx(s),x1=cx(e);`+
+    `if(x1>GUT&&x0<GUT+PLOTW){if(x0<GUT)x0=GUT;if(x1>GUT+PLOTW)x1=GUT+PLOTW;`+
+    `g.fillStyle=colorOf(col);g.fillRect(x0,y+1,Math.max(1,x1-x0),Math.max(1,ROWH-1));}}}`+
+    `gut(WROWS[gs],AX+gs*ROWH,AX+n*ROWH,gseq);`+
+    `g.strokeStyle='#3a4553';g.beginPath();g.moveTo(GUT+0.5,0);g.lineTo(GUT+0.5,H);g.stroke();}`+
+    `function renderLegend(){var el=document.getElementById('wvlegend');if(!el)return;`+
+    `var h='<span class="lg"><span class="sw" style="background:'+BURSTCOL[1]+`+
+    `'"></span>wave 1/3/5..</span>';`+
+    `if(NBURST>1)h+='<span class="lg"><span class="sw" style="background:'+BURSTCOL[2]+`+
+    `'"></span>wave 2/4/6..</span>';el.innerHTML=h;}`+
+    `function syncChrome(){`+
+    `whint.textContent='up to '+NBURST+' wave'+(NBURST!==1?'s':'')+'/slot; '+`+
+    `WROWS.length+' lanes (WG x SIMD x wave-slot); scroll=time zoom, alt+scroll=row zoom, `+
+    `shift+scroll=pan rows, drag=pan';renderLegend();}`+
+    `function openWaves(){wpane.classList.add('show');WOPEN=true;WV0=DC0;WV1=DC1;`+
+    `syncChrome();drawWaves();}`+
+    `function closeWaves(){wpane.classList.remove('show');WOPEN=false;hideTip();}`+
+    `if(wbtn)wbtn.onclick=openWaves;if(wclose)wclose.onclick=closeWaves;`+
+    `window.addEventListener('resize',function(){if(WOPEN)drawWaves();});`+
+    `var wzi=document.getElementById('wvzin'),wzo=document.getElementById('wvzout'),`+
+    `wri=document.getElementById('wvrin'),wro=document.getElementById('wvrout'),`+
+    `wfit=document.getElementById('wvfit');`+
+    `function rowZoom(f){ROWZ=Math.max(0.25,Math.min(8,ROWZ*f));drawWaves();}`+
+    `if(wzi)wzi.onclick=function(){zoomWV(0.5,0.6);};`+
+    `if(wzo)wzo.onclick=function(){zoomWV(0.5,1/0.6);};`+
+    `if(wri)wri.onclick=function(){rowZoom(1.4);};`+
+    `if(wro)wro.onclick=function(){rowZoom(1/1.4);};`+
+    `if(wfit)wfit.onclick=function(){WV0=DC0;WV1=DC1;ROWZ=1;drawWaves();};`+
+    `if(wcan){wcan.addEventListener('wheel',function(e){`+
+    `if(e.shiftKey){wwrap.scrollTop+=e.deltaY;e.preventDefault();return;}`+
+    `if(e.altKey){rowZoom(e.deltaY<0?1.15:1/1.15);e.preventDefault();return;}`+
+    `var rect=wcan.getBoundingClientRect(),mx=e.clientX-rect.left;`+
+    `var frac=(mx-GUT)/PLOTW;if(frac<0)frac=0;if(frac>1)frac=1;`+
+    `zoomWV(frac,e.deltaY<0?0.85:1/0.85);e.preventDefault();},{passive:false});`+
+    `wcan.addEventListener('mousedown',function(e){var rect=wcan.getBoundingClientRect();`+
+    `if(e.clientX-rect.left<GUT)return;wpan=true;wpx=e.clientX;wpv0=WV0;wpv1=WV1;`+
+    `wcan.style.cursor='grabbing';hideTip();e.preventDefault();});`+
+    `window.addEventListener('mousemove',function(e){if(!wpan)return;`+
+    `var dc=-(e.clientX-wpx)/PLOTW*(wpv1-wpv0);WV0=wpv0+dc;WV1=wpv1+dc;clampWV();drawWaves();});`+
+    `window.addEventListener('mouseup',function(){if(wpan){wpan=false;wcan.style.cursor='grab';}});`+
+    `wcan.style.cursor='grab';`+
+    `wcan.addEventListener('mousemove',function(e){`+
+    `if(wpan){hideTip();return;}`+
+    `var rect=wcan.getBoundingClientRect(),mx=e.clientX-rect.left,my=e.clientY-rect.top;`+
+    `if(my<AX||mx<GUT){hideTip();return;}`+
+    `var i=Math.floor((my-AX)/ROWH);if(i<0||i>=WROWS.length){hideTip();return;}`+
+    `var c=WV0+(mx-GUT)/PLOTW*(WV1-WV0);`+
+    `var row=WROWS[i],cc=row.coords,nm='(not resident)',run=0;`+
+    `for(var wi=0;wi<row.waves.length;wi++){run++;`+
+    `if(c>=row.waves[wi][0]&&c<row.waves[wi][1]){`+
+    `nm='wave #'+run+' of '+esc(D.fam)+' ('+(row.waves[wi][1]-row.waves[wi][0])+' cyc)';break;}}`+
+    `var h='<b>WG:'+cc.cu+' SIMD:'+cc.sm+' wave_id:'+cc.id+'</b>'+`+
+    `'<br>'+nm+' @ '+fmtk(c-DC0)+' cyc';`+
+    `TIP.innerHTML=h;TIP.style.display='block';posTip(e);});`+
+    `wcan.addEventListener('mouseout',function(){hideTip();});}`+
+    `document.addEventListener('keydown',function(e){if(e.key==='Escape'&&WOPEN)closeWaves();});`+
+    `}`+
+    `<\/scr`+`ipt></body></html>`;
+  w.document.open(); w.document.write(doc); w.document.close();
 }
 
 // POST to the companion server to run ATT on a free GPU board and fold the result in
@@ -2191,6 +3207,9 @@ async function traceKernelLive(sym, fam){
     D.att_by_fam=D.att_by_fam||{};
     let n=0;
     for(const k in j.fam_stats){ D.att_by_fam[k]=j.fam_stats[k]; n++; }
+    // fold the full per-instruction ISA so "Open Trace View" lights up too
+    D.att_code_by_fam=D.att_code_by_fam||{};
+    if(j.fam_code) for(const k in j.fam_code){ D.att_code_by_fam[k]=j.fam_code[k]; }
     st.style.color='#8fe388';
     st.textContent='traced on '+(j.host||'board')+' -- '+n+' famil'+(n===1?'y':'ies')+' folded in';
     renderSelectedKernel();
@@ -2205,32 +3224,55 @@ tb.querySelectorAll('tr').forEach(tr=>{
 {
   const tf = document.querySelector('#tbl tfoot');
   const totCountTok = D.summary.reduce((a,r)=>a+r.per_tok,0);
-  const totCount = D.summary.reduce((a,r)=>a+r.count,0);
   const timePerTok = D.n_tokens_baked ? D.busy_ns/D.n_tokens_baked : 0;
-  const totGap = Math.max(0, D.span_ns - D.busy_ns);
-  const gapPerTok = D.n_tokens_baked ? totGap/D.n_tokens_baked : 0;
-  const nGaps = totCount>1 ? totCount-1 : 1;
-  const avgGap = totGap/nGaps;
+  // CP Transition Gap/token = the non-kernel (host/launch/idle) time in a token.
+  // Per-kernel GPU time is accurate under trace, but the trace inflates the SPAN
+  // (host serialization + completion-signal latency), so span-busy OVERSTATES the
+  // real gap by the profiling overhead. When a clean (untraced) tg throughput is
+  // available, prefer [clean per-token wall] - [kernel time/token]: the clean wall
+  // carries no profiling overhead and kernel time is trustworthy, so the difference
+  // isolates the true gap. Fall back to the traced span-busy gap otherwise.
+  const tracedGapPerTok = D.n_tokens_baked ? Math.max(0, D.span_ns - D.busy_ns)/D.n_tokens_baked : 0;
+  const cleanTokNs = (D.clean_tps && D.clean_tps.tps) ? 1e9/D.clean_tps.tps : 0;
+  const useClean = cleanTokNs>0;
+  const gapPerTok = useClean ? Math.max(0, cleanTokNs - timePerTok) : tracedGapPerTok;
+  const gapLabel = useClean ? 'clean total CP Transition Gap'
+                            : 'total CP Transition Gap <span class="r">(traced span - busy)</span>';
+  const gapsPerTok = totCountTok>1 ? totCountTok-1 : totCountTok;
+  const avgGap = gapsPerTok>0 ? gapPerTok/gapsPerTok : 0;
   let rows =
-    `<tr><td colspan="3">total count / token</td><td>${totCountTok.toFixed(1)}</td></tr>`+
-    `<tr><td colspan="3">total kernel time / token</td><td>${fmtdur(timePerTok)}</td></tr>`+
-    `<tr><td colspan="3">total CP Transition Gap / token</td><td>${fmtdur(gapPerTok)}</td></tr>`+
+    `<tr><td colspan="3">total count</td><td>${totCountTok.toFixed(1)}</td></tr>`+
+    `<tr><td colspan="3">total kernel time</td><td>${fmtdur(timePerTok)}</td></tr>`+
+    (useClean?`<tr><td colspan="3">clean token time (untraced)</td><td>${fmtdur(cleanTokNs)}</td></tr>`:``)+
+    `<tr><td colspan="3">${gapLabel}</td><td>${fmtdur(gapPerTok)}</td></tr>`+
     `<tr><td colspan="3">avg CP Transition Gap/kernel</td><td>${fmtdur(avgGap)}</td></tr>`;
   if (D.has_bw){
     const totMB = D.summary.reduce((a,r)=>a+(r.mb_tok||0),0);
     rows +=
-      `<tr><td colspan="3">DRAM read / token (all kernels, measured)</td><td>${totMB.toFixed(0)} MB</td></tr>`;
+      `<tr><td colspan="3">DRAM read (all kernels, measured)</td><td>${totMB.toFixed(0)} MB</td></tr>`;
   }
   if (D.has_map){
-    // eff BW = useful throughput: theoretical packed weight bytes / kernel time
-    // (over-fetch-immune; only order-mapped matvec dispatches carry packed bytes).
+    // Two effective-BW rooflines (over-fetch-immune; only order-mapped matvec
+    // dispatches carry packed bytes):
+    //  1) eff KERNEL BW% = packed weights / kernel time -- how well the matvecs
+    //     use DRAM while the GPU is actually running them (excludes idle gaps).
+    //  2) eff TOKEN BW% = (packed weights + KV cache) / token time -- the useful
+    //     DRAM throughput per generated token end-to-end, so it charges the
+    //     inter-kernel gaps too. Uses the clean (untraced) token time when known,
+    //     else the traced span/token. KV cache re-read grows with context.
     let totPacked = 0;
     for(const s of D.gpu){ if(s.map) totPacked += s.map.packed||0; }
     const packedTok = D.n_tokens_baked ? totPacked/D.n_tokens_baked : 0;
-    const effbw = timePerTok ? packedTok/timePerTok : 0;  // bytes/ns == GB/s
+    const kernBw = timePerTok ? packedTok/timePerTok : 0;  // bytes/ns == GB/s
+    const tokTime = useClean ? cleanTokNs
+                    : (D.n_tokens_baked ? D.span_ns/D.n_tokens_baked : 0);
+    const kvTok = D.kv_bytes_per_tok||0;
+    const tokBw = tokTime ? (packedTok+kvTok)/tokTime : 0;
     rows +=
-      `<tr><td colspan="3">eff BW% (packed weights / kernel time)</td>`+
-      `<td>${effbw.toFixed(0)} GB/s (${(effbw/D.peak_bw_gbs*100).toFixed(0)}%)</td></tr>`;
+      `<tr><td colspan="3">eff kernel BW% (packed weights / kernel time)</td>`+
+      `<td>${kernBw.toFixed(0)} GB/s (${(kernBw/D.peak_bw_gbs*100).toFixed(0)}%)</td></tr>`+
+      `<tr><td colspan="3">eff token BW%</td>`+
+      `<td>${tokBw.toFixed(0)} GB/s (${(tokBw/D.peak_bw_gbs*100).toFixed(0)}%)</td></tr>`;
   }
   tf.innerHTML = rows;
 }
@@ -2270,8 +3312,8 @@ cv.addEventListener('mousemove', e=>{
       (s.map?`<div style="color:#ffd479">${s.map.role} [${s.map.K}x${s.map.trueN}] ${s.map.q}`+
         (s.map.padN?` +${s.map.padN} pad`:` (no pad)`)+
         (s.map.overfetch?`, ${s.map.overfetch}x fetch`:``)+`</div>`+
-        (s.map.effbw?`<div style="color:#8fe388">effective BW ~ ${s.map.effbw} GB/s `+
-          `(${s.map.effbw_pct}% of ${D.peak_bw_gbs} peak)</div>`:''):'')+
+        (s.map.effbw?(m=>`<div style="color:${m}">effective BW ~ ${s.map.effbw} GB/s `+
+          `(${s.map.effbw_pct}% of ${D.peak_bw_gbs} peak)</div>`)(isBwBound(s.fam)&&s.map.effbw_pct>0&&s.map.effbw_pct<80?'#ff6b6b':'#8fe388'):''):'')+
       ((D.has_bw && fc.bw_gbs && !s.map)?
         `<div style="color:#7fd1ff">achieved BW ~ ${fc.bw_gbs} GB/s `+
         `(${fc.bw_pct}% of ${D.peak_bw_gbs} peak), ${fc.kb_disp} KB/disp</div>`:'')+

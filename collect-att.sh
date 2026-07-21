@@ -27,11 +27,13 @@ BUILD_DIR=""
 MODEL=""
 OUT_DIR=""
 KERNEL_REGEX=""
+RUNNER=""
 NTOK=1
 TARGET_CU=0
 CONSEC=1
 BUFFER_MB=256
 SE_MASK="0x1"
+SIMD_SELECT=""
 EXTRA=()
 
 usage() {
@@ -41,10 +43,21 @@ Usage: collect-att.sh --kernel REGEX --build-dir DIR --model M.gguf --out-dir DI
   --kernel REGEX    rocprofv3 --kernel-include-regex: the kernel SYMBOL to trace
                     (e.g. mul_mat_vec_q_wvsplitk). REQUIRED. ATT filters by symbol,
                     so this captures every quant/shape variant of that kernel.
-  --build-dir DIR   Directory containing llama-bench + libggml-hip.so* (required).
-  --model PATH      GGUF model file (required).
+  --build-dir DIR   Directory containing the workload binary + libggml-hip.so*
+                    (required). For the default runner this must hold llama-bench;
+                    for --runner it must hold that binary (e.g. test-backend-ops).
+  --model PATH      GGUF model file (required for the default llama-bench runner;
+                    ignored when --runner is given).
   --out-dir DIR     Where the decoded ATT output is written (required). Feed this
                     same directory to the viewer's --att-dir.
+  --runner "CMD"    Replace the default llama-bench decode workload with an
+                    arbitrary command (run with cwd = --build-dir, so a bundled
+                    binary is "./name"). Lets ATT target a single-kernel evaluator
+                    instead of a full model graph -- far fewer cutoff dispatches.
+                    Example (llama.cpp single-op perf harness):
+                      --runner "./test-backend-ops perf -o MUL_MAT -p type_a=q4_K"
+                    When set, --model is not required and -n is ignored; put any
+                    workload flags inside the quoted string (not after --).
   --rocm DIR        ROCm install to drive rocprofv3 + supply the ATT decoder
                     (default: \$ROCM_DIR${ROCM_DIR:+ = $ROCM_DIR}). REQUIRED
                     (via flag or \$ROCM_DIR); no personal path is baked in.
@@ -54,7 +67,13 @@ Usage: collect-att.sh --kernel REGEX --build-dir DIR --model M.gguf --out-dir DI
   --buffer-mb N     --att-buffer-size in MB (default: $BUFFER_MB; raising this
                     reduces cutoffs but slows the run sharply -- 1024 can hang).
   --se-mask HEX     --att-shader-engine-mask (default: $SE_MASK; gfx1151 has one SE).
-  Anything after -- is passed straight to llama-bench (e.g. -fa 1).
+  --simd-select N   --att-simd-select: on gfx10+ this is the SIMD *ID* to detail
+                    (0..3), NOT a bitmask -- ATT thread-traces ONE SIMD per run and
+                    lumps the rest into other_simd_*.json. rocprofv3 default 0xF
+                    resolves to SIMD 3. To cover every SIMD, run once per id (0,1,2,3)
+                    and merge the outputs. Unset = leave rocprofv3 default.
+  Anything after -- is passed straight to the default llama-bench runner (e.g.
+  -fa 1). Ignored when --runner is set (put flags in the --runner string).
 
 After it finishes, refold into the overlay:
   rocprof-unified-viewer <your existing flags> --att-dir <out-dir> --out overlay.html
@@ -67,12 +86,14 @@ while [ $# -gt 0 ]; do
     --build-dir)   BUILD_DIR="$2"; shift 2 ;;
     --model)       MODEL="$2"; shift 2 ;;
     --out-dir)     OUT_DIR="$2"; shift 2 ;;
+    --runner)      RUNNER="$2"; shift 2 ;;
     --rocm)        ROCM_DIR="$2"; shift 2 ;;
     -n)            NTOK="$2"; shift 2 ;;
     --target-cu)   TARGET_CU="$2"; shift 2 ;;
     --consecutive) CONSEC="$2"; shift 2 ;;
     --buffer-mb)   BUFFER_MB="$2"; shift 2 ;;
     --se-mask)     SE_MASK="$2"; shift 2 ;;
+    --simd-select) SIMD_SELECT="$2"; shift 2 ;;
     -h|--help)     usage; exit 0 ;;
     --)            shift; EXTRA=("$@"); break ;;
     *)             EXTRA+=("$1"); shift ;;
@@ -81,11 +102,13 @@ done
 
 [ -n "$KERNEL_REGEX" ] || { echo "ERROR: --kernel REGEX required" >&2; usage >&2; exit 1; }
 [ -n "$BUILD_DIR" ]    || { echo "ERROR: --build-dir required" >&2; exit 1; }
-[ -n "$MODEL" ]        || { echo "ERROR: --model required" >&2; exit 1; }
 [ -n "$OUT_DIR" ]      || { echo "ERROR: --out-dir required" >&2; exit 1; }
 [ -n "$ROCM_DIR" ]     || { echo "ERROR: ROCm dir required: set --rocm DIR or \$ROCM_DIR" >&2; exit 1; }
-[ -x "$BUILD_DIR/llama-bench" ] || { echo "ERROR: no llama-bench in $BUILD_DIR" >&2; exit 1; }
-[ -f "$MODEL" ]        || { echo "ERROR: model not found: $MODEL" >&2; exit 1; }
+if [ -z "$RUNNER" ]; then
+  [ -n "$MODEL" ]      || { echo "ERROR: --model required (or use --runner)" >&2; exit 1; }
+  [ -x "$BUILD_DIR/llama-bench" ] || { echo "ERROR: no llama-bench in $BUILD_DIR" >&2; exit 1; }
+  [ -f "$MODEL" ]      || { echo "ERROR: model not found: $MODEL" >&2; exit 1; }
+fi
 
 ROCPROFV3="$ROCM_DIR/bin/rocprofv3"
 [ -x "$ROCPROFV3" ] || { echo "ERROR: rocprofv3 not found at $ROCPROFV3 (set --rocm)" >&2; exit 1; }
@@ -94,14 +117,28 @@ ROCPROFV3="$ROCM_DIR/bin/rocprofv3"
 ROCM_LIBS="$ROCM_DIR/lib:$ROCM_DIR/lib/llvm/lib"
 mkdir -p "$OUT_DIR"
 
+# The workload run under ATT. Default = llama-bench decode; --runner overrides it
+# with an arbitrary command (word-split; run with cwd = BUILD_DIR).
+if [ -n "$RUNNER" ]; then
+  # shellcheck disable=SC2206  # intentional word-split of the runner string
+  WORKLOAD=($RUNNER)
+else
+  WORKLOAD=(./llama-bench -m "$MODEL" -p 0 -n "$NTOK" -r 1 "${EXTRA[@]}")
+fi
+
 echo "ROCm:      $ROCM_DIR"
 echo "Build:     $BUILD_DIR"
-echo "Model:     $MODEL"
+echo "Model:     ${MODEL:-(n/a, --runner)}"
 echo "Out:       $OUT_DIR"
 echo "Kernel:    $KERNEL_REGEX"
-echo "ATT:       target-cu=$TARGET_CU consecutive=$CONSEC buffer=${BUFFER_MB}MB se-mask=$SE_MASK"
-echo "Extra:     ${EXTRA[*]:-(none)}"
+echo "ATT:       target-cu=$TARGET_CU consecutive=$CONSEC buffer=${BUFFER_MB}MB se-mask=$SE_MASK simd-select=${SIMD_SELECT:-default}"
+echo "Workload:  ${WORKLOAD[*]}"
 echo ""
+
+# gfx10+: --att-simd-select is a SIMD *ID* (0..3); ATT details ONE SIMD per run.
+# Only pass it when set so rocprofv3 keeps its own default (0xF -> SIMD 3) otherwise.
+SIMD_ARGS=()
+[ -n "$SIMD_SELECT" ] && SIMD_ARGS=(--att-simd-select "$SIMD_SELECT")
 
 # rocprofv3 may exit nonzero in postprocess after decoding; judge success by the
 # decoded stats CSVs actually present under the out dir.
@@ -115,9 +152,10 @@ set +e
     --att-consecutive-kernels "$CONSEC" \
     --att-buffer-size $((BUFFER_MB * 1024 * 1024)) \
     --att-shader-engine-mask "$SE_MASK" \
+    "${SIMD_ARGS[@]}" \
     --kernel-include-regex "$KERNEL_REGEX" \
     -d "$OUT_DIR" -- \
-    ./llama-bench -m "$MODEL" -p 0 -n "$NTOK" -r 1 "${EXTRA[@]}" )
+    "${WORKLOAD[@]}" )
 rc=$?
 set -e
 
