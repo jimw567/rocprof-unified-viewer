@@ -59,10 +59,11 @@ import sys
 from collections import defaultdict
 
 try:
-    from isa_glossary import ISA_GLOSSARY, REG_GLOSSARY
+    from isa_glossary import ISA_GLOSSARY, REG_GLOSSARY, CONCEPT_GLOSSARY
 except ImportError:
     ISA_GLOSSARY = {}
     REG_GLOSSARY = {}
+    CONCEPT_GLOSSARY = {}
 
 
 # --- stall classification thresholds (tunable) --------------------------------
@@ -411,6 +412,68 @@ def load_hw_diagram():
             return "data:image/png;base64," + base64.b64encode(fh.read()).decode("ascii")
     except OSError:
         return ""
+
+
+def shortcuts_help_html(uid, title, sections):
+    """Return a self-contained mouse/key shortcut helper: a small round "?" button
+    plus a modal listing the shortcuts, with inline styles + an IIFE that wires
+    open/close/Esc/backdrop-click. No shared CSS needed, so the SAME markup drops
+    into the main overlay AND the child debug window (separate documents).
+
+    uid      -- unique element-id prefix (docs may coexist; keep ids distinct).
+    title    -- modal heading.
+    sections -- [(section_name, [(keys, description), ...]), ...]. `keys` is shown
+                in a monospace chip column; both are plain text (HTML-escaped here).
+    """
+    def esc(s):
+        return (str(s).replace("&", "&amp;").replace("<", "&lt;")
+                .replace(">", "&gt;"))
+    rows = []
+    for name, items in sections:
+        rows.append(
+            '<div style="margin:10px 0 4px;color:#7fd1ff;font-size:12px;'
+            'text-transform:uppercase;letter-spacing:.5px">%s</div>' % esc(name))
+        rows.append('<table style="width:100%;border-collapse:collapse">')
+        for keys, desc in items:
+            rows.append(
+                '<tr>'
+                '<td style="padding:3px 12px 3px 0;white-space:nowrap;'
+                'vertical-align:top"><span style="font-family:ui-monospace,'
+                'Menlo,Consolas,monospace;background:#1b2130;border:1px solid '
+                '#2a3340;border-radius:3px;padding:1px 6px;color:#dbe6f5;'
+                'font-size:12px">%s</span></td>'
+                '<td style="padding:3px 0;color:#c8d0da;font-size:13px">%s</td>'
+                '</tr>' % (esc(keys), esc(desc)))
+        rows.append("</table>")
+    body = "".join(rows)
+    b, m = uid + "Btn", uid + "Modal"
+    return (
+        '<button id="%s" title="mouse & keyboard shortcuts" '
+        'style="cursor:pointer;width:24px;height:24px;border-radius:50%%;'
+        'background:#1f2733;color:#dbe6f5;border:1px solid #3a4553;'
+        'font-size:14px;line-height:1;padding:0">?</button>'
+        '<div id="%s" style="display:none;position:fixed;inset:0;z-index:10000;'
+        'background:rgba(0,0,0,.72);align-items:center;justify-content:center;'
+        'padding:24px">'
+        '<div style="position:relative;max-width:640px;max-height:88vh;overflow:auto;'
+        'background:#0d1017;border:1px solid #2a2f3a;border-radius:6px;padding:14px 16px">'
+        '<div style="display:flex;justify-content:space-between;align-items:center">'
+        '<b style="color:#dbe6f5;font-size:15px">%s</b>'
+        '<button id="%sClose" style="cursor:pointer;background:#1f2733;color:#d7dde5;'
+        'border:1px solid #3a4553;border-radius:3px;padding:2px 10px">Close &times;</button>'
+        '</div>%s</div></div>'
+        "<scr" + "ipt>(function(){var b=document.getElementById('%s'),"
+        "m=document.getElementById('%s'),c=document.getElementById('%sClose');"
+        "if(!b||!m)return;function op(){m.style.display='flex';}"
+        "function cl(){m.style.display='none';}b.onclick=op;if(c)c.onclick=cl;"
+        "m.addEventListener('click',function(e){if(e.target===m)cl();});"
+        "window.addEventListener('keydown',function(e){"
+        "if(e.key==='Escape'&&m.style.display!=='none'){e.stopPropagation();cl();}"
+        "else if((e.key==='?'||(e.key==='/'&&e.shiftKey))&&m.style.display==='none'){"
+        "var t=e.target;if(t&&(t.tagName==='INPUT'||t.tagName==='SELECT'||"
+        "t.tagName==='TEXTAREA'))return;e.preventDefault();op();}},true);})();"
+        "</scr" + "ipt>"
+    ) % (b, m, esc(title), uid, body, b, m, uid)
 
 
 def load_loadwidth(path):
@@ -1652,6 +1715,7 @@ def build_payload(args):
         "has_att": bool(att_by_fam),
         "att_code_by_fam": att_code_by_fam,
         "att_occ_pool": att_occ_pool,
+        "dbg_shortcuts": _DEBUG_SHORTCUTS_HTML,
         "has_att_code": bool(att_code_by_fam),
         # RDNA3.5 ISA one-line opcode glossary (mnemonic -> description), embedded
         # only when the debug view exists, so the view can show a hover tooltip
@@ -1660,9 +1724,12 @@ def build_payload(args):
         # Special-register / wait-counter glossary (operand token -> description),
         # so hovering vmcnt/lgkmcnt/SCC/EXEC/VCC/M0 etc. in an ISA line explains it.
         "reg_gloss": REG_GLOSSARY if att_code_by_fam else {},
+        # Concept glossary (superblock, etc.) -- embedded unconditionally since the
+        # tiling schematic (which uses it) only needs a GGUF-mapped shape, not ATT.
+        "concept_gloss": CONCEPT_GLOSSARY,
         "att_cmd": att_cmd,
         # Live-tracing mode: false for the static export; serve.py flips this true
-        # so the client shows a "Trace now" button instead of the copy command.
+        # so the client shows a "Run Trace" button alongside the copy command.
         "att_server": False,
         "has_map": bool(expected_seq),
         "map_stats": map_stats,
@@ -1724,8 +1791,68 @@ def write_overlay(args):
 
 
 def render_html(payload):
-    data = json.dumps(payload, separators=(",", ":"))
-    return _HTML_TEMPLATE.replace("__DATA__", data)
+    # Escape "<" so any embedded markup in the payload (e.g. the child debug window's
+    # help HTML, which contains a </script> close tag) cannot terminate the parent
+    # <script> block early. JSON "<" decodes back to "<" in JS, so data is intact.
+    data = json.dumps(payload, separators=(",", ":")).replace("<", "\\u003c")
+    return (_HTML_TEMPLATE.replace("__DATA__", data)
+            .replace("__SHORTCUTS__", _MAIN_SHORTCUTS_HTML))
+
+
+# Mouse/keyboard help for the MAIN timeline overlay (see shortcuts_help_html).
+_MAIN_SHORTCUTS_HTML = shortcuts_help_html("mainKeys", "Shortcuts -- timeline view", [
+    ("Select", [
+        ("click", "select one kernel (show detail panel)"),
+        ("ctrl/cmd + click", "add / remove one kernel from the selection"),
+        ("drag", "select kernels in a time range (lasso)"),
+        ("ctrl/cmd + drag", "add the dragged range to the selection"),
+        ("Esc", "clear the selection"),
+    ]),
+    ("Zoom / pan", [
+        ("ctrl + wheel", "zoom horizontally (time) at the cursor"),
+        ("+ / -", "zoom in / out"),
+        ("shift + drag", "pan the time window"),
+        ("shift + wheel", "pan horizontally (time)"),
+        ("left / right", "pan by a quarter window"),
+        ("shift + left / right", "pan by a full window"),
+    ]),
+    ("Measure (A/B markers)", [
+        ("drag A or B", "move a marker; snaps to kernel edges"),
+        ("alt + drag", "move a marker freely (no snap)"),
+        ("double-click", "bring both markers into view"),
+    ]),
+    ("Trace (live-server mode)", [
+        ("Run trace", "run ATT for the selected kernel on a free board, discarding "
+                      "any on-disk trace first (fresh; picks up DWARF source lines)"),
+    ]),
+    ("General", [
+        ("?", "open this help"),
+    ]),
+])
+
+# Mouse/keyboard help for the CHILD debug window (ISA table + Occupancy View). This
+# HTML is carried in the payload and injected into the child document's header.
+_DEBUG_SHORTCUTS_HTML = shortcuts_help_html("dbgKeys", "Shortcuts -- trace view", [
+    ("ISA table / step mode", [
+        ("hover instruction", "show its ISA / register description"),
+        ("click a row", "jump to its source line (when line info present)"),
+        ("left / right", "step one instruction (executed order)"),
+        ("n / p  or  j / k", "step next / previous instruction"),
+        ("H / L", "jump to previous / next source line"),
+    ]),
+    ("Occupancy view", [
+        ("wheel", "scroll rows up / down"),
+        ("ctrl + wheel", "zoom horizontally (time) at the cursor"),
+        ("alt + wheel", "zoom vertically (rows)"),
+        ("shift + wheel", "pan horizontally (time)"),
+        ("drag", "pan the time window"),
+        ("hover a wave", "show WG / SIMD / wave + cycle"),
+        ("Esc", "close the Occupancy view"),
+    ]),
+    ("General", [
+        ("?", "open this help"),
+    ]),
+])
 
 
 _HTML_TEMPLATE = r"""<!DOCTYPE html>
@@ -1796,19 +1923,20 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
 <div class="wrap">
   <div class="left">
     <div class="bar">
-      <button id="prev">&larr; prev</button>
-      <button id="next">next &rarr;</button>
-      <button id="zin">zoom +</button>
-      <button id="zout">zoom &minus;</button>
-      <button id="reset">reset</button>
-      <button id="markhome">markers &rarr; view</button>
+      <button id="prev">&larr; Prev</button>
+      <button id="next">Next &rarr;</button>
+      <button id="zin">Zoom +</button>
+      <button id="zout">Zoom &minus;</button>
+      <button id="reset">Reset</button>
+      <button id="markhome">Markers &rarr; view</button>
       <select id="findWhat" title="what to find">
         <option value="maxgap">largest intra-token gap</option>
         <option value="mineffbw">lowest eff-BW matvec (mmvq/mmq)</option>
       </select>
-      <button id="findGo" title="find (click again for next-largest)">find next</button>
-      <button id="findPrev" title="previous (larger) match">find prev</button>
+      <button id="findGo" title="find (click again for next-largest)">Find next</button>
+      <button id="findPrev" title="previous (larger) match">Find prev</button>
       <button id="hwbtn" title="RDNA 3.5 WGP hardware reference" style="display:none">RDNA 3.5 HW</button>
+      __SHORTCUTS__
       <span id="findmsg" class="sub"></span>
       <span id="viewinfo" class="sub"></span>
       <span class="legend" id="legend"></span>
@@ -1838,7 +1966,7 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
     border:1px solid #2a2f3a;border-radius:6px;padding:12px 12px 8px;overflow:auto">
     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
       <b style="color:#c8d0da">RDNA 3.5 WGP hardware reference</b>
-      <button id="hwclose">close &times;</button>
+      <button id="hwclose">Close &times;</button>
     </div>
     <img id="hwimg" alt="RDNA 3.5 WGP: VGPR file, LDS banks, wave slots, gfx1151/gfx1150 constants"
       style="display:block;max-width:100%;height:auto;background:#fff;border-radius:3px">
@@ -2127,8 +2255,7 @@ function draw(){
   const tlabel = tv.length? (tv.length===1?`tok ${tv[0]}`:`tok ${tv[0]}-${tv[tv.length-1]}`):'-';
   document.getElementById('viewinfo').textContent =
     `${tlabel} | ${fmtms(span)} | GPU busy ${gp.toFixed(0)}% `+
-    `idle ${ip.toFixed(0)}% | A-B dt ${fmtdur(Math.abs(markB-markA))} | `+
-    `drag=select kernels  ctrl/cmd+click=add/remove 1  ctrl/cmd+drag=add range  scroll/+-=zoom  shift+drag/arrows=pan  drag A/B=measure (snaps to edges; alt=free)  click=1 kernel  esc=clear`;
+    `idle ${ip.toFixed(0)}% | A-B dt ${fmtdur(Math.abs(markB-markA))}`;
 }
 
 // summary table
@@ -2538,12 +2665,24 @@ function renderSelectedKernel(){
   const dbgBtn = hasCode
     ? `<button id="attdbg" style="cursor:pointer;background:#2a3a52;color:#dbe6f5;`+
       `border:1px solid #3a5578;border-radius:3px;padding:3px 12px;font-size:12px;`+
-      `flex:0 0 auto;white-space:nowrap">Open Trace View</button>`
+      `flex:0 0 auto;white-space:nowrap">Open trace view</button>`
+    : ``;
+  // "Run Trace" (live-server only): ALWAYS re-runs ATT on a board, wiping any on-disk
+  // att-<sym>/ first. Sits next to "Open Trace View"; the fix for on-disk traces that
+  // lack DWARF source lines (rebuild device code with -g, then click Run Trace).
+  const retraceBtn = D.att_server
+    ? `<button id="attretrace" title="run ATT on a free board, discarding the on-disk `+
+      `trace first (use when the existing trace lacks DWARF source lines)" `+
+      `style="cursor:pointer;background:#5c3a1f;color:#f5ead6;border:1px solid #7d5a2f;`+
+      `border-radius:3px;padding:3px 12px;font-size:12px;flex:0 0 auto;`+
+      `white-space:nowrap">Run trace</button>`+
+      `<span id="attstatustop" class="r" style="flex:1 1 100%;color:#c8d0da;`+
+      `display:none;font-size:12px"></span>`
     : ``;
   let h=`<h2>Selected kernel</h2>`+
     `<div style="display:flex;align-items:flex-start;gap:8px;margin-bottom:6px;flex-wrap:wrap">`+
     `<div style="color:#7fd1ff;word-break:break-all;flex:0 1 auto">${s.fam}</div>`+
-    dbgBtn+`</div>`+
+    retraceBtn+dbgBtn+`</div>`+
     (dg?`<div style="margin:0 0 8px;padding:6px 9px;border-left:3px solid ${dg.c};`+
         `background:rgba(255,255,255,.05);border-radius:3px;line-height:1.35">`+
         `<b style="color:${dg.c}">${dg.t}</b> `+
@@ -2602,8 +2741,15 @@ function renderSelectedKernel(){
     if(fc.wg){
       const W = fc.wave ? Math.round(fc.wg/fc.wave) : 0;   // waves per block
       const L = fc.lds_static||0;
+      const tileBtn = (s.map && s.map.K && (s.map.launchN||s.map.trueN))
+        ? `<button id="tileview" style="cursor:pointer;background:#2a3a52;color:#dbe6f5;`+
+          `border:1px solid #3a5578;border-radius:3px;padding:2px 10px;font-size:11px;`+
+          `text-transform:none;letter-spacing:normal">View tiling schematic</button>`
+        : ``;
       h+=`<tr><td colspan="2" style="color:var(--dim);padding-top:8px;`+
-         `text-transform:uppercase;font-size:10px;letter-spacing:.5px">tiling / scheduling</td></tr>`;
+         `text-transform:uppercase;font-size:10px;letter-spacing:.5px">`+
+         `<span style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">`+
+         `<span>tiling / scheduling</span>${tileBtn}</span></td></tr>`;
       const nblk = s.blocks || 0;
       if(nblk)
         h+=`<tr><td>grid</td><td>${nblk} blocks <span class="r">(this dispatch)</span></td></tr>`;
@@ -2718,24 +2864,19 @@ function renderSelectedKernel(){
     `python3 ${ac.viewer} \\\n`+
     `  ${ac.regen_flags} \\\n`+
     `  --att-dir ${outdir} --out ${ac.out_html}`;
-  const liveBtn = D.att_server
-    ? `<button id="atttrace" style="cursor:pointer;background:#1f5c34;color:#e6f5ea;`+
-      `border:1px solid #2f7d48;border-radius:3px;padding:1px 8px;font-size:11px;`+
-      `margin-left:6px">Trace now</button>`+
-      `<span id="attstatus" class="r" style="margin-left:8px;color:#c8d0da;display:none"></span>`
-    : ``;
+  // Live tracing is driven by the "Run Trace" button up next to the kernel name; the
+  // box below is the copy-paste command for running ATT on the board by hand.
   h+=`<div style="margin-top:12px;padding:8px 10px;border:1px dashed var(--dim);border-radius:3px">`+
      `<b>Trace this kernel with ATT</b> `+
      `<button id="attcopy" style="cursor:pointer;background:#2a3340;color:#d7dde5;`+
-     `border:1px solid #3a4553;border-radius:3px;padding:1px 8px;font-size:11px">copy</button>`+
-     liveBtn+
+     `border:1px solid #3a4553;border-radius:3px;padding:1px 8px;font-size:11px">Copy</button>`+
      `<span id="attcopied" class="r" style="margin-left:8px;color:#8fe388;display:none">copied</span>`+
      `<pre style="margin:6px 0 0;padding:7px 9px;background:#0d1117;border-radius:3px;`+
      `overflow:auto;white-space:pre;font-size:11px;color:#c8d0da">${esc(cmd)}</pre>`+
      (at?``:`<div class="sub">No ATT data loaded for this kernel yet -- `+
        (D.att_server
-         ? `click <b>Trace now</b> to dispatch ATT to a free GPU board over ssh and fold `+
-           `the result in live, or `
+         ? `click <b>Run trace</b> above to dispatch ATT to a free GPU board over ssh and `+
+           `fold the result in live, or `
          : ``)+
        `run the command above on the board, then re-run the viewer with `+
        `<code>--att-dir</code> to see per-instruction stalls here. (ATT filters by kernel `+
@@ -2743,12 +2884,166 @@ function renderSelectedKernel(){
        `<code>${esc(sym)}</code>.)</div>`)+
      `</div>`;
   dp.innerHTML=h; dp.style.display='block';
+  const tv=document.getElementById('tileview');
+  if(tv && s.map) tv.onclick=()=>openTilingView({K:s.map.K, N:s.map.launchN||s.map.trueN,
+    q:s.map.q, nm:s.map.nm, role:s.map.role,
+    // actual launched grid for THIS dispatch: blocks = workgroup count (Grid/Workgroup
+    // from the kernel trace), wg = threads/block, wave = warp size (both from PMC).
+    blocks:s.blocks||0, wg:fc.wg||0, wave:fc.wave||0,
+    sbHelp:(D.concept_gloss||{}).superblock||''});
   const cp=document.getElementById('attcopy');
   if(cp) cp.onclick=()=>copyCmd(cmd);
-  const tb2=document.getElementById('atttrace');
-  if(tb2) tb2.onclick=()=>traceKernelLive(sym, s.fam);
+  const rt=document.getElementById('attretrace');
+  if(rt) rt.onclick=()=>traceKernelLive(sym, s.fam, true);
   const db=document.getElementById('attdbg');
   if(db) db.onclick=()=>openDebugView(s.fam);
+}
+
+// Open a new browser tab with a static tiling schematic for the selected dispatch,
+// derived PURELY from (K, N, quant, WvPrGrp) -- no trace data. Every one of the N
+// output rows is a wave; each wave streams K/256 Q4_K weight super-blocks and shares
+// the K/32-block Q8_1 activation (staged in LDS once per workgroup); 16 waves = one
+// workgroup. Left strip = shared activation, center = weight rows (colored by
+// workgroup), right column = the N fp32 outputs. Self-contained (inline CSS/JS).
+function openTilingView(shape){
+  if(!shape||!shape.K||!shape.N){ alert('No mapped shape for this kernel (run with --gguf).'); return; }
+  const w=window.open('','_blank');
+  if(!w){ alert('Popup blocked -- allow popups to open the tiling view.'); return; }
+  const doc=`<!doctype html><html><head><meta charset="utf-8">`+
+    `<title>tiling -- `+esc(shape.nm||(shape.K+'x'+shape.N))+`</title><style>`+
+    `*{box-sizing:border-box}body{margin:0;background:#0d1117;color:#d7dde5;`+
+    `display:flex;flex-direction:column;height:100vh;font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif}`+
+    `#bar{flex:0 0 auto;display:flex;align-items:center;gap:14px;padding:10px 16px;`+
+    `background:#161b22;border-bottom:1px solid #2a3340;flex-wrap:wrap}`+
+    `#bar h2{margin:0;font-size:16px;color:#dbe6f5}`+
+    `#bar .zb{background:#1f2733;color:#d7dde5;border:1px solid #3a4553;border-radius:3px;`+
+    `padding:3px 9px;font-size:12px;cursor:pointer}#bar .zb:hover{background:#2a3340}`+
+    `.lg{display:inline-flex;align-items:center;gap:5px;font-size:12px;color:#9fb0c4;margin-right:10px}`+
+    `.sw{display:inline-block;width:13px;height:13px;border-radius:2px}`+
+    `#formula{flex:1 1 100%;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:15px;`+
+    `color:#ffd7b0}`+
+    `#notes{flex:1 1 100%;margin-top:2px;font-family:ui-monospace,Menlo,Consolas,monospace;`+
+    `font-size:12px;color:#c8d0da;display:grid;grid-template-columns:max-content 1fr;`+
+    `column-gap:10px;row-gap:1px;max-width:640px}`+
+    `#notes .k{color:#9fb0c4}`+
+    `#sbnote{flex:1 1 100%;margin-top:6px;font-size:12px;line-height:1.45;color:#9fb0c4;`+
+    `max-width:900px}#sbnote b{color:#c8d0da}`+
+    `#wrap{flex:1 1 auto;overflow:auto;min-height:0}#cv{display:block}`+
+    `</style></head><body>`+
+    `<div id="bar"><h2>Tiling schematic</h2>`+
+    `<button class="zb" id="zout">Zoom &minus;</button>`+
+    `<button class="zb" id="zin">Zoom +</button>`+
+    `<button class="zb" id="fit">Fit</button>`+
+    `<span class="lg"><span class="sw" style="background:#e8912a"></span>W: weight rows (colored by workgroup)</span>`+
+    `<span class="lg"><span class="sw" style="background:#2d3f2f;border:1px solid #3fb950"></span>X: activation (Q8_1, shared/LDS)</span>`+
+    `<span class="lg"><span class="sw" style="background:#c9d4e2"></span>Y: output (fp32, 1/wave)</span>`+
+    `<div id="formula"></div>`+
+    `<div id="notes"></div><div id="sbnote"></div></div>`+
+    `<div id="wrap"><canvas id="cv"></canvas></div>`+
+    `<scr`+`ipt>`+
+    `var SH=`+JSON.stringify(shape).replace(/</g,'\\u003c')+`;`+
+    `var QK=256,QK81=32;`+
+    // super-block bytes per 256-weight K-quant (ggml-common.h): Q4_K=144, Q5_K=176,
+    // Q6_K=210, Q8_0=34 (32-wide blocks -> 8/superblock x 34/8... use per-256 bytes),
+    // Q2_K=84, Q3_K=110. Default 144 if the quant tag is unrecognized.
+    `var SBB={'Q4_K':144,'Q5_K':176,'Q6_K':210,'Q2_K':84,'Q3_K':110,'Q8_0':272,'Q4_0':144,'Q4_1':160,'Q5_0':176,'Q5_1':192};`+
+    `var SB=SBB[SH.q]||144;`+
+    `var Kb=Math.ceil(SH.K/QK),Ab=Math.ceil(SH.K/QK81),N=SH.N;`+
+    // ACTUAL launched grid from the trace/PMC (not hardcoded): NWG = workgroup count,
+    // RPW = output rows per workgroup, WPW = waves per workgroup (Workgroup_Size/warp).
+    // Fall back to 1 row/WG (== N workgroups) when the grid wasn't captured.
+    `var NWG=SH.blocks>0?SH.blocks:N;`+
+    `var RPW=Math.max(1,Math.round(N/NWG));`+
+    `var WPW=(SH.wg>0&&SH.wave>0)?Math.round(SH.wg/SH.wave):RPW;`+
+    `var WGP=['#e8912a','#4d90fe','#c678dd','#3fb950','#e5c07b','#56b6c2','#e06c75','#61afef'];`+
+    `var cv=document.getElementById('cv'),wrap=document.getElementById('wrap'),`+
+    `notesEl=document.getElementById('notes'),fEl=document.getElementById('formula'),TZ=1;`+
+    // Write W as [rows x cols] = [N x K] (= PyTorch [out,in]), matching the drawing:
+    // N rows down, K values across. Plain matvec, no transpose: [N x K].[K x 1]=[N x 1].
+    // (GGUF labels the SAME bytes ne=[K,N], contiguous dim first -- noted parenthetically.)
+    `fEl.textContent='Y['+N+'x1] = W['+N+'x'+SH.K+'] * X['+SH.K+'x1]'`+
+    `+'   (K='+SH.K+' reduction, N='+N+' output; W gguf ne=['+SH.K+'x'+N+'], '+(SH.q||'')+')';`+
+    // notes panel: one parameter per row (key | value), from the actual launched grid.
+    `var wRow=Kb*SB,wTot=N*wRow,aBytes=Ab*36;`+
+    `function nrow(k,v){return '<span class="k">'+k+'</span><span>'+v+'</span>';}`+
+    `notesEl.innerHTML=`+
+    `nrow('waves/workgroup (nwarps):', WPW)+`+
+    `nrow('rows/workgroup:', RPW+'   (1 wave = 1 output row)')+`+
+    `nrow('workgroups (blocks):', NWG)+`+
+    `nrow('threads/block:', (SH.wg>0?SH.wg:'(n/a)'))+`+
+    `nrow('total waves = output rows:', N)+`+
+    `nrow('each row:', Kb+' superblocks x'+SB+'B='+wRow+'B weight')+`+
+    `nrow('activation:', aBytes+'B shared in LDS')+`+
+    `nrow('total weight:', (wTot/1048576).toFixed(2)+' MB');`+
+    // superblock definition (from the concept glossary), shown as a footnote
+    `var sbn=document.getElementById('sbnote');`+
+    `if(sbn&&SH.sbHelp)sbn.innerHTML='<b>superblock (SB):</b> '+`+
+    `SH.sbHelp.replace(/&/g,'&amp;').replace(/</g,'&lt;');`+
+    `var FN='ui-monospace,Menlo,Consolas,monospace';`+
+    // Elided conceptual schematic: show only the FIRST + LAST output row (N-2 rows
+    // collapsed to an ellipsis band) and, within each row, only the FIRST + LAST
+    // super-block (K/256-2 collapsed to a "..." column). Fixed size, not 8192 lanes.
+    `function draw(){var dpr=window.devicePixelRatio||1;`+
+    `var GUT=110,GAP=28,ACT=48,OUT=96,AX=52;`+
+    `var cw=Math.round(200*TZ),ew=96,CH=Math.round(104*TZ),EH=Math.round(72*TZ);`+
+    `var Wx=GUT,Wend=Wx+cw+ew+cw,Xx=Wend+GAP,Yx=Xx+ACT+GAP;`+
+    `var y0=AX,yE=AX+CH,y1=AX+CH+EH,bot=y1+CH;`+
+    `var W=Math.max(wrap.clientWidth||900,Yx+OUT+16),H=bot+14;`+
+    `cv.style.width=W+'px';cv.style.height=H+'px';`+
+    `cv.width=Math.floor(W*dpr);cv.height=Math.floor(H*dpr);`+
+    `var g=cv.getContext('2d');g.setTransform(dpr,0,0,dpr,0,0);`+
+    `g.clearRect(0,0,W,H);g.textBaseline='middle';`+
+    // header band
+    `g.fillStyle='#161b22';g.fillRect(0,0,W,AX);g.fillStyle='#c8d0da';g.textAlign='center';`+
+    `g.font='18px '+FN;`+
+    `g.fillText('row (wave)',GUT/2,AX/2);`+
+    `g.fillText('W: '+N+' rows x '+Kb+' superblocks',Wx+(cw+ew+cw)/2,AX/2);`+
+    `g.fillText('X[K]',Xx+ACT/2,AX/2);`+
+    `g.fillText('Y[N]',Yx+OUT/2,AX/2);`+
+    // one labeled cell (fill + bold title + optional subtitle)
+    `function cell(x,y,w,h,fill,txt,sub){g.fillStyle=fill;g.fillRect(x,y,w,h);`+
+    `g.strokeStyle='#0d1117';g.lineWidth=1;g.strokeRect(x+0.5,y+0.5,w-1,h-1);`+
+    `g.fillStyle='#0d1117';g.textAlign='center';g.font='bold 19px '+FN;`+
+    `g.fillText(txt,x+w/2,y+h/2+(sub?-11:0));`+
+    `if(sub){g.font='15px '+FN;g.fillText(sub,x+w/2,y+h/2+13);}}`+
+    // draw one shown output row: SB0 | ... | SB(last) weight cells + Y output cell
+    `function rowband(yy,ri,wg){var col=WGP[wg%WGP.length];`+
+    `g.fillStyle='#9fb0c4';g.textAlign='right';g.font='18px '+FN;`+
+    `g.fillText('row '+ri,GUT-8,yy+CH/2-11);`+
+    `g.fillStyle='#7fd0ff';g.font='15px '+FN;g.fillText('WG'+wg,GUT-8,yy+CH/2+13);`+
+    `cell(Wx,yy,cw,CH,col,'SB0',SB+'B');`+
+    `cell(Wx+cw+ew,yy,cw,CH,col,'SB'+(Kb-1),SB+'B');`+
+    `g.fillStyle='#6f7d8f';g.textAlign='center';g.font='26px '+FN;`+
+    `g.fillText('...',Wx+cw+ew/2,yy+CH/2);`+
+    `cell(Yx,yy,OUT,CH,'#c9d4e2','y['+ri+']','fp32');}`+
+    `rowband(y0,0,0);`+
+    `rowband(y1,N-1,Math.floor((N-1)/RPW));`+
+    // ellipsis band between first & last row (vertical dots + count)
+    `g.fillStyle='#6f7d8f';g.textAlign='center';g.font='26px '+FN;`+
+    `g.fillText(String.fromCharCode(8942),Wx+cw/2,yE+EH/2);`+                 // vertical ellipsis
+    `g.fillText(String.fromCharCode(8942),Wx+cw+ew+cw/2,yE+EH/2);`+
+    `g.fillText(String.fromCharCode(8942),Yx+OUT/2,yE+EH/2);`+
+    `g.fillStyle='#9fb0c4';g.font='16px '+FN;`+
+    `g.fillText('('+(N-2)+' rows elided)',Wx+(cw+ew+cw)/2,yE+EH/2);`+
+    // X activation strip: shared vector, spans all rows; first/last element labeled
+    `g.fillStyle='#2d3f2f';g.fillRect(Xx,y0,ACT,bot-y0);`+
+    `g.strokeStyle='#3fb950';g.lineWidth=1;g.strokeRect(Xx+0.5,y0+0.5,ACT-1,bot-y0-1);`+
+    `g.save();g.translate(Xx+ACT/2,(y0+bot)/2);g.rotate(-Math.PI/2);`+
+    `g.fillStyle='#9fe6b0';g.textAlign='center';g.font='15px '+FN;`+
+    `g.fillText('x[0..'+(SH.K-1)+'] shared (LDS)',0,0);g.restore();`+
+    // count of elided super-blocks, under the '...' column of the first row
+    `if(Kb>2){g.fillStyle='#6f7d8f';g.textAlign='center';g.font='14px '+FN;`+
+    `g.fillText('+'+(Kb-2),Wx+cw+ew/2,y0+CH/2+13);}`+
+    `}`+
+    `function zoom(f){TZ=Math.max(0.25,Math.min(20,TZ*f));draw();}`+
+    `document.getElementById('zin').onclick=function(){zoom(1.4);};`+
+    `document.getElementById('zout').onclick=function(){zoom(1/1.4);};`+
+    `document.getElementById('fit').onclick=function(){TZ=1;draw();};`+
+    `cv.addEventListener('wheel',function(e){if(e.ctrlKey||e.altKey){zoom(e.deltaY<0?1.15:1/1.15);e.preventDefault();return;}`+
+    `wrap.scrollTop+=e.deltaY;e.preventDefault();},{passive:false});`+
+    `window.addEventListener('resize',draw);draw();`+
+    `<\/scr`+`ipt></body></html>`;
+  w.document.open(); w.document.write(doc); w.document.close();
 }
 
 // Open a new browser tab with a self-contained debug view for one kernel family,
@@ -2771,7 +3066,8 @@ function openDebugView(fam){
                  src_files:srcFiles, split:split, exec:c.exec||null,
                  waves:c.waves||null,
                  occ:((c.occ_ref!=null&&c.occ_ref>=0)?(D.att_occ_pool||[])[c.occ_ref]:(c.occ||null)),
-                 gloss:(D.isa_gloss||{}), regGloss:(D.reg_gloss||{})};
+                 gloss:(D.isa_gloss||{}), regGloss:(D.reg_gloss||{}),
+                 dbgHelp:(D.dbg_shortcuts||'')};
   const fileOpts=Object.keys(srcFiles).map(f=>`<option value="`+esc(f)+`">`+esc(f)+`</option>`).join('');
   const doc=`<!doctype html><html><head><meta charset="utf-8">`+
     `<title>ISA debug -- `+esc(fam)+`</title><style>`+
@@ -2847,21 +3143,23 @@ function openDebugView(fam){
     `#wvclose:hover{background:#2a3340}`+
     `#wvwrap{flex:1 1 auto;overflow:auto;min-height:0}#wvcanvas{display:block}`+
     `</style></head><body>`+
-    `<header><h1>ISA debug view`+(split?` -- source-linked`:``)+`</h1>`+
+    `<header><h1 style="display:flex;align-items:center;gap:10px">`+
+    `<span>ISA debug view`+(split?` -- source-linked`:``)+`</span>`+
+    (payload.dbgHelp||'')+`</h1>`+
     `<div class="sym">`+esc(payload.sym||fam)+`</div>`+
     `<div class="tot">`+payload.rows.length+` instructions &middot; `+
     payload.n_disp+` dispatch(es), ~1 SIMD &middot; `+
     fmtc(payload.stall)+` stall / `+fmtc(payload.lat)+` latency / `+
     fmtc(payload.idle)+` idle cyc`+
-    (payload.occ?`<button id="wvbtn">Occupancy View</button>`:``)+`</div>`+
+    (payload.occ?`<button id="wvbtn">Occupancy view</button>`:``)+`</div>`+
     (payload.has_src?``:`<div class="note">Source lines unavailable: the traced `+
       `code object has no DWARF line tables (build ggml-hip with `+
       `-gline-tables-only/-g and re-trace to link ISA to source). Showing ISA only.`+
       `</div>`)+
     (payload.exec?`<div id="stepbar"><button id="sprev">&#9664; Prev</button>`+
       `<button id="snext">Next &#9654;</button>`+
-      `<button id="slprev">&#9664; src line</button>`+
-      `<button id="slnext">src line &#9654;</button>`+
+      `<button id="slprev">&#9664; Src line</button>`+
+      `<button id="slnext">Src line &#9654;</button>`+
       `<span id="stepinfo"></span>`+
       `<span class="hint">one sampled wave, executed order &middot; keys: `+
       `&larr;/&rarr; step, H/L source-line</span></div>`:``)+
@@ -2880,12 +3178,12 @@ function openDebugView(fam){
       fileOpts+`</select><span class="hint">click a line to jump to its instructions</span>`+
       `</div><div class="scroll"><div id="src"></div></div></section>`:``)+
     `</div>`+
-    (payload.occ?`<div id="wavepane"><div id="wvbar"><h2>Occupancy View</h2>`+
-      `<button class="wvzb" id="wvzout">time &minus;</button>`+
-      `<button class="wvzb" id="wvzin">time +</button>`+
-      `<button class="wvzb" id="wvrout">rows &minus;</button>`+
-      `<button class="wvzb" id="wvrin">rows +</button>`+
-      `<button class="wvzb" id="wvfit">fit</button>`+
+    (payload.occ?`<div id="wavepane"><div id="wvbar"><h2>Occupancy view</h2>`+
+      `<button class="wvzb" id="wvzout">Time &minus;</button>`+
+      `<button class="wvzb" id="wvzin">Time +</button>`+
+      `<button class="wvzb" id="wvrout">Rows &minus;</button>`+
+      `<button class="wvzb" id="wvrin">Rows +</button>`+
+      `<button class="wvzb" id="wvfit">Fit</button>`+
       `<span id="wvhint"></span>`+
       `<span id="wvlegend"></span>`+
       `<button id="wvclose">Close (Esc)</button></div>`+
@@ -3132,8 +3430,8 @@ function openDebugView(fam){
     `'"></span>wave 2/4/6..</span>';el.innerHTML=h;}`+
     `function syncChrome(){`+
     `whint.textContent='up to '+NBURST+' wave'+(NBURST!==1?'s':'')+'/slot; '+`+
-    `WROWS.length+' lanes (WG x SIMD x wave-slot); scroll=time zoom, alt+scroll=row zoom, `+
-    `shift+scroll=pan rows, drag=pan';renderLegend();}`+
+    `WROWS.length+' lanes (WG x SIMD x wave-slot); wheel=scroll, ctrl=time zoom, `+
+    `alt=row zoom, shift=time pan, drag=pan (? for help)';renderLegend();}`+
     `function openWaves(){wpane.classList.add('show');WOPEN=true;WV0=DC0;WV1=DC1;`+
     `syncChrome();drawWaves();}`+
     `function closeWaves(){wpane.classList.remove('show');WOPEN=false;hideTip();}`+
@@ -3148,12 +3446,16 @@ function openDebugView(fam){
     `if(wri)wri.onclick=function(){rowZoom(1.4);};`+
     `if(wro)wro.onclick=function(){rowZoom(1/1.4);};`+
     `if(wfit)wfit.onclick=function(){WV0=DC0;WV1=DC1;ROWZ=1;drawWaves();};`+
+    // Standard wheel model: plain=scroll rows, ctrl=zoom horizontal (time),
+    // alt=zoom vertical (rows), shift=pan horizontal (time).
     `if(wcan){wcan.addEventListener('wheel',function(e){`+
-    `if(e.shiftKey){wwrap.scrollTop+=e.deltaY;e.preventDefault();return;}`+
-    `if(e.altKey){rowZoom(e.deltaY<0?1.15:1/1.15);e.preventDefault();return;}`+
-    `var rect=wcan.getBoundingClientRect(),mx=e.clientX-rect.left;`+
+    `if(e.ctrlKey){var rect=wcan.getBoundingClientRect(),mx=e.clientX-rect.left;`+
     `var frac=(mx-GUT)/PLOTW;if(frac<0)frac=0;if(frac>1)frac=1;`+
-    `zoomWV(frac,e.deltaY<0?0.85:1/0.85);e.preventDefault();},{passive:false});`+
+    `zoomWV(frac,e.deltaY<0?0.85:1/0.85);e.preventDefault();return;}`+
+    `if(e.altKey){rowZoom(e.deltaY<0?1.15:1/1.15);e.preventDefault();return;}`+
+    `if(e.shiftKey){var s=WV1-WV0;var d=(e.deltaY<0?-0.15:0.15)*s;`+
+    `WV0+=d;WV1+=d;clampWV();drawWaves();e.preventDefault();return;}`+
+    `wwrap.scrollTop+=e.deltaY;e.preventDefault();},{passive:false});`+
     `wcan.addEventListener('mousedown',function(e){var rect=wcan.getBoundingClientRect();`+
     `if(e.clientX-rect.left<GUT)return;wpan=true;wpx=e.clientX;wpv0=WV0;wpv1=WV1;`+
     `wcan.style.cursor='grabbing';hideTip();e.preventDefault();});`+
@@ -3181,27 +3483,33 @@ function openDebugView(fam){
   w.document.open(); w.document.write(doc); w.document.close();
 }
 
-// POST to the companion server to run ATT on a free GPU board and fold the result in
-async function traceKernelLive(sym, fam){
+// POST to the companion server to run ATT on a free GPU board and fold the result in.
+// force=true tells the server to discard the on-disk att-<sym>/ trace first, so this
+// genuinely recollects (the fix for on-disk traces that lack DWARF source lines).
+async function traceKernelLive(sym, fam, force){
   const btn=document.getElementById('atttrace');
-  const st=document.getElementById('attstatus');
-  if(!btn||!st) return;
-  btn.disabled=true; st.style.display='inline';
-  st.style.color='#c8d0da'; st.textContent='dispatching to a free GPU board... (~30-90s)';
+  const rbtn=document.getElementById('attretrace');
+  // update BOTH status spans (top row next to Run Trace, and the bottom trace box)
+  // so feedback is visible next to whichever button was clicked.
+  const sts=[document.getElementById('attstatustop'),
+             document.getElementById('attstatus')].filter(Boolean);
+  function setSt(color,text){for(const s of sts){s.style.display='inline';
+    s.style.color=color;s.textContent=text;}}
+  if(btn) btn.disabled=true; if(rbtn) rbtn.disabled=true;
+  setSt('#c8d0da',(force?'re-tracing (discarding on-disk data)':'dispatching')
+    +' on a free GPU board... (~30-90s)');
   try{
     const r=await fetch('/api/trace',{method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({kernel:sym})});
+      body:JSON.stringify({kernel:sym, force:!!force})});
     const j=await r.json().catch(()=>({}));
     if(r.status===409){
-      st.style.color='#e0b341';
-      st.textContent=j.error||'a trace is already running -- try again shortly';
-      btn.disabled=false; return;
+      setSt('#e0b341',j.error||'a trace is already running -- try again shortly');
+      if(btn) btn.disabled=false; if(rbtn) rbtn.disabled=false; return;
     }
     if(!r.ok||!j.ok){
-      st.style.color='#ff6b6b';
-      st.textContent='trace failed: '+(j.error||('HTTP '+r.status));
-      btn.disabled=false; return;
+      setSt('#ff6b6b','trace failed: '+(j.error||('HTTP '+r.status)));
+      if(btn) btn.disabled=false; if(rbtn) rbtn.disabled=false; return;
     }
     // fold every returned family into the cache (ATT captures all variants of the symbol)
     D.att_by_fam=D.att_by_fam||{};
@@ -3210,11 +3518,11 @@ async function traceKernelLive(sym, fam){
     // fold the full per-instruction ISA so "Open Trace View" lights up too
     D.att_code_by_fam=D.att_code_by_fam||{};
     if(j.fam_code) for(const k in j.fam_code){ D.att_code_by_fam[k]=j.fam_code[k]; }
-    st.style.color='#8fe388';
-    st.textContent='traced on '+(j.host||'board')+' -- '+n+' famil'+(n===1?'y':'ies')+' folded in';
+    setSt('#8fe388','traced on '+(j.host||'board')+' -- '+n+' famil'+(n===1?'y':'ies')+' folded in');
     renderSelectedKernel();
   }catch(e){
-    st.style.color='#ff6b6b'; st.textContent='trace error: '+e; btn.disabled=false;
+    setSt('#ff6b6b','trace error: '+e);
+    if(btn) btn.disabled=false; if(rbtn) rbtn.disabled=false;
   }
 }
 tb.querySelectorAll('tr').forEach(tr=>{
@@ -3367,11 +3675,20 @@ document.getElementById('zin').onclick=()=>zoomAt(0.5,0.6);
 document.getElementById('zout').onclick=()=>zoomAt(0.5,1/0.6);
 document.getElementById('reset').onclick=()=>setView(D.tok_starts[D.view_i0],D.tok_starts[D.view_i1]);
 
+// Standard wheel model: ctrl=zoom horizontal (time), shift=pan horizontal.
+// The timeline lane is fixed-height with no vertical content, so plain/alt wheel
+// fall through to normal page scroll.
 cv.addEventListener('wheel', e=>{
-  e.preventDefault();
-  const r=cv.getBoundingClientRect();
-  const frac=Math.min(1,Math.max(0,(e.clientX-r.left)/cv.clientWidth));
-  zoomAt(frac, e.deltaY<0 ? 0.85 : 1/0.85);
+  if(e.ctrlKey){
+    e.preventDefault();
+    const r=cv.getBoundingClientRect();
+    const frac=Math.min(1,Math.max(0,(e.clientX-r.left)/cv.clientWidth));
+    zoomAt(frac, e.deltaY<0 ? 0.85 : 1/0.85);
+  } else if(e.shiftKey){
+    e.preventDefault();
+    const s=view1-view0, step=(e.deltaY<0?-0.15:0.15)*s;
+    setView(view0+step, view1+step);
+  }
 }, {passive:false});
 
 // arrow keys pan the view (Shift = a full page); +/- zoom

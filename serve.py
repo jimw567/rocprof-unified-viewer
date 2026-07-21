@@ -32,6 +32,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import threading
@@ -137,9 +138,14 @@ def _run_att_on_host(host, sym, out_dir):
     return True, log
 
 
-def _do_trace(sym):
+def _do_trace(sym, force=False):
     """Run (or stub) a trace for one kernel symbol; fold results into the cache.
-    Returns (http_status, response_dict)."""
+    Returns (http_status, response_dict).
+
+    force=True wipes any existing att-<sym>/ output on disk BEFORE re-running, so a
+    re-trace genuinely re-collects instead of accumulating alongside (and reloading)
+    stale decoded data -- the usual reason to force is that the on-disk trace came
+    from a build WITHOUT DWARF line tables and you want a fresh one that has them."""
     if sym not in _ALLOWED_SYMS:
         return 400, {"ok": False, "error": "unknown kernel symbol"}
     if not _TRACE_LOCK.acquire(blocking=False):
@@ -158,6 +164,9 @@ def _do_trace(sym):
                                       % (_ARGS.hosts_env,
                                          ":".join(r["host"] for r in rows) or "empty")}
             src_dir = os.path.join(_out_base(), "att-" + sym)
+            if force:
+                # only ever remove OUR own per-symbol scratch dir under the out-base
+                shutil.rmtree(src_dir, ignore_errors=True)
             os.makedirs(src_dir, exist_ok=True)
             ok, log = _run_att_on_host(host, sym, src_dir)
             if not ok:
@@ -231,8 +240,9 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(400, {"ok": False, "error": "bad JSON body"})
             return
         sym = (req.get("kernel") or "").strip()
+        force = bool(req.get("force"))
         try:
-            status, resp = _do_trace(sym)
+            status, resp = _do_trace(sym, force=force)
         except RuntimeError as e:
             status, resp = 500, {"ok": False, "error": str(e)}
         self._send_json(status, resp)

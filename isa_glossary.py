@@ -1228,3 +1228,21 @@ REG_GLOSSARY = {
 "execz": "Single-bit flag: set when the entire EXEC mask is zero (no lanes active). Usable as a branch condition.",
 "vccz": "Single-bit flag: set when the entire VCC mask is zero.",
 }
+
+
+# GPU / quantization concepts (not ISA opcodes or registers), keyed by a lowercased
+# term. Used for hover/help captions in the schematic and detail panels. Pure ASCII.
+CONCEPT_GLOSSARY = {
+"superblock": (
+    "K-quant super-block: the 256-weight (QK_K=256) container ggml uses to store "
+    "k-quantized weights. Not just packed quants -- it carries a two-level scale "
+    "hierarchy: one fp16 super-block scale (and, for Q4_K/Q5_K, an fp16 min) plus "
+    "cheap per-sub-block scales. The 256 weights split into sub-blocks that each "
+    "get their own quantized scale, so dequant is weight = d*sub_scale*q (- dmin* "
+    "sub_min for Q4/Q5_K); the two tiers give k-quants better accuracy than type-0 "
+    "quants at nearly the same bit rate (hence 'K'). Per-super-block bytes: "
+    "Q4_K=144 (8 sub-blocks x32, 6-bit scale+min, 4.5 bpw), Q5_K=176 (adds a 32B "
+    "high-bit plane, 5.5 bpw), Q6_K=210 (16 sub-blocks x16, 8-bit scale, no min, "
+    "6.56 bpw). A mmvq reduction over K walks K/256 super-blocks per output row."
+),
+}
