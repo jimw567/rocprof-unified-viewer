@@ -28,6 +28,7 @@ MODEL=""
 OUT_DIR=""
 KERNEL_REGEX=""
 RUNNER=""
+RUNNER_ENV=()
 NTOK=1
 TARGET_CU=0
 CONSEC=1
@@ -58,6 +59,10 @@ Usage: collect-att.sh --kernel REGEX --build-dir DIR --model M.gguf --out-dir DI
                       --runner "./test-backend-ops perf -o MUL_MAT -p type_a=q4_K"
                     When set, --model is not required and -n is ignored; put any
                     workload flags inside the quoted string (not after --).
+  --runner-env V=X  Set an environment variable for the --runner process (repeatable).
+                    Used to inject a shape-exact test case, e.g. with a patched
+                    test-backend-ops: --runner-env GGML_ATT_MULMAT=12,2560,8192
+                    (ggml_type,K,N) so ATT captures the model's real matvec dims.
   --rocm DIR        ROCm install to drive rocprofv3 + supply the ATT decoder
                     (default: \$ROCM_DIR${ROCM_DIR:+ = $ROCM_DIR}). REQUIRED
                     (via flag or \$ROCM_DIR); no personal path is baked in.
@@ -87,6 +92,7 @@ while [ $# -gt 0 ]; do
     --model)       MODEL="$2"; shift 2 ;;
     --out-dir)     OUT_DIR="$2"; shift 2 ;;
     --runner)      RUNNER="$2"; shift 2 ;;
+    --runner-env)  RUNNER_ENV+=("$2"); shift 2 ;;
     --rocm)        ROCM_DIR="$2"; shift 2 ;;
     -n)            NTOK="$2"; shift 2 ;;
     --target-cu)   TARGET_CU="$2"; shift 2 ;;
@@ -133,6 +139,7 @@ echo "Out:       $OUT_DIR"
 echo "Kernel:    $KERNEL_REGEX"
 echo "ATT:       target-cu=$TARGET_CU consecutive=$CONSEC buffer=${BUFFER_MB}MB se-mask=$SE_MASK simd-select=${SIMD_SELECT:-default}"
 echo "Workload:  ${WORKLOAD[*]}"
+[ ${#RUNNER_ENV[@]} -gt 0 ] && echo "RunnerEnv: ${RUNNER_ENV[*]}"
 echo ""
 
 # gfx10+: --att-simd-select is a SIMD *ID* (0..3); ATT details ONE SIMD per run.
@@ -144,6 +151,8 @@ SIMD_ARGS=()
 # decoded stats CSVs actually present under the out dir.
 set +e
 ( cd "$BUILD_DIR"
+  # export any --runner-env vars so they reach the workload (rocprofv3's child).
+  for kv in "${RUNNER_ENV[@]}"; do export "${kv?}"; done
   PATH="$ROCM_DIR/bin:$PATH" \
   LD_LIBRARY_PATH="$BUILD_DIR:$ROCM_LIBS:${LD_LIBRARY_PATH:-}" \
   "$ROCPROFV3" --att \

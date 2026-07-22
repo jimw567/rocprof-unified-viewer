@@ -2320,10 +2320,12 @@ function toggleSlice(sl){
 // count across 4 SIMDs/CU), so ALU alone would mislabel them.
 function diagnose(fc){
   if(!fc) return null;
-  const ea=+fc.ea||0, alu=+fc.alu||0, occ=+fc.occ||0, l2=+fc.l2||0,
+  // OccupancyPercent is intentionally NOT used: it is a derived SQ metric and is
+  // unreliable on gfx1151 (SQ mis-attribution -> impossible >100% values).
+  const ea=+fc.ea||0, alu=+fc.alu||0, l2=+fc.l2||0,
         bw=+fc.bw_pct||0, scr=+fc.scratch||0, vg=+fc.vgpr||0;
   const lw=fc.loadw||{}, lane=+lw.dominant_lane_bytes||0;
-  const havePmc = (fc.ea!==undefined) && (ea||alu||occ||(+fc.mem||0));
+  const havePmc = (fc.ea!==undefined) && (ea||alu||(+fc.mem||0));
   if(scr>0) return {c:'#ff6b6b',t:'REGISTER SPILLING',
     a:`spilling ${scr}B to scratch -- cut live VGPRs (split kernel / reduce unroll) `+
       `to stop spill/fill traffic.`};
@@ -2348,13 +2350,11 @@ function diagnose(fc){
   if(alu>=100) return {c:'#ffb454',t:'VALU / COMPUTE-BOUND',
     a:`ALU ${alu}% (VALU busy across 4 SIMDs) with EA only ${ea}% -- compute-bound. `+
       `More registers/ILP beats more waves; look for redundant math or low-throughput ops.`};
-  if(occ<50) return {c:'#ffd54a',t:'LOW OCCUPANCY / LATENCY-BOUND',
-    a:`occupancy ${occ}% with EA ${ea}% / ALU ${alu}% both moderate -- too few resident `+
-      `waves to hide latency`+
-      (vg>96?`; VGPR=${vg} caps it (>96/thread for wave32). Cut VGPRs to raise occupancy.`
-            :`; likely a short or small-grid kernel dominated by ramp/drain tails.`)};
+  if(vg>96) return {c:'#ffd54a',t:'LOW OCCUPANCY / LATENCY-BOUND',
+    a:`EA ${ea}% / ALU ${alu}% both moderate and VGPR=${vg} (>96/thread for wave32) `+
+      `caps resident waves -- too few to hide latency. Cut VGPRs to raise occupancy.`};
   return {c:'#9aa6b2',t:'BALANCED',
-    a:`no single dominant bottleneck: EA ${ea}%, ALU ${alu}%, occupancy ${occ}%.`};
+    a:`no single dominant bottleneck: EA ${ea}%, ALU ${alu}%.`};
 }
 // details panel below the lanes for the single selected kernel
 const dp = document.getElementById('detail');
@@ -2679,10 +2679,16 @@ function renderSelectedKernel(){
       `<span id="attstatustop" class="r" style="flex:1 1 100%;color:#c8d0da;`+
       `display:none;font-size:12px"></span>`
     : ``;
+  // "Open tiling view" -- static (shape-only), first button in the kernel-name row.
+  const tileBtn = (s.map && s.map.K && (s.map.launchN||s.map.trueN))
+    ? `<button id="tileview" style="cursor:pointer;background:#2a3a52;color:#dbe6f5;`+
+      `border:1px solid #3a5578;border-radius:3px;padding:3px 12px;font-size:12px;`+
+      `flex:0 0 auto;white-space:nowrap">Open tiling view</button>`
+    : ``;
   let h=`<h2>Selected kernel</h2>`+
     `<div style="display:flex;align-items:flex-start;gap:8px;margin-bottom:6px;flex-wrap:wrap">`+
     `<div style="color:#7fd1ff;word-break:break-all;flex:0 1 auto">${s.fam}</div>`+
-    retraceBtn+dbgBtn+`</div>`+
+    tileBtn+retraceBtn+dbgBtn+`</div>`+
     (dg?`<div style="margin:0 0 8px;padding:6px 9px;border-left:3px solid ${dg.c};`+
         `background:rgba(255,255,255,.05);border-radius:3px;line-height:1.35">`+
         `<b style="color:${dg.c}">${dg.t}</b> `+
@@ -2726,9 +2732,11 @@ function renderSelectedKernel(){
     h += `<tr><td>achieved BW</td><td>${fc.bw_gbs} GB/s (${fc.bw_pct}% of ${D.peak_bw_gbs}), ${fc.kb_disp} KB/disp <span class="r">(per-family, raw traffic)</span></td></tr>`;
   }
   if(D.has_pmc){
+    // NOTE: the OccupancyPercent PMC counter is dropped -- it is a derived SQ metric
+    // and is unreliable on gfx1151 (SQ-counter mis-attribution under WGP harvesting
+    // yields impossible values >100%). Use the modeled resident/WGP row instead.
     h+=`<tr><td>MemUnitBusy</td><td>${fc.mem}%</td></tr>`+
        `<tr><td>L2 hit</td><td>${fc.l2}%</td></tr>`+
-       `<tr><td>Occupancy</td><td>${fc.occ}%</td></tr>`+
        `<tr><td>LDS bank conflict</td><td>${fc.lds}</td></tr>`+
        `<tr><td>WriteUnitStalled</td><td>${fc.wr}</td></tr>`;
     if(fc.ea) h+=`<tr><td>EA (DRAM iface) busy</td><td>${fc.ea}%</td></tr>`;
@@ -2737,33 +2745,14 @@ function renderSelectedKernel(){
        (fc.accum_vgpr?` (+${fc.accum_vgpr} accum)`:``)+`</td></tr>`;
     const sc=fc.scratch||0;
     h+=`<tr><td>scratch size</td><td>${sc>=1024?(sc/1024).toFixed(1)+' KB':sc+' B'}</td></tr>`;
-    // ---- tiling / scheduling ----
+    // ---- occupancy limiter (LDS/block + resident blocks per WGP) ----
     if(fc.wg){
       const W = fc.wave ? Math.round(fc.wg/fc.wave) : 0;   // waves per block
       const L = fc.lds_static||0;
-      const tileBtn = (s.map && s.map.K && (s.map.launchN||s.map.trueN))
-        ? `<button id="tileview" style="cursor:pointer;background:#2a3a52;color:#dbe6f5;`+
-          `border:1px solid #3a5578;border-radius:3px;padding:2px 10px;font-size:11px;`+
-          `text-transform:none;letter-spacing:normal">View tiling schematic</button>`
-        : ``;
-      h+=`<tr><td colspan="2" style="color:var(--dim);padding-top:8px;`+
-         `text-transform:uppercase;font-size:10px;letter-spacing:.5px">`+
-         `<span style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">`+
-         `<span>tiling / scheduling</span>${tileBtn}</span></td></tr>`;
       const nblk = s.blocks || 0;
-      if(nblk)
-        h+=`<tr><td>grid</td><td>${nblk} blocks <span class="r">(this dispatch)</span></td></tr>`;
-      h+=`<tr><td>block (workgroup)</td><td>${fc.wg} threads`+
-         (W?` = ${W} wave${fc.wave}`:``)+`</td></tr>`;
-      // Wavefronts for THIS dispatch = grid blocks x waves-per-block (exact: the
-      // hw counter is just grid_size/wave_size). Derived from this slice's grid so
-      // it tracks the selected dispatch, not the useless per-family mean.
-      if(nblk && W)
-        h+=`<tr><td>wavefronts</td><td>${nblk*W} `+
-           `<span class="r">(${nblk} blocks x ${W} wave${fc.wave})</span></td></tr>`;
       h+=`<tr><td>LDS / block</td><td>${L>=1024?(L/1024).toFixed(1)+' KB':L+' B'}`+
          (L===0?` <span class="r">(static; dynamic extern-shared not profiled)</span>`:``)+`</td></tr>`;
-      // Tier 2: modeled occupancy limiter (gfx1151 wave32).
+      // modeled occupancy limiter (gfx1151 wave32): resident blocks per WGP.
       const hw=D.hw;
       if(hw && W){
         const slotsWGP=hw.simd_per_wgp*hw.slots_per_simd;   // 64 wave32
@@ -2775,17 +2764,9 @@ function renderSelectedKernel(){
         let lim='slots', resid=bSlots;
         if(bVgpr<resid){lim='VGPR';resid=bVgpr;}
         if(bLds<resid){lim='LDS';resid=bLds;}
-        if(resid>0){
-          const theo=Math.round(resid*W/slotsWGP*100);
-          const chip=resid*hw.wgp;
+        if(resid>0)
           h+=`<tr><td>resident / WGP</td><td>${resid} block${resid!==1?'s':''} `+
              `<span class="r">(${lim}-bound; modeled gfx1151 wave32)</span></td></tr>`;
-          h+=`<tr><td>occupancy (modeled)</td><td>theo ~${theo}%`+
-             (fc.occ?` &middot; achieved ${fc.occ}%`:``)+`</td></tr>`;
-          if(nblk)
-            h+=`<tr><td>rounds to drain</td><td>~${Math.ceil(nblk/chip)} `+
-               `<span class="r">(${nblk} blocks / ${chip} chip-resident)</span></td></tr>`;
-        }
       }
     }
   }
@@ -2890,11 +2871,19 @@ function renderSelectedKernel(){
     // actual launched grid for THIS dispatch: blocks = workgroup count (Grid/Workgroup
     // from the kernel trace), wg = threads/block, wave = warp size (both from PMC).
     blocks:s.blocks||0, wg:fc.wg||0, wave:fc.wave||0,
+    // chip-wide wavefront slot capacity for the occupancy/tail view (WGP x SIMD/WGP
+    // x slots/SIMD = 20*4*16 = 1280 on gfx1151).
+    hwslots:(D.hw?D.hw.wgp*D.hw.simd_per_wgp*D.hw.slots_per_simd:0),
     sbHelp:(D.concept_gloss||{}).superblock||''});
   const cp=document.getElementById('attcopy');
   if(cp) cp.onclick=()=>copyCmd(cmd);
   const rt=document.getElementById('attretrace');
-  if(rt) rt.onclick=()=>traceKernelLive(sym, s.fam, true);
+  // shape-exact matvec target from the order-mapped weight (quant + K + N), so the
+  // live trace captures THIS dispatch's real dims (server injects it via the patched
+  // test-backend-ops). null for non-mapped kernels -> server falls back to its runner.
+  const tshape=(s.map && s.map.K && (s.map.launchN||s.map.trueN))
+    ? {q:s.map.q, K:s.map.K, N:(s.map.launchN||s.map.trueN)} : null;
+  if(rt) rt.onclick=()=>traceKernelLive(sym, s.fam, true, tshape);
   const db=document.getElementById('attdbg');
   if(db) db.onclick=()=>openDebugView(s.fam);
 }
@@ -2926,7 +2915,14 @@ function openTilingView(shape){
     `font-size:12px;color:#c8d0da;display:grid;grid-template-columns:max-content 1fr;`+
     `column-gap:10px;row-gap:1px;max-width:640px}`+
     `#notes .k{color:#9fb0c4}`+
-    `#sbnote{flex:1 1 100%;margin-top:6px;font-size:12px;line-height:1.45;color:#9fb0c4;`+
+    `#foot{flex:0 0 auto;padding:10px 16px;background:#12161c;border-top:1px solid #2a3340}`+
+    `#occnote{font-size:12px;color:#9fb0c4;`+
+    `display:flex;align-items:center;gap:6px;flex-wrap:wrap}#occnote b{color:#c8d0da}`+
+    `.occbar{display:inline-block;width:46px;height:12px;background:#1b2130;`+
+    `border:1px solid #2a3340;border-radius:2px;overflow:hidden;vertical-align:middle}`+
+    `.occfill{display:block;height:100%}`+
+    `.occmore{color:#6f7d8f}.occok{color:#8fe388}.occwarn{color:#e0a341}`+
+    `#sbnote{margin-top:6px;font-size:12px;line-height:1.45;color:#9fb0c4;`+
     `max-width:900px}#sbnote b{color:#c8d0da}`+
     `#wrap{flex:1 1 auto;overflow:auto;min-height:0}#cv{display:block}`+
     `</style></head><body>`+
@@ -2938,8 +2934,9 @@ function openTilingView(shape){
     `<span class="lg"><span class="sw" style="background:#2d3f2f;border:1px solid #3fb950"></span>X: activation (Q8_1, shared/LDS)</span>`+
     `<span class="lg"><span class="sw" style="background:#c9d4e2"></span>Y: output (fp32, 1/wave)</span>`+
     `<div id="formula"></div>`+
-    `<div id="notes"></div><div id="sbnote"></div></div>`+
+    `<div id="notes"></div></div>`+
     `<div id="wrap"><canvas id="cv"></canvas></div>`+
+    `<div id="foot"><div id="occnote"></div><div id="sbnote"></div></div>`+
     `<scr`+`ipt>`+
     `var SH=`+JSON.stringify(shape).replace(/</g,'\\u003c')+`;`+
     `var QK=256,QK81=32;`+
@@ -2965,6 +2962,12 @@ function openTilingView(shape){
     `+'   (K='+SH.K+' reduction, N='+N+' output; W gguf ne=['+SH.K+'x'+N+'], '+(SH.q||'')+')';`+
     // notes panel: one parameter per row (key | value), from the actual launched grid.
     `var wRow=Kb*SB,wTot=N*wRow,aBytes=Ab*36;`+
+    // chip occupancy / tail effect: the chip runs HWS wavefronts concurrently
+    // (1280 on gfx1151). N waves take ceil(N/HWS) waves-deep rounds; the last round
+    // is only (N mod HWS) waves wide unless N divides evenly -> partial occupancy.
+    `var HWS=SH.hwslots>0?SH.hwslots:1280;`+
+    `var ROUNDS=Math.ceil(N/HWS),TAIL=N%HWS,TAILW=(TAIL===0?HWS:TAIL);`+
+    `var TAILPCT=Math.round(100*TAILW/HWS),FULL=(TAIL===0);`+
     `function nrow(k,v){return '<span class="k">'+k+'</span><span>'+v+'</span>';}`+
     `notesEl.innerHTML=`+
     `nrow('waves/workgroup (nwarps):', WPW)+`+
@@ -2972,9 +2975,23 @@ function openTilingView(shape){
     `nrow('workgroups (blocks):', NWG)+`+
     `nrow('threads/block:', (SH.wg>0?SH.wg:'(n/a)'))+`+
     `nrow('total waves = output rows:', N)+`+
+    `nrow('device wavefront slots:', HWS+'   (WGP x SIMD x 16 slots)')+`+
+    `nrow('occupancy rounds:', ROUNDS+' waves-deep   (ceil('+N+'/'+HWS+'))')+`+
+    `nrow('last round:', FULL?(HWS+' waves = full'):`+
+    `(TAILW+' of '+HWS+' waves = '+TAILPCT+'% (tail: '+(HWS-TAILW)+' slots idle)'))+`+
     `nrow('each row:', Kb+' superblocks x'+SB+'B='+wRow+'B weight')+`+
     `nrow('activation:', aBytes+'B shared in LDS')+`+
     `nrow('total weight:', (wTot/1048576).toFixed(2)+' MB');`+
+    // occupancy footnote: a mini bar of ROUNDS segments, last one partially filled
+    // to show the tail (partial chip occupancy when N not divisible by HWS).
+    `var occ=document.getElementById('occnote');`+
+    `if(occ){var seg='';var shown=Math.min(ROUNDS,8);`+
+    `for(var i=0;i<shown;i++){var last=(i===ROUNDS-1);var pct=last?TAILPCT:100;`+
+    `seg+='<span class="occbar" title="round '+(i+1)+': '+pct+'% of '+HWS+' slots">'`+
+    `+'<span class="occfill" style="width:'+pct+'%;background:'+(last&&!FULL?'#e0a341':'#3fb950')+'"></span></span>';}`+
+    `if(ROUNDS>shown)seg+='<span class="occmore">+'+(ROUNDS-shown)+' more</span>';`+
+    `occ.innerHTML='<b>device occupancy:</b> '+ROUNDS+' round'+(ROUNDS>1?'s':'')+' of '+HWS+' wavefronts '`+
+    `+seg+(FULL?' <span class="occok">fully packed</span>':' <span class="occwarn">last round '+TAILPCT+'% ('+(HWS-TAILW)+' idle slots)</span>');}`+
     // superblock definition (from the concept glossary), shown as a footnote
     `var sbn=document.getElementById('sbnote');`+
     `if(sbn&&SH.sbHelp)sbn.innerHTML='<b>superblock (SB):</b> '+`+
@@ -3042,6 +3059,8 @@ function openTilingView(shape){
     `cv.addEventListener('wheel',function(e){if(e.ctrlKey||e.altKey){zoom(e.deltaY<0?1.15:1/1.15);e.preventDefault();return;}`+
     `wrap.scrollTop+=e.deltaY;e.preventDefault();},{passive:false});`+
     `window.addEventListener('resize',draw);draw();`+
+    // Esc closes this tab (allowed: opened via window.open).
+    `window.addEventListener('keydown',function(e){if(e.key==='Escape')window.close();});`+
     `<\/scr`+`ipt></body></html>`;
   w.document.open(); w.document.write(doc); w.document.close();
 }
@@ -3486,7 +3505,7 @@ function openDebugView(fam){
 // POST to the companion server to run ATT on a free GPU board and fold the result in.
 // force=true tells the server to discard the on-disk att-<sym>/ trace first, so this
 // genuinely recollects (the fix for on-disk traces that lack DWARF source lines).
-async function traceKernelLive(sym, fam, force){
+async function traceKernelLive(sym, fam, force, shape){
   const btn=document.getElementById('atttrace');
   const rbtn=document.getElementById('attretrace');
   // update BOTH status spans (top row next to Run Trace, and the bottom trace box)
@@ -3501,7 +3520,7 @@ async function traceKernelLive(sym, fam, force){
   try{
     const r=await fetch('/api/trace',{method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({kernel:sym, force:!!force})});
+      body:JSON.stringify({kernel:sym, force:!!force, shape:shape||null})});
     const j=await r.json().catch(()=>({}));
     if(r.status===409){
       setSt('#e0b341',j.error||'a trace is already running -- try again shortly');

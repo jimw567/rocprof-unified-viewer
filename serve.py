@@ -97,9 +97,20 @@ def _pick_free_host():
     return reachable[0]["host"], rows
 
 
-def _run_att_on_host(host, sym, out_dir):
+# ggml_type enum ints for the quant tags carried in a family name (e.g. "[Q4_K]").
+# Used to build a shape-exact test-backend-ops MUL_MAT case for a selected matvec.
+_GGML_TYPE_INT = {"Q4_0": 2, "Q4_1": 3, "Q5_0": 6, "Q5_1": 7, "Q8_0": 8,
+                  "Q2_K": 10, "Q3_K": 11, "Q4_K": 12, "Q5_K": 13, "Q6_K": 14}
+
+
+def _run_att_on_host(host, sym, out_dir, shape=None):
     """Pipe the local collect-att.sh over `ssh host bash -s` so the board runs the
-    repo's current script (no board deployment). Returns (ok, log)."""
+    repo's current script (no board deployment). Returns (ok, log).
+
+    When `shape` (a {quant,K,N} dict from the selected matvec) is given AND the
+    server is in test-backend-ops runner mode, trace the EXACT decode shape: inject
+    it via GGML_ATT_MULMAT (needs the patched test-backend-ops) and filter the perf
+    run with -p to that single case, so ATT captures the model's real dims."""
     script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                           "collect-att.sh")
     with open(script) as fh:
@@ -114,7 +125,32 @@ def _run_att_on_host(host, sym, out_dir):
         # Single-kernel evaluator instead of the full llama-bench graph. The
         # runner string is passed as one collect-att.sh arg (it word-splits it);
         # --model / --bench-flags do not apply in this mode.
-        sh_args += ["--runner", _ARGS.runner]
+        runner = _ARGS.runner
+        # Shape-exact matvec: if the selected family carries a quant + K + N and the
+        # runner is test-backend-ops, target that exact MUL_MAT case.
+        q = (shape or {}).get("q")
+        K = (shape or {}).get("K")
+        N = (shape or {}).get("N")
+        ti = _GGML_TYPE_INT.get(str(q).upper()) if q else None
+        if ti and K and N and "test-backend-ops" in runner and "-o MUL_MAT" in runner:
+            # Override the configured runner with a shape-exact PERF run: the env var
+            # injects the case; -p selects it by its unique dims (m=N,n=1,k=K). Perf
+            # mode runs thousands of iterations so the ATT capture survives cutoff
+            # (test mode's single dispatch gets truncated). Filter on dims only --
+            # the quant is pinned by GGML_ATT_MULMAT, and vars() prints the quant tag
+            # mixed-case which a regex would miss. NO quotes around the -p value:
+            # collect-att.sh word-splits the runner string (WORKLOAD=($RUNNER)), so
+            # quotes would become literal chars; the value has no spaces so bare works.
+            base = runner.split(" -p ")[0]
+            runner = '%s -p m=%d,n=1,k=%d' % (base, int(N), int(K))
+            sh_args += ["--runner-env",
+                        "GGML_ATT_MULMAT=%d,%d,%d" % (ti, int(K), int(N))]
+            # DISABLE HIP graphs: test-backend-ops perf wraps the repeated launches in
+            # a HIP graph, so ATT sees one opaque graphLaunch and can't thread-trace
+            # the kernel (-> 0 populated dispatches). Stream mode makes each launch a
+            # visible dispatch ATT can capture. Essential for the single-shape run.
+            sh_args += ["--runner-env", "GGML_CUDA_DISABLE_GRAPHS=1"]
+        sh_args += ["--runner", runner]
     else:
         sh_args += ["--model", _ARGS.model]
         bench = shlex.split(_ARGS.bench_flags) if _ARGS.bench_flags else []
@@ -138,14 +174,16 @@ def _run_att_on_host(host, sym, out_dir):
     return True, log
 
 
-def _do_trace(sym, force=False):
+def _do_trace(sym, force=False, shape=None):
     """Run (or stub) a trace for one kernel symbol; fold results into the cache.
     Returns (http_status, response_dict).
 
     force=True wipes any existing att-<sym>/ output on disk BEFORE re-running, so a
     re-trace genuinely re-collects instead of accumulating alongside (and reloading)
     stale decoded data -- the usual reason to force is that the on-disk trace came
-    from a build WITHOUT DWARF line tables and you want a fresh one that has them."""
+    from a build WITHOUT DWARF line tables and you want a fresh one that has them.
+
+    shape={quant,K,N} (optional) targets a shape-exact matvec (see _run_att_on_host)."""
     if sym not in _ALLOWED_SYMS:
         return 400, {"ok": False, "error": "unknown kernel symbol"}
     if not _TRACE_LOCK.acquire(blocking=False):
@@ -168,7 +206,7 @@ def _do_trace(sym, force=False):
                 # only ever remove OUR own per-symbol scratch dir under the out-base
                 shutil.rmtree(src_dir, ignore_errors=True)
             os.makedirs(src_dir, exist_ok=True)
-            ok, log = _run_att_on_host(host, sym, src_dir)
+            ok, log = _run_att_on_host(host, sym, src_dir, shape=shape)
             if not ok:
                 return 500, {"ok": False, "error": log, "host": host}
         stats = load_att_stats(src_dir)
@@ -241,8 +279,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         sym = (req.get("kernel") or "").strip()
         force = bool(req.get("force"))
+        # optional shape-exact matvec target {q, K, N} for the selected dispatch.
+        shape = req.get("shape") if isinstance(req.get("shape"), dict) else None
         try:
-            status, resp = _do_trace(sym, force=force)
+            status, resp = _do_trace(sym, force=force, shape=shape)
         except RuntimeError as e:
             status, resp = 500, {"ok": False, "error": str(e)}
         self._send_json(status, resp)
