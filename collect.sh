@@ -37,6 +37,7 @@ MODEL=""
 OUT_DIR=""
 NTOK=64
 PMC_NTOK=2
+PROMPT=0
 KERNEL_REGEX=""
 # Stall-classification counters + raw cycle counters for two derived ratios the
 # viewer computes: EA busy% = GRBM_EA_BUSY/GRBM_GUI_ACTIVE (DRAM-interface busy,
@@ -62,6 +63,12 @@ Usage: collect.sh --build-dir DIR --model M.gguf --out-dir DIR [opts] [-- llama-
   -n N              Decode tokens for the sys-trace run (default: $NTOK).
   --pmc-n N         Decode tokens for the PMC runs (default: $PMC_NTOK; keep small,
                     PMC replays every kernel once per counter-set pass).
+  --prompt N        Prefill mode: process an N-token prompt with 0 decode
+                    (-p N -n 0) instead of the default decode workload
+                    (-p 0 -n <-n>). N=0 (default) = decode; N>0 = prefill.
+                    In prefill mode -n / --pmc-n are ignored (one forward pass),
+                    and clean_tps.txt holds prompt-processing tp (pp) not decode
+                    tg. Feed the resulting trace to the viewer with --mode prefill.
   --kernel REGEX    Restrict PMC collection to kernels matching REGEX
                     (rocprofv3 --kernel-include-regex). Default: all kernels.
   --counters "..."  Override the stall counter set.
@@ -88,6 +95,7 @@ while [ $# -gt 0 ]; do
     --rocm)      ROCM_DIR="$2"; shift 2 ;;
     -n)          NTOK="$2"; shift 2 ;;
     --pmc-n)     PMC_NTOK="$2"; shift 2 ;;
+    --prompt)    PROMPT="$2"; shift 2 ;;
     --kernel)    KERNEL_REGEX="$2"; shift 2 ;;
     --counters)  STALL_COUNTERS="$2"; shift 2 ;;
     -h|--help)   usage; exit 0 ;;
@@ -109,12 +117,30 @@ ROCPROFV3="$ROCM_DIR/bin/rocprofv3"
 ROCM_LIBS="$ROCM_DIR/lib:$ROCM_DIR/lib/llvm/lib"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+case "$PROMPT" in ''|*[!0-9]*) echo "ERROR: --prompt must be a non-negative integer" >&2; exit 1 ;; esac
+
+# Workload dims per regime. Decode (--prompt 0): 0 prompt, N decode tokens; the
+# viewer segments the periodic per-token stream. Prefill (--prompt N>0): N prompt
+# tokens, 0 decode -- one forward pass (MMQ GEMMs), so -n / --pmc-n do not apply
+# and both the sys-trace and PMC runs use the same -p N -n 0. clean_tps.txt then
+# holds prompt-processing tp (pp) not decode tg.
+if [ "$PROMPT" -gt 0 ]; then
+  MODE="prefill"
+  TRACE_PN=(-p "$PROMPT" -n 0)
+  PMC_PN=(-p "$PROMPT" -n 0)
+else
+  MODE="decode"
+  TRACE_PN=(-p 0 -n "$NTOK")
+  PMC_PN=(-p 0 -n "$PMC_NTOK")
+fi
+
 mkdir -p "$OUT_DIR/trace" "$OUT_DIR/stall" "$OUT_DIR/fetch"
 
 echo "ROCm:      $ROCM_DIR"
 echo "Build:     $BUILD_DIR"
 echo "Model:     $MODEL"
 echo "Out:       $OUT_DIR"
+echo "Mode:      $MODE (trace: ${TRACE_PN[*]}; pmc: ${PMC_PN[*]})"
 echo "Extra:     ${EXTRA[*]:-(none)}"
 echo ""
 
@@ -132,22 +158,22 @@ run_ok() { # $1=glob under dir  $2=dir  $3..=command
 # --- 0. clean run: no rocprofv3, so the tok/s is the honest untraced throughput.
 # rocprofv3 (even --sys-trace) perturbs timing; PMC replays kernels and is far
 # worse. Same LD_LIBRARY_PATH as the traced runs so it exercises the same libs.
-echo "=== [0/5] clean run (no rocprofv3) -> untraced tok/s (-n $NTOK) ==="
+echo "=== [0/5] clean run (no rocprofv3) -> untraced tok/s (${TRACE_PN[*]}) ==="
 ( cd "$BUILD_DIR"
   LD_LIBRARY_PATH="$BUILD_DIR:$ROCM_LIBS:${LD_LIBRARY_PATH:-}" \
-    ./llama-bench -m "$MODEL" -p 0 -n "$NTOK" "${EXTRA[@]}" ) \
+    ./llama-bench -m "$MODEL" "${TRACE_PN[@]}" "${EXTRA[@]}" ) \
     | tee "$OUT_DIR/clean_tps.txt"
 echo "Wrote $OUT_DIR/clean_tps.txt (untraced baseline; quote this tok/s, not the traced runs')"
 
 echo ""
 # --- 1. sys-trace (real timing; build dir first so llama-bench finds its libs) --
-echo "=== [1/5] sys-trace (-n $NTOK) ==="
+echo "=== [1/5] sys-trace (${TRACE_PN[*]}) ==="
 ( cd "$BUILD_DIR"
   PATH="$ROCM_DIR/bin:$PATH" \
   LD_LIBRARY_PATH="$BUILD_DIR:$ROCM_LIBS:${LD_LIBRARY_PATH:-}" \
   run_ok '*_kernel_trace.csv' "$OUT_DIR/trace" \
     "$ROCPROFV3" --sys-trace --output-format pftrace csv -d "$OUT_DIR/trace" -- \
-    ./llama-bench -m "$MODEL" -p 0 -n "$NTOK" "${EXTRA[@]}" )
+    ./llama-bench -m "$MODEL" "${TRACE_PN[@]}" "${EXTRA[@]}" )
 
 # --- PMC helper: system ROCm runtime FIRST (no build dir) -----------------------
 KREGEX=()
@@ -159,15 +185,15 @@ pmc_run() { # $1=dir  $2..=counters
     LD_LIBRARY_PATH="$ROCM_LIBS:${LD_LIBRARY_PATH:-}" \
     run_ok '*_counter_collection.csv' "$dir" \
       "$ROCPROFV3" --pmc "$@" --output-format csv "${KREGEX[@]}" -d "$dir" -- \
-      ./llama-bench -m "$MODEL" -p 0 -n "$PMC_NTOK" "${EXTRA[@]}" )
+      ./llama-bench -m "$MODEL" "${PMC_PN[@]}" "${EXTRA[@]}" )
 }
 
 echo ""
-echo "=== [2/5] PMC stall counters (-n $PMC_NTOK) ==="
+echo "=== [2/5] PMC stall counters (${PMC_PN[*]}) ==="
 pmc_run "$OUT_DIR/stall" $STALL_COUNTERS
 
 echo ""
-echo "=== [3/5] PMC FETCH_SIZE -> achieved DRAM bytes (-n $PMC_NTOK) ==="
+echo "=== [3/5] PMC FETCH_SIZE -> achieved DRAM bytes (${PMC_PN[*]}) ==="
 pmc_run "$OUT_DIR/fetch" FETCH_SIZE
 
 # --- 4. disasm load widths ------------------------------------------------------
@@ -189,4 +215,9 @@ echo "    --pmc-csv    $OUT_DIR/stall/$HOST/*_counter_collection.csv \\"
 echo "    --fetch-csv  $OUT_DIR/fetch/$HOST/*_counter_collection.csv \\"
 echo "    --loadwidth-json $OUT_DIR/loadwidth.json \\"
 echo "    --clean-tps-file $OUT_DIR/clean_tps.txt \\"
-echo "    --out overlay.html --tokens 2"
+if [ "$MODE" = "prefill" ]; then
+  # Prefill bakes one forward pass; the decode --tokens viewport does not apply.
+  echo "    --mode prefill --out overlay.html"
+else
+  echo "    --out overlay.html --tokens 2"
+fi

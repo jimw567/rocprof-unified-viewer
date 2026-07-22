@@ -105,6 +105,12 @@ _GGML_TYPES = {
 PEAK_BW_GBS_BY_ARCH = {
     "gfx1151": 230.0,   # Strix Halo, LPDDR5X-8000 256-bit (~230 achievable of 256 theo)
 }
+# Per-arch peak compute (TOPS) for the fp16/int8 matmul path -- the roofline's
+# compute ceiling, shown next to the BW peak in the title. gfx1151 (Strix Halo,
+# Radeon 8060S, 40 RDNA3.5 CUs @ ~2.9 GHz) delivers ~43 TOPS f16/int8 via WMMA.
+PEAK_TOPS_BY_ARCH = {
+    "gfx1151": 43.0,    # Strix Halo, WMMA fp16/int8
+}
 DEFAULT_ARCH = "gfx1151"
 
 
@@ -112,6 +118,12 @@ def peak_bw_for(arch, override=None):
     if override:
         return float(override)
     return PEAK_BW_GBS_BY_ARCH.get(arch, PEAK_BW_GBS_BY_ARCH[DEFAULT_ARCH])
+
+
+def peak_tops_for(arch, override=None):
+    if override:
+        return float(override)
+    return PEAK_TOPS_BY_ARCH.get(arch)
 
 
 def family_of(kernel_name):
@@ -370,23 +382,25 @@ def load_fetch_bytes_mapped(path, expected_seq):
     return {nm: statistics.mean(vs) for nm, vs in acc.items() if vs}
 
 
-def parse_clean_tps(path):
-    """Parse the decode (tg) throughput from collect.sh's clean_tps.txt -- the
-    untraced llama-bench markdown table. Returns {"test": "tg64", "tps": float,
-    "sd": float or None} for the last tg row, or None if the file is missing or
-    unparseable. This is the honest tok/s: rocprofv3 perturbs the traced runs,
-    so this bare number is what to quote."""
+def parse_clean_tps(path, kind="tg"):
+    """Parse throughput from collect.sh's clean_tps.txt -- the untraced llama-bench
+    markdown table. Returns {"test": "tg64"/"pp128", "tps": float, "sd": float or
+    None} for the last matching row, or None if the file is missing or unparseable.
+    kind selects which row family to read: "tg" (decode token-generation, default)
+    or "pp" (prefill prompt-processing). This is the honest tok/s -- rocprofv3
+    perturbs the traced runs, so this bare number is what to quote."""
     try:
         with open(path, encoding="utf-8", errors="replace") as fh:
             text = fh.read()
     except OSError:
         return None
     best = None
+    row_re = re.compile(r"%s\d+" % kind)
     for line in text.splitlines():
         if "|" not in line:
             continue
         cells = [c.strip() for c in line.strip().strip("|").split("|")]
-        test = next((c for c in cells if re.fullmatch(r"tg\d+", c)), None)
+        test = next((c for c in cells if row_re.fullmatch(c)), None)
         if not test:
             continue
         m = re.search(r"([0-9]+\.?[0-9]*)\s*(?:\u00b1|\+/-)\s*([0-9]+\.?[0-9]*)",
@@ -1197,6 +1211,9 @@ def add_common_args(ap):
                          % (DEFAULT_ARCH, PEAK_BW_GBS_BY_ARCH[DEFAULT_ARCH]))
     ap.add_argument("--peak-bw", type=float,
                     help="override peak DRAM bandwidth in GB/s (else from --arch)")
+    ap.add_argument("--peak-tops", type=float,
+                    help="override peak fp16/int8 compute in TOPS shown in the "
+                         "title (else from --arch; omitted if unknown)")
     ap.add_argument("--clean-tps-file",
                     help="path to collect.sh's clean_tps.txt (the untraced "
                          "llama-bench run): parses the decode (tg) row's t/s and "
@@ -1204,6 +1221,13 @@ def add_common_args(ap):
                          "rocprofv3 perturbs the traced runs' timing. Silently "
                          "ignored if the file is missing or unparseable.")
     ap.add_argument("--out", help="output HTML path (required for the generator)")
+    ap.add_argument("--mode", choices=["decode", "prefill"], default="decode",
+                    help="trace regime (default decode). 'decode' segments the "
+                         "timeline by the periodic per-token dispatch stream (mmvq). "
+                         "'prefill' bakes the single prompt-processing forward pass "
+                         "(MMQ) as one span -- no per-token periodicity; the layer/"
+                         "role lanes (decode order-map) are omitted, CPU+GPU+family "
+                         "lanes render.")
     ap.add_argument("--tokens", type=int, default=2,
                     help="decode tokens to show in the viewport (default 2)")
     ap.add_argument("--skip-tokens", type=int, default=30,
@@ -1236,10 +1260,14 @@ def main():
 
 def build_payload(args):
     peak_bw = peak_bw_for(args.arch, args.peak_bw)
-    # Surface the peak next to the arch string in the title (e.g.
-    # "... (gfx1151)" -> "... (gfx1151, 230 GB/s peak)").
+    peak_tops = peak_tops_for(args.arch, args.peak_tops)
+    # Surface the roofline peaks next to the arch string in the title (e.g.
+    # "... (gfx1151)" -> "... (gfx1151, 230 GB/s, 43 TOPS f16/int8)"). The TOPS
+    # clause is only shown when a peak is known for the arch.
     title = args.title
-    tag = "%s, %g GB/s peak" % (args.arch, peak_bw)
+    tag = "%s, %g GB/s" % (args.arch, peak_bw)
+    if peak_tops:
+        tag += ", %g TOPS f16/int8" % peak_tops
     if args.arch in title:
         title = title.replace(args.arch, tag, 1)
     else:
@@ -1252,25 +1280,47 @@ def build_payload(args):
     sid = max(by_stream, key=lambda s: len(by_stream[s]))
     evs = by_stream[sid]
 
-    bounds = detect_boundaries(evs, args.gap_threshold_us * 1000)
-    if len(bounds) < args.skip_tokens + args.tokens + 2:
-        sys.exit(f"error: only {len(bounds)} token boundaries detected; "
-                 f"need > {args.skip_tokens + args.tokens}. Lower --skip-tokens "
-                 f"or --gap-threshold-us.")
+    if args.mode == "prefill":
+        # Prefill = ONE prompt-processing forward pass (MMQ GEMMs), not the
+        # periodic per-token decode stream. There are no token boundaries to
+        # segment on, so bake the whole compute span as a single "pass": drop
+        # the leading copyBuffer/quantize weight-upload prologue (everything
+        # before the first mul_mat*), then bake to the end.
+        a = next((i for i, ev in enumerate(evs) if "mul_mat" in ev[2]), 0)
+        b = len(evs)
+        baked = evs[a:b]
+        if not baked:
+            sys.exit("error: no mul_mat* dispatches in prefill trace "
+                     f"{args.kernel_csv}; is this a prefill (-p N -n 0) run?")
+        t0, t1 = baked[0][0], baked[-1][1]
+        # One span. The client viewport is [tok_starts[view_i0], tok_starts[view_i1]),
+        # so hand it two entries (pass start, pass end) => the initial viewport spans
+        # the whole forward pass instead of collapsing to zero width. These also render
+        # as the two delimiting markers. The order-map reset boundary is still just {0}.
+        tok_starts = [t0, t1]
+        lo_tok = 0
+        view_i0 = 0
+        view_i1 = 1
+    else:
+        bounds = detect_boundaries(evs, args.gap_threshold_us * 1000)
+        if len(bounds) < args.skip_tokens + args.tokens + 2:
+            sys.exit(f"error: only {len(bounds)} token boundaries detected; "
+                     f"need > {args.skip_tokens + args.tokens}. Lower --skip-tokens "
+                     f"or --gap-threshold-us.")
 
-    # Bake a wider span (context on each side) so the stepper can pan.
-    lo_tok = max(0, args.skip_tokens - args.context_tokens)
-    hi_tok = min(len(bounds) - 1, args.skip_tokens + args.tokens + args.context_tokens)
-    a = bounds[lo_tok]
-    b = bounds[hi_tok]
-    baked = evs[a:b]
-    t0, t1 = baked[0][0], baked[-1][1]
+        # Bake a wider span (context on each side) so the stepper can pan.
+        lo_tok = max(0, args.skip_tokens - args.context_tokens)
+        hi_tok = min(len(bounds) - 1, args.skip_tokens + args.tokens + args.context_tokens)
+        a = bounds[lo_tok]
+        b = bounds[hi_tok]
+        baked = evs[a:b]
+        t0, t1 = baked[0][0], baked[-1][1]
 
-    # Token boundary timestamps within the baked span (for stepper snapping).
-    tok_starts = [evs[bounds[k]][0] for k in range(lo_tok, hi_tok + 1)]
-    # Initial viewport = the first `tokens` tokens after the leading context.
-    view_i0 = args.context_tokens if lo_tok > 0 else 0
-    view_i1 = min(len(tok_starts) - 1, view_i0 + args.tokens)
+        # Token boundary timestamps within the baked span (for stepper snapping).
+        tok_starts = [evs[bounds[k]][0] for k in range(lo_tok, hi_tok + 1)]
+        # Initial viewport = the first `tokens` tokens after the leading context.
+        view_i0 = args.context_tokens if lo_tok > 0 else 0
+        view_i1 = min(len(tok_starts) - 1, view_i0 + args.tokens)
 
     # PMC families -> color/stall lookup.
     fams = load_pmc_families(args.pmc_csv) if args.pmc_csv else {}
@@ -1300,7 +1350,9 @@ def build_payload(args):
             _occ_seen[_key] = len(att_occ_pool)
             att_occ_pool.append(_o)
         _c["occ_ref"] = _occ_seen[_key]
-    clean_tps = parse_clean_tps(args.clean_tps_file) if args.clean_tps_file else None
+    clean_tps = (parse_clean_tps(args.clean_tps_file,
+                                 "pp" if args.mode == "prefill" else "tg")
+                 if args.clean_tps_file else None)
 
     # Optional GGUF order-map: build the expected per-token matvec tensor sequence
     # in decode execution order. llama.cpp fuses the SwiGLU gate+up into one
@@ -1308,7 +1360,10 @@ def build_payload(args):
     # candidate's N-sequence best matches the actual matvec dispatches in one token.
     expected_seq = []
     gguf_meta = {}
-    if args.gguf:
+    # The decode order-map keys off the periodic per-token mmvq stream; prefill
+    # (single MMQ forward pass, 2D grid) needs a different join and is deferred
+    # to increment 2. Skip it so layer/role lanes stay empty for prefill.
+    if args.gguf and args.mode != "prefill":
         gguf_tensors, gguf_meta = load_gguf_tensors(args.gguf)
         # Reference token = the matvec N-stream between the first two boundaries in
         # the baked span (a full steady-state token).
@@ -1356,8 +1411,12 @@ def build_payload(args):
                      if (args.fetch_csv and expected_seq) else {})
 
     # Baked-relative indices where a new decode token starts (reset the order-map
-    # pointer here so each token re-aligns to the expected sequence head).
-    tok_boundary_idx = {bounds[k] - a for k in range(lo_tok, hi_tok + 1)}
+    # pointer here so each token re-aligns to the expected sequence head). Prefill
+    # is a single baked span -> one boundary at index 0.
+    if args.mode == "prefill":
+        tok_boundary_idx = {0}
+    else:
+        tok_boundary_idx = {bounds[k] - a for k in range(lo_tok, hi_tok + 1)}
 
     # GPU slices in the baked span (relative ns from t0). If a GGUF sequence was
     # built, order-map each mul_mat_vec dispatch to its expected weight tensor
@@ -1447,7 +1506,9 @@ def build_payload(args):
     # Keyed "ti|family" so a rare token with a different kernel count self-segregates
     # rather than blending mismatched positions. Durations are ns (JS renders us).
     kstats = {}
-    kstats_ntok = max(0, len(bounds) - 1 - args.skip_tokens)
+    # Per-position kernel-duration stats need the periodic per-token segmentation;
+    # prefill's single pass has no repeats to aggregate over.
+    kstats_ntok = 0 if args.mode == "prefill" else max(0, len(bounds) - 1 - args.skip_tokens)
     if kstats_ntok > 0:
         agg = defaultdict(list)
         for k in range(args.skip_tokens, len(bounds) - 1):
@@ -1575,7 +1636,8 @@ def build_payload(args):
             cpu_slices.append({"s": cs - t0, "e": ce - t0, "name": name})
 
     span_ns = t1 - t0
-    ntok_baked = hi_tok - lo_tok
+    # Prefill bakes one forward pass (a single span); decode bakes (hi-lo) tokens.
+    ntok_baked = 1 if args.mode == "prefill" else hi_tok - lo_tok
 
     # Per-family summary (over the baked span), enriched with PMC counters and,
     # if a FETCH_SIZE run was given, MEASURED achieved DRAM bandwidth. bytes/disp
@@ -1671,6 +1733,10 @@ def build_payload(args):
         regen_parts.append("--arch " + args.arch)
     if args.peak_bw:
         regen_parts.append("--peak-bw %g" % args.peak_bw)
+    if args.peak_tops:
+        regen_parts.append("--peak-tops %g" % args.peak_tops)
+    if args.mode != "decode":
+        regen_parts.append("--mode " + args.mode)
     if args.tokens != 2:
         regen_parts.append("--tokens %d" % args.tokens)
     if args.skip_tokens != 30:
@@ -1691,8 +1757,22 @@ def build_payload(args):
         "out_html": os.path.abspath(_out),
     }
 
+    # Prefill TTFT estimate == the GPU prompt-eval floor, computed the SAME way the
+    # llamacpp regression harness reports ttft_ms_estimate: n_prompt / prefill_tps.
+    # n_prompt comes from the clean_tps test label (e.g. "pp128" -> 128); prefill_tps
+    # is the untraced clean pp tok/s. Excludes tokenize/first-sample/scheduling, so
+    # it is a floor, not the server-measured end-to-end TTFT. None if unavailable.
+    ttft_est_ms = None
+    if args.mode == "prefill" and clean_tps and clean_tps.get("tps", 0) > 0:
+        _m = re.search(r"(\d+)", clean_tps.get("test", "") or "")
+        _np = int(_m.group(1)) if _m else 0
+        if _np > 0:
+            ttft_est_ms = _np / clean_tps["tps"] * 1000.0
+
     payload = {
         "title": title,
+        "mode": args.mode,
+        "ttft_est_ms": ttft_est_ms,
         "kernel_csv": args.kernel_csv,
         "pmc_csv": args.pmc_csv or "",
         "span_ns": span_ns,
@@ -1762,9 +1842,13 @@ def write_overlay(args):
     with open(args.out, "w") as f:
         f.write(html)
     print(f"wrote {args.out}", file=sys.stderr)
-    print(f"  baked {payload['n_tokens_baked']} tokens ({len(payload['gpu'])} GPU "
-          f"slices, {len(payload['cpu'])} CPU calls); viewport shows "
-          f"{payload['tokens_view']} tokens.", file=sys.stderr)
+    if args.mode == "prefill":
+        print(f"  prefill: 1 forward pass ({len(payload['gpu'])} GPU slices, "
+              f"{len(payload['cpu'])} CPU calls).", file=sys.stderr)
+    else:
+        print(f"  baked {payload['n_tokens_baked']} tokens ({len(payload['gpu'])} GPU "
+              f"slices, {len(payload['cpu'])} CPU calls); viewport shows "
+              f"{payload['tokens_view']} tokens.", file=sys.stderr)
     print(f"  window busy {payload['busy_ns']/1e6:.3f} ms / span "
           f"{payload['span_ns']/1e6:.3f} ms "
           f"({payload['busy_ns']/payload['span_ns']*100:.1f}% GPU-busy)",
@@ -2027,16 +2111,21 @@ function fallbackCopy(text,done){
   document.body.removeChild(ta);
 }
 
-document.getElementById('title').textContent = D.title;
+const IS_PREFILL = D.mode === 'prefill';
+document.getElementById('title').textContent =
+  D.title + (IS_PREFILL ? '  -- PREFILL' : '  -- DECODE');
 document.getElementById('sub').textContent =
-  `baked ${D.n_tokens_baked} tokens | ${D.gpu.length} GPU slices | `+
+  (IS_PREFILL ? `prefill: 1 forward pass` : `baked ${D.n_tokens_baked} tokens`)+
+  ` | ${D.gpu.length} GPU slices | `+
   `${D.cpu.length} HIP calls | window GPU-busy ${fmtms(D.busy_ns)} / span `+
   `${fmtms(D.span_ns)}` + (D.has_pmc ? '' : ' | NO PMC (uncolored)') +
   (D.map_stats ? ` | GGUF map ${D.map_stats.mapped}/${D.map_stats.total} matvec `+
     `(${D.map_stats.pct}%)` : '') +
-  (D.clean_tps ? ` | clean decode ${D.clean_tps.tps.toFixed(1)}`+
+  (D.clean_tps ? ` | clean ${IS_PREFILL ? 'prefill' : 'decode'} `+
+    `${D.clean_tps.tps.toFixed(1)}`+
     (D.clean_tps.sd!=null ? ` +/- ${D.clean_tps.sd.toFixed(1)}` : '')+
-    ` tok/s (untraced)` : '');
+    ` tok/s (untraced)` : '') +
+  (D.ttft_est_ms!=null ? ` | TTFT (est) ${D.ttft_est_ms.toFixed(1)} ms` : '');
 document.getElementById('cpunote').textContent = D.has_cpu ? '' :
   '(no --hip-csv supplied: CPU lane empty)';
 document.getElementById('bwnote').textContent = D.has_bw ?
@@ -2670,12 +2759,25 @@ function renderSelectedKernel(){
   // "Run Trace" (live-server only): ALWAYS re-runs ATT on a board, wiping any on-disk
   // att-<sym>/ first. Sits next to "Open Trace View"; the fix for on-disk traces that
   // lack DWARF source lines (rebuild device code with -g, then click Run Trace).
+  // batch selector for the trace: 1 = decode (mmvq), >1 = prefill (MMQ). Only shown
+  // for order-mapped matvec kernels (which carry a shape); lets one server trace both.
+  const hasShape = !!(s.map && s.map.K && (s.map.launchN||s.map.trueN));
+  const batchSel = (D.att_server && hasShape)
+    ? `<label style="flex:0 0 auto;font-size:12px;color:#9fb0c4;display:inline-flex;`+
+      `align-items:center;gap:4px">batch `+
+      `<select id="attbatch" title="1 = decode (mmvq); >1 = prefill tokens (routes to MMQ)" `+
+      `style="background:#1f2733;color:#d7dde5;border:1px solid #3a4553;border-radius:3px;`+
+      `padding:2px 6px;font-size:12px">`+
+      `<option value="1">1 (decode)</option><option value="128">128</option>`+
+      `<option value="256">256</option><option value="512">512 (prefill)</option>`+
+      `</select></label>`
+    : ``;
   const retraceBtn = D.att_server
     ? `<button id="attretrace" title="run ATT on a free board, discarding the on-disk `+
       `trace first (use when the existing trace lacks DWARF source lines)" `+
       `style="cursor:pointer;background:#5c3a1f;color:#f5ead6;border:1px solid #7d5a2f;`+
       `border-radius:3px;padding:3px 12px;font-size:12px;flex:0 0 auto;`+
-      `white-space:nowrap">Run trace</button>`+
+      `white-space:nowrap">Run trace</button>`+batchSel+
       `<span id="attstatustop" class="r" style="flex:1 1 100%;color:#c8d0da;`+
       `display:none;font-size:12px"></span>`
     : ``;
@@ -2878,12 +2980,18 @@ function renderSelectedKernel(){
   const cp=document.getElementById('attcopy');
   if(cp) cp.onclick=()=>copyCmd(cmd);
   const rt=document.getElementById('attretrace');
-  // shape-exact matvec target from the order-mapped weight (quant + K + N), so the
-  // live trace captures THIS dispatch's real dims (server injects it via the patched
-  // test-backend-ops). null for non-mapped kernels -> server falls back to its runner.
-  const tshape=(s.map && s.map.K && (s.map.launchN||s.map.trueN))
-    ? {q:s.map.q, K:s.map.K, N:(s.map.launchN||s.map.trueN)} : null;
-  if(rt) rt.onclick=()=>traceKernelLive(sym, s.fam, true, tshape);
+  // shape-exact matvec target from the order-mapped weight (quant + K + N), plus a
+  // batch b read from the selector at click time (1=decode/mmvq, >1=prefill/MMQ), so
+  // the live trace captures the real dims. null for non-mapped kernels -> server
+  // falls back to its runner.
+  if(rt) rt.onclick=()=>{
+    if(!(s.map && s.map.K && (s.map.launchN||s.map.trueN))){
+      traceKernelLive(sym, s.fam, true, null); return; }
+    const be=document.getElementById('attbatch');
+    const b=be?(+be.value||1):1;
+    traceKernelLive(sym, s.fam, true,
+      {q:s.map.q, K:s.map.K, N:(s.map.launchN||s.map.trueN), b:b});
+  };
   const db=document.getElementById('attdbg');
   if(db) db.onclick=()=>openDebugView(s.fam);
 }
@@ -3573,6 +3681,13 @@ tb.querySelectorAll('tr').forEach(tr=>{
     (useClean?`<tr><td colspan="3">clean token time (untraced)</td><td>${fmtdur(cleanTokNs)}</td></tr>`:``)+
     `<tr><td colspan="3">${gapLabel}</td><td>${fmtdur(gapPerTok)}</td></tr>`+
     `<tr><td colspan="3">avg CP Transition Gap/kernel</td><td>${fmtdur(avgGap)}</td></tr>`;
+  // Prefill: TTFT floor (n_prompt / clean pp, matching the regression harness's
+  // ttft_ms_estimate). Untraced prompt-eval GPU floor, excludes tokenize/sample.
+  if (D.ttft_est_ms!=null){
+    rows +=
+      `<tr><td colspan="3">TTFT (est, n_prompt / clean pp)</td>`+
+      `<td>${D.ttft_est_ms.toFixed(1)} ms</td></tr>`;
+  }
   if (D.has_bw){
     const totMB = D.summary.reduce((a,r)=>a+(r.mb_tok||0),0);
     rows +=

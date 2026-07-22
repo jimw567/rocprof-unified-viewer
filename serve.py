@@ -115,9 +115,15 @@ def _run_att_on_host(host, sym, out_dir, shape=None):
                           "collect-att.sh")
     with open(script) as fh:
         script_src = fh.read()
+    # The ATT kernel-symbol filter. For prefill (batch>1) the GEMM routes to
+    # mul_mat_q (MMQ), a different symbol than the decode mul_mat_vec_q; use a broad
+    # "mul_mat" regex so whichever kernel the batch routes to is captured.
+    kern_regex = sym
+    if int((shape or {}).get("b") or 1) > 1:
+        kern_regex = "mul_mat"
     # Args after `--` become $1.. for `bash -s`. sym is allowlist-validated; quote
     # everything anyway. Never shell=True.
-    sh_args = ["--", "--kernel", sym,
+    sh_args = ["--", "--kernel", kern_regex,
                "--build-dir", _ARGS.build_dir,
                "--out-dir", out_dir,
                "--rocm", _ARGS.rocm]
@@ -126,29 +132,27 @@ def _run_att_on_host(host, sym, out_dir, shape=None):
         # runner string is passed as one collect-att.sh arg (it word-splits it);
         # --model / --bench-flags do not apply in this mode.
         runner = _ARGS.runner
-        # Shape-exact matvec: if the selected family carries a quant + K + N and the
-        # runner is test-backend-ops, target that exact MUL_MAT case.
+        # Shape-exact MUL_MAT: the selected family's quant + K + N, and an optional
+        # batch (b): b=1 is decode (routes to mmvq); b>1 is prefill (routes to MMQ
+        # mul_mat_q). Injected via GGML_ATT_MULMAT into the patched test-backend-ops
+        # and selected with a -p filter on the exact dims.
         q = (shape or {}).get("q")
         K = (shape or {}).get("K")
         N = (shape or {}).get("N")
+        b = int((shape or {}).get("b") or 1)
         ti = _GGML_TYPE_INT.get(str(q).upper()) if q else None
         if ti and K and N and "test-backend-ops" in runner and "-o MUL_MAT" in runner:
-            # Override the configured runner with a shape-exact PERF run: the env var
-            # injects the case; -p selects it by its unique dims (m=N,n=1,k=K). Perf
-            # mode runs thousands of iterations so the ATT capture survives cutoff
-            # (test mode's single dispatch gets truncated). Filter on dims only --
-            # the quant is pinned by GGML_ATT_MULMAT, and vars() prints the quant tag
-            # mixed-case which a regex would miss. NO quotes around the -p value:
-            # collect-att.sh word-splits the runner string (WORKLOAD=($RUNNER)), so
-            # quotes would become literal chars; the value has no spaces so bare works.
+            # Override with a shape-exact PERF run: the env var injects the case, -p
+            # selects it by its unique dims (m=N,n=b,k=K). Perf mode runs many
+            # iterations so the ATT capture survives cutoff. Bare -p value (no quotes:
+            # collect-att.sh word-splits the runner string).
             base = runner.split(" -p ")[0]
-            runner = '%s -p m=%d,n=1,k=%d' % (base, int(N), int(K))
+            runner = '%s -p m=%d,n=%d,k=%d' % (base, int(N), b, int(K))
             sh_args += ["--runner-env",
-                        "GGML_ATT_MULMAT=%d,%d,%d" % (ti, int(K), int(N))]
-            # DISABLE HIP graphs: test-backend-ops perf wraps the repeated launches in
-            # a HIP graph, so ATT sees one opaque graphLaunch and can't thread-trace
-            # the kernel (-> 0 populated dispatches). Stream mode makes each launch a
-            # visible dispatch ATT can capture. Essential for the single-shape run.
+                        "GGML_ATT_MULMAT=%d,%d,%d,%d" % (ti, int(K), int(N), b)]
+            # DISABLE HIP graphs: perf mode wraps launches in a HIP graph, so ATT sees
+            # one opaque graphLaunch and can't thread-trace (0 populated dispatches).
+            # Stream mode makes each launch a visible dispatch ATT can capture.
             sh_args += ["--runner-env", "GGML_CUDA_DISABLE_GRAPHS=1"]
         sh_args += ["--runner", runner]
     else:

@@ -70,6 +70,21 @@ Outputs land under `./run/{trace,stall,fetch}/<host>/*.csv` and
 `./run/loadwidth.json`. `collect.sh` prints the exact `rocprof-unified-viewer`
 command to run next.
 
+By default `collect.sh` collects a **decode** workload (`-p 0 -n <-n>`). To
+profile **prefill** (prompt processing) instead, pass `--prompt N` -- every run
+switches to `-p N -n 0` (one forward pass; `-n`/`--pmc-n` no longer apply) and
+`clean_tps.txt` then holds prompt-processing tp (pp), not decode tg. Feed the
+trace to the viewer with `--mode prefill` (the printed command already does):
+
+```bash
+./collect.sh \
+    --build-dir /path/to/llamacpp-build \
+    --model     /path/to/Model-Q4_K_M.gguf \
+    --out-dir   ./run-prefill \
+    --prompt    128 \
+    -- -fa 1 -r 1
+```
+
 For the optional per-instruction stall layer, [`collect-att.sh`](collect-att.sh)
 captures + decodes a single kernel's thread trace (`--att-dir` input); see
 [ATT thread-trace stalls](#att-thread-trace-stalls---att-dir).
