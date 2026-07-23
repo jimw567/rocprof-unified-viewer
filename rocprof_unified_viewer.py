@@ -2422,10 +2422,12 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
   table{width:100%;border-collapse:collapse;font-size:11px;}
   th,td{padding:3px 6px;text-align:right;border-bottom:1px solid var(--line);}
   th:first-child,td:first-child{text-align:left;}
-  /* Summary (family) table: fixed layout + wrap the family cell anywhere so a
-     no-break 290-char Tensile name wraps rather than forcing the pane wide. */
-  #tbl{table-layout:fixed;}
-  #tbl td:first-child,#tbl th:first-child{overflow-wrap:anywhere;word-break:break-word;}
+  /* Summary (family) table: keep the default AUTO layout (columns size to content,
+     which reads well) -- but cap ONLY the family cell so a pathological ~290-char
+     Tensile name wraps within a bounded width instead of forcing the whole pane wide.
+     The numeric columns stay content-sized. */
+  #tbl td:first-child,#tbl th:first-child{max-width:200px;overflow-wrap:anywhere;
+    word-break:break-word;}
   th{color:var(--dim);font-weight:600;position:sticky;top:0;background:var(--panel);}
   /* Selected-kernel detail: keep label + value adjacent (not pushed to the two
      edges of the pane like the full-width family table). */
@@ -2857,14 +2859,18 @@ const tb = document.querySelector('#tbl tbody');
 document.getElementById('tblcnt').textContent = IS_PREFILL ? 'cnt/fwd' : 'cnt/tok';
 document.getElementById('tblmet').textContent  = IS_PREFILL ? 'TOPS%' : 'time%';
 document.getElementById('tblmet2').textContent = IS_PREFILL ? 'time%' : 'BW%';
+// compact stall labels so the column fits without wrapping (full word in the title).
+const STALL_ABBR = {memory:'mem',compute:'comp',occupancy:'occu',lds:'lds',
+  copy:'copy',unknown:'?'};
 tb.innerHTML = D.summary.map(r=>{
   const col = D.colors[r.stall]||D.colors.unknown;
   // prefill: [TOPS%][time%]; decode: [time%][BW%]. A dash when the metric is N/A
   // (unmapped family has no TOPS; no-FETCH run has no BW%).
   const m1 = IS_PREFILL ? (r.tops_pct? r.tops_pct : '-') : r.busy_pct;
   const m2 = IS_PREFILL ? r.busy_pct : (r.bw_pct? r.bw_pct : '-');
+  const sab = STALL_ABBR[r.stall]||r.stall;
   return `<tr data-fam="${r.fam}"><td><span class="fam-dot" style="background:${col}"></span>${r.fam}</td>`+
-    `<td>${r.per_tok}</td><td>${m1}</td><td>${m2}</td><td>${r.stall}</td></tr>`;
+    `<td>${r.per_tok}</td><td>${m1}</td><td>${m2}</td><td title="${r.stall}">${sab}</td></tr>`;
 }).join('');
 // selection: a table row selects a FAMILY (dims other families); a click on the
 // timeline selects a SINGLE kernel (bright outline) and shows its details below.
