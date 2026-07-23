@@ -400,6 +400,41 @@ These are baked into `collect.sh`, but if you run rocprofv3 by hand:
 - Timing is only trustworthy from the clean `--sys-trace` run; PMC/FETCH runs
   serialize kernels and are used only for per-family counter values.
 
+## Provenance & versioning
+
+Every generated overlay embeds a provenance stamp (`payload.provenance`) and shows it
+in a small footer under the sub-header:
+
+```
+rocprof-unified-viewer v0.1.0 (a1b2c3d) | generated 2026-07-23 21:34 UTC on <host> | py3.12
+```
+
+It records the generator `version`, the short git commit (`git_sha`, suffixed `-dirty`
+if the working tree had uncommitted changes), the UTC build time, the machine that
+generated it, and the Python version. This makes any shared HTML self-identifying: when
+someone reports a bug against an `overlay.html`, the footer says exactly what produced
+it -- no guessing which version a user vs. a maintainer was running.
+
+Everything is computed locally at generation time; nothing phones home (the tool is
+used on air-gapped boards). Running the script from outside a git checkout is fine --
+`git_sha` falls back to `unknown`.
+
+**Bumping the version:** update BOTH `__version__` at the top of
+`rocprof_unified_viewer.py` and `version` in `pyproject.toml` in the same commit. Bump
+when the output format or a user-visible behavior changes.
+
+## Contributing
+
+- **ASCII only.** All source, output, and docs use plain ASCII (`-`, not en/em-dashes
+  or smart quotes). CI fails on any non-ASCII byte in the tracked `.py` files.
+- **Before pushing:** run `python3 -m py_compile rocprof_unified_viewer.py serve.py
+  disasm_loadwidth.py` and `pytest tests/ -q`. Both are gated in CI on every PR.
+- **CI** (`.github/workflows/ci.yml`) runs on GitHub-hosted runners with no GPU: it
+  compiles the modules, checks ASCII purity, and smoke-generates an overlay from the
+  trimmed CSV fixtures in `tests/fixtures/`, asserting the pipeline still produces a
+  well-formed HTML.
+- Open a PR against `main`; keep the version stamp in mind (bump when behavior changes).
+
 ## License
 
 MIT. See [LICENSE](LICENSE).

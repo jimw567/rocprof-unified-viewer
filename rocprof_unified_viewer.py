@@ -52,12 +52,21 @@ import argparse
 import base64
 import copy
 import csv
+import datetime
 import json
 import os
+import platform
 import re
+import socket
 import statistics
+import subprocess
 import sys
 from collections import defaultdict
+
+# Generator version. Bump alongside pyproject.toml's [project] version when the
+# output format or a user-visible behavior changes -- it is stamped into every
+# overlay (payload["provenance"]) so a shared HTML self-identifies what produced it.
+__version__ = "0.1.0"
 
 try:
     from isa_glossary import ISA_GLOSSARY, REG_GLOSSARY, CONCEPT_GLOSSARY
@@ -65,6 +74,36 @@ except ImportError:
     ISA_GLOSSARY = {}
     REG_GLOSSARY = {}
     CONCEPT_GLOSSARY = {}
+
+
+def _provenance():
+    """Build-provenance stamp embedded in every overlay so a shared HTML says exactly
+    what produced it (version, git commit, when, which machine). All best-effort: a
+    loose script outside a git checkout still generates, just with git_sha 'unknown'."""
+    sha = "unknown"
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        sha = subprocess.check_output(
+            ["git", "-C", here, "rev-parse", "--short", "HEAD"],
+            stderr=subprocess.DEVNULL).decode().strip() or "unknown"
+        dirty = subprocess.check_output(
+            ["git", "-C", here, "status", "--porcelain"],
+            stderr=subprocess.DEVNULL).decode().strip()
+        if dirty:
+            sha += "-dirty"
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        host = socket.gethostname()
+    except OSError:
+        host = "unknown"
+    return {
+        "version": __version__,
+        "git_sha": sha,
+        "generated_utc": datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
+        "host": host,
+        "python": platform.python_version(),
+    }
 
 
 # --- stall classification thresholds (tunable) --------------------------------
@@ -2129,6 +2168,7 @@ def build_payload(args):
 
     payload = {
         "title": title,
+        "provenance": _provenance(),
         "mode": args.mode,
         "ttft_est_ms": ttft_est_ms,
         "kernel_csv": args.kernel_csv,
@@ -2257,6 +2297,7 @@ def build_bundle(args):
         return primary
     alt = build_payload(_alt_args(args))
     return {"multi": True,
+            "provenance": primary.get("provenance"),
             "default_mode": primary["mode"],
             "payloads": {primary["mode"]: primary, alt["mode"]: alt}}
 
@@ -2422,6 +2463,7 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
       border:1px solid #3a3f4d;border-radius:6px;padding:3px 8px;font-size:13px;"></select>
   </h1>
   <div class="sub" id="sub"></div>
+  <div class="sub" id="provfoot" style="margin-top:2px;opacity:.65;font-size:10px"></div>
 </header>
 <div class="wrap">
   <div class="left">
@@ -2574,6 +2616,12 @@ document.getElementById('sub').textContent =
     (D.clean_tps.sd!=null ? ` +/- ${D.clean_tps.sd.toFixed(1)}` : '')+
     ` tok/s (untraced)` : '') +
   (D.ttft_est_ms!=null ? ` | TTFT (est) ${D.ttft_est_ms.toFixed(1)} ms` : '');
+// Provenance footer: what generated THIS overlay (version, git commit, when, host) --
+// so a shared HTML self-identifies. Read from bundle top-level or the active payload.
+(function(){var p=(RAW&&RAW.provenance)||D.provenance;if(!p)return;
+  document.getElementById('provfoot').textContent=
+    'rocprof-unified-viewer v'+(p.version||'?')+' ('+(p.git_sha||'unknown')+') | generated '+
+    (p.generated_utc||'?')+' on '+(p.host||'?')+' | py'+(p.python||'?');})();
 document.getElementById('cpunote').textContent = D.has_cpu ? '' :
   '(no --hip-csv supplied: CPU lane empty)';
 document.getElementById('bwnote').textContent = IS_PREFILL ?
