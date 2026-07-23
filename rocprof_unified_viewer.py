@@ -100,7 +100,8 @@ def _provenance():
     return {
         "version": __version__,
         "git_sha": sha,
-        "generated_utc": datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC"),
+        "generated_utc": datetime.datetime.now(datetime.timezone.utc)
+                                 .strftime("%Y-%m-%d %H:%M UTC"),
         "host": host,
         "python": platform.python_version(),
     }
