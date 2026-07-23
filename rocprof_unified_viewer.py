@@ -2354,7 +2354,16 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
   .sub{color:var(--dim);font-size:11px;}
   .wrap{display:flex;gap:12px;padding:12px 16px;align-items:flex-start;}
   .left{flex:1 1 auto;min-width:0;}
-  .right{flex:0 0 430px;}
+  /* Cap the right pane so a pathological kernel name (e.g. a ~290-char Tensile
+     family) can't blow the summary table out to ~2000px and squeeze the timeline
+     to zero. min-width:0 lets the flex item shrink; the table + cell rules below
+     wrap the long name instead of forcing intrinsic width. */
+  .right{flex:0 0 430px;max-width:430px;min-width:0;}
+  /* Narrow (Windows) viewports: stack the panes instead of side-by-side. */
+  @media (max-width:900px){
+    .wrap{flex-direction:column;}
+    .right{flex:1 1 auto;max-width:none;width:100%;}
+  }
   .bar{display:flex;align-items:center;gap:14px;margin:6px 0 10px;flex-wrap:wrap;}
   button{background:#2a2e3a;color:var(--fg);border:1px solid #3a3f4d;border-radius:6px;
          padding:5px 12px;cursor:pointer;font-size:12px;}
@@ -2371,6 +2380,10 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
   table{width:100%;border-collapse:collapse;font-size:11px;}
   th,td{padding:3px 6px;text-align:right;border-bottom:1px solid var(--line);}
   th:first-child,td:first-child{text-align:left;}
+  /* Summary (family) table: fixed layout + wrap the family cell anywhere so a
+     no-break 290-char Tensile name wraps rather than forcing the pane wide. */
+  #tbl{table-layout:fixed;}
+  #tbl td:first-child,#tbl th:first-child{overflow-wrap:anywhere;word-break:break-word;}
   th{color:var(--dim);font-weight:600;position:sticky;top:0;background:var(--panel);}
   /* Selected-kernel detail: keep label + value adjacent (not pushed to the two
      edges of the pane like the full-width family table). */
@@ -2852,84 +2865,142 @@ function toggleSlice(sl){
   tb.querySelectorAll('tr').forEach(tr=>tr.classList.toggle('sel', fams.has(tr.dataset.fam)));
   updateDetail(); draw();
 }
-// Rule-based per-kernel bottleneck verdict. Thresholds are heuristics tuned on
-// gfx1151 decode traces; the verdict is a HINT shown beside the raw numbers, not
-// a replacement for them. Priority order matters: DRAM-bound is tested before
-// VALU-bound because BW-bound matvec kernels also read ALU>100% (VALU cycles
-// count across 4 SIMDs/CU), so ALU alone would mislabel them.
-function diagnose(fc,famName){
+// Rule-based per-kernel bottleneck verdict, framed as a POSITION on Hashem's
+// GEMM optimization ladder (see docs/MatMulGuide): the binding limiter walks
+// coalescing -> data-bus width -> register spilling -> register-file->math
+// bandwidth -> raw compute. The verdict names the rung + the guide's next step,
+// as a HINT beside the raw numbers, not a replacement. Priority matters: spilling
+// first (it masks everything), then DRAM (BW-bound matvec also reads VALU>100%
+// since VALU cycles count across 4 SIMDs/CU, so ALU alone would mislabel it).
+// Only true GEMM/matvec families get the reg-file->math + systolic-MMA advice --
+// the guide's ladder is a dot-product-over-K story; norms/copies/rope are not.
+function isMatmul(fam){var f=(fam||'').toLowerCase();
+  return f.indexOf('mul_mat')>=0;}
+function diagnose(fc,famName,ofetch){
   if(!fc) return null;
   // OccupancyPercent is intentionally NOT used: it is a derived SQ metric and is
   // unreliable on gfx1151 (SQ mis-attribution -> impossible >100% values).
   const ea=+fc.ea||0, alu=+fc.alu||0, l2=+fc.l2||0,
         bw=+fc.bw_pct||0, scr=+fc.scratch||0, vg=+fc.vgpr||0, tp=+fc.tops_pct||0;
+  const of=+ofetch||0;
   const lw=fc.loadw||{}, lane=+lw.dominant_lane_bytes||0;
   const havePmc = (fc.ea!==undefined) && (ea||alu||(+fc.mem||0));
-  if(scr>0) return {c:'#ff6b6b',t:'REGISTER SPILLING',
-    a:`spilling ${scr}B to scratch -- cut live VGPRs (split kernel / reduce unroll) `+
-      `to stop spill/fill traffic.`};
-  // Prefill: lead with the achieved-TOPS roofline. Near peak -> done. Below peak, the
-  // WHY for a QUANTIZED MMQ GEMM is usually the dequant/convert path, not the matmul:
-  // ATT shows most VALU stall in v_fma_mix + v_cvt_f32_i32 (dequant + int32->f32),
-  // with the actual v_wmma only a small slice. So low TOPS% with high ALU (VALU busy)
-  // = DEQUANT/CONVERT-BOUND even when EA (DRAM iface) reads high (the interface stays
-  // busy streaming weights, but execution time is the on-chip conversion math).
+  const mm = isMatmul(famName);
+  // FETCH_SIZE/theoretical-bytes BW% is unreliable for tiny glue kernels: >100% is
+  // physically impossible, so flag high values low-confidence and soften "cut bytes".
+  const bwBad = bw>105;
+  const bwtxt = bwBad ? `${bw}% peak BW (low-confidence: >100%, byte model unreliable here)`
+              : (bw?`${bw}% of peak BW`:``);
+  // rung 3: spilling wins outright -- spill/fill traffic masks the true limiter.
+  if(scr>0) return {c:'#ff6b6b',t:'[3] REGISTER SPILLING',
+    a:`spilling ${scr}B to scratch. Guide step 5/6: cut live VGPRs (bound the unroll, `+
+      `split the kernel) before anything else -- spill/fill traffic hides the real limiter.`};
+  // Over-fetch (measured DRAM bytes / packed weight bytes) is a REFINEMENT, not a
+  // primary rung -- it is only the actionable lever when the kernel is actually
+  // memory-bound. On a compute/VALU-bound kernel, high over-fetch is real but NOT the
+  // binding limit, so it is appended as a secondary note (ofNote) instead of the verdict.
+  // Its meaning also depends on regime:
+  //  * matvec (M=1, no weight reuse): each weight byte read once, so over-fetch > 1 is
+  //    wasted traffic = partial-line / uncoalesced access. Clean kernels sit ~1.0-1.07.
+  //  * GEMM (B>1): weight reused across B cols + re-touched across tiles, so over-fetch
+  //    conflates coalescing with cache reuse (can be <1.0!) and tile-granularity waste.
+  //    High here = REDUNDANT DRAM TRAFFIC -> bigger grouped tiles (guide step 7).
+  const matvec = (famName||'').toLowerCase().indexOf('mul_mat_vec')>=0;
+  const gemm = mm && !matvec;
+  const ofHot = (matvec && of>=1.15) || (gemm && of>=2);
+  const ofNote = ofHot
+    ? (matvec
+        ? ` Secondary: over-fetch ${of}x -- this matvec reads each weight once, so the `+
+          `extra bytes are uncoalesced/partial-line traffic (guide step 1-3: swizzle / `+
+          `LDS-stage, widen chunks)${(lane&&lane<16)?`, and loads are ${lane}B/lane (<16B)`:``}.`
+        : ` Secondary: over-fetch ${of}x -- this GEMM re-reads the weight from DRAM `+
+          `(tile-granularity waste / poor reuse, guide step 7: bigger grouped tiles staged `+
+          `to LDS). Not the binding limit here.`)
+    : ``;
+  // Prefill: lead with the achieved-TOPS roofline. Below peak, a QUANTIZED MMQ GEMM
+  // is usually reg-file->math (VALU) bound on the dequant/convert path, not the matmul.
   if(IS_PREFILL && tp){
-    if(tp>=60) return {c:'#8fe388',t:'COMPUTE-BOUND (near peak)',
-      a:`${tp}% of ${D.peak_tops} TOPS peak (B=${D.compute_batch}) -- near the roofline; `+
-        `little headroom without a faster kernel.`};
-    // ATT confirmation: if the traced stall is dominated by dequant/convert VALU ops.
+    if(tp>=60) return {c:'#8fe388',t:'[5] RAW COMPUTE (near peak)',
+      a:`${tp}% of ${D.peak_tops} TOPS peak (B=${D.compute_batch}) -- top rung, near the `+
+        `roofline; only a faster kernel/dtype helps.`};
     var att=(D.att_by_fam||{})[famName]||null;
-    if(alu>=90) return {c:'#ffb454',t:'VALU-BOUND (dequant/convert)',
-      a:`${tp}% of ${D.peak_tops} TOPS peak but VALU ${alu}% busy. On RDNA3.5 the WMMA `+
-        `matmul runs ON the VALU (v_wmma_* are VALU ops), and it shares that one vector `+
-        `ALU with the dequant + int32->f32 conversion (v_fma_mix, v_cvt_f32_i32) -- which `+
-        `dominate the VALU cycles, so the matmul itself is a small slice. EA ${ea}% (DRAM `+
-        `iface busy streaming weights/over-fetch, not the binding limit). Lever: cheaper `+
-        `dequant/convert to free VALU for the matmul, not more BW or tiling.`+
-        (att?` ATT traced -- see the utilization view (VALU:WMMA vs VALU:other).`:` (trace with ATT to confirm.)`)};
-    if(ea<70) return {c:'#ffb454',t:'COMPUTE-UNDERUTILIZED',
-      a:`only ${tp}% of ${D.peak_tops} TOPS peak with EA (DRAM iface) ${ea}% and VALU `+
-        `${alu}% -- compute left on the table (tiling / occupancy / low-ILP).`};
-    // low TOPS% + EA high + VALU not busy -> genuinely BW-bound; use the DRAM rules below.
+    if(alu>=90){
+      if(mm) return {c:'#ffb454',t:'[4] REGISTER-FILE -> MATH BANDWIDTH',
+        a:`${tp}% of ${D.peak_tops} TOPS peak but VALU ${alu}% busy. Guide step 6.a: the `+
+          `VALU is saturated feeding packed FMA/convert from the register file -- the `+
+          `reg-file->math ceiling the guide fixes with systolic MMA (reuse A/B tiles from `+
+          `math-unit storage). Caveat (Q4_K): on RDNA3.5 WMMA IS VALU and the dequant math `+
+          `(v_fma_mix, v_cvt_f32_i32) stays on the VALU, so systolic does not remove the `+
+          `dequant ceiling -- cheaper dequant/convert is the real lever.`+
+          (att?` ATT traced -- see the utilization view (VALU:WMMA vs VALU:other).`:` (trace with ATT to confirm.)`)+ofNote};
+      return {c:'#ffb454',t:'VALU-BOUND',
+        a:`VALU ${alu}% busy (across 4 SIMDs) at ${tp}% TOPS. Not a GEMM -- the guide's `+
+          `systolic-MMA fix does not apply; look for redundant / low-throughput math here.`+ofNote};
+    }
+    if(ea<70) return {c:'#ffb454',t:'[4-] COMPUTE UNDERUTILIZED',
+      a:`only ${tp}% of ${D.peak_tops} TOPS peak, EA ${ea}%, VALU ${alu}% -- compute left `+
+        `on the table (guide step 4/5: raise N-tile / occupancy / ILP, watch for spilling).`};
   }
   if(!havePmc){
-    if(IS_PREFILL && tp) return {c:'#8fe388',t:'COMPUTE',
+    if(IS_PREFILL && tp) return {c:'#8fe388',t:'[5?] RAW COMPUTE (unconfirmed)',
       a:`${tp}% of ${D.peak_tops} TOPS peak (B=${D.compute_batch}); no PMC counters for `+
         `this family (not in the --pmc set) so the bottleneck is unconfirmed.`};
-    if(bw) return {c:'#7fd1ff',t:'DRAM TRAFFIC',
-      a:`achieved ${bw}% of peak BW; no PMC counters for this family (not in the `+
-        `--pmc set) so the bottleneck is unconfirmed.`};
+    if(bw) return {c:'#7fd1ff',t:'DRAM TRAFFIC (unconfirmed)',
+      a:`achieved ${bwtxt}; no PMC counters for this family (not in the --pmc set) so the `+
+        `bottleneck is unconfirmed.`};
     return null;
   }
-  if(ea>=85 || bw>=80){
-    // "widen loads" only helps when the DRAM interface is busy but NOT
-    // delivering peak BW (bw<75) -- a sign of partial-line/uncoalesced access
-    // that wider loads can fix. Near peak (e.g. Q6_K at 96%), narrow loads are
-    // fine and the only lever is moving fewer bytes, so don't suggest it.
-    const widen = (bw && bw<75 && lane && lane<16)
-      ? ` Loads are ${lane}B/lane and BW is only ${bw}% of peak: try widening to `+
-        `16B/b128 to coalesce fuller cache lines.` : ``;
-    return {c:'#7fd1ff',t:'DRAM-BOUND',
-      a:`EA (DRAM iface) ${ea}%${bw?`, ${bw}% of peak BW`:''}, L2 hit ${l2}% -- streaming `+
-        `from DRAM. Occupancy/VGPR won't help; cut bytes moved (better quant, fusion).`+widen};
+  // rung M: DRAM-bound. Gate on EA (DRAM-interface busy, reliable) rather than the
+  // unreliable BW% for tiny kernels; near-peak BW means bytes, not coalescing.
+  if(ea>=85 || (bw>=80 && !bwBad)){
+    // "widen loads" only helps when the interface is busy but NOT delivering peak BW
+    // (bw<75) -- partial-line/uncoalesced access wider loads can fix. Near peak, narrow
+    // loads are fine and the only lever is moving fewer bytes.
+    const widen = (bw && !bwBad && bw<75 && lane && lane<16)
+      ? ` Loads are ${lane}B/lane at only ${bw}% BW -> widen to 16B/b128 (guide step 2: `+
+        `fuller cache lines).` : ``;
+    // On a memory-bound kernel, over-fetch IS the actionable lever -> lead with it.
+    const lever = ofHot
+      ? (matvec
+          ? `over-fetch ${of}x means ${of}x the packed bytes are streamed -- uncoalesced/`+
+            `partial-line access; guide step 1-3: swizzle / LDS-stage, widen chunks.`
+          : `over-fetch ${of}x means the weight is re-read ${of}x from DRAM -- tile-`+
+            `granularity waste / poor reuse; guide step 7: bigger grouped tiles staged to LDS.`)
+      : `cut bytes moved (better quant, fusion).`;
+    const regime = mm ? (matvec?`vector-matrix (skinny-GEMM) regime -- streaming B[] is the limit`
+                              :`tiled-GEMM regime, DRAM-bound`)
+                      : `memory-bound`;
+    return {c:'#7fd1ff',t:'[M] MEMORY / DRAM-BOUND',
+      a:`EA (DRAM iface) ${ea}%${bwtxt?`, ${bwtxt}`:''}, L2 hit ${l2}%. Guide: ${regime}; `+
+        `occupancy/VGPR won't help -- ${lever}`+widen};
   }
-  if(alu>=100) return {c:'#ffb454',t:'VALU / COMPUTE-BOUND',
-    a:`ALU ${alu}% (VALU busy across 4 SIMDs) with EA only ${ea}% -- compute-bound. `+
-      `More registers/ILP beats more waves; look for redundant math or low-throughput ops.`};
-  if(vg>96) return {c:'#ffd54a',t:'LOW OCCUPANCY / LATENCY-BOUND',
-    a:`EA ${ea}% / ALU ${alu}% both moderate and VGPR=${vg} (>96/thread for wave32) `+
+  if(alu>=100){
+    if(mm) return {c:'#ffb454',t:'[4] REGISTER-FILE -> MATH / VALU',
+      a:`VALU ${alu}% (across 4 SIMDs) with EA ${ea}%. Guide step 6.a: reg-file->math `+
+        `bandwidth; systolic MMA reuse is the structural fix.`+ofNote};
+    return {c:'#ffb454',t:'VALU-BOUND',
+      a:`VALU ${alu}% (across 4 SIMDs) with EA ${ea}%. Not a GEMM -- systolic MMA does not `+
+        `apply; look for redundant / low-throughput math.`+ofNote};
+  }
+  if(vg>96) return {c:'#ffd54a',t:'[3-] LOW OCCUPANCY / LATENCY-BOUND',
+    a:`EA ${ea}% / VALU ${alu}% both moderate and VGPR=${vg} (>96/thread for wave32) `+
       `caps resident waves -- too few to hide latency. Cut VGPRs to raise occupancy.`};
-  return {c:'#9aa6b2',t:'BALANCED',
-    a:`no single dominant bottleneck: EA ${ea}%, ALU ${alu}%.`};
+  return {c:'#9aa6b2',t:'[=] BALANCED',
+    a:`no single dominant limiter: EA ${ea}%, VALU ${alu}%.`};
 }
 // details panel below the lanes for the single selected kernel
 const dp = document.getElementById('detail');
 function updateDetail(){
-  if(selectedSlices){ renderMultiSelect(); return; }
-  if(selectedSlice){ renderSelectedKernel(); return; }
-  if(selectedFam){ renderFamilyMembers(); return; }
-  dp.style.display='none'; dp.innerHTML='';
+  const had = (selectedSlices||selectedSlice||selectedFam);
+  if(selectedSlices){ renderMultiSelect(); }
+  else if(selectedSlice){ renderSelectedKernel(); }
+  else if(selectedFam){ renderFamilyMembers(); }
+  else { dp.style.display='none'; dp.innerHTML=''; return; }
+  // After a selection renders the detail panel, scroll it into view -- on a narrow
+  // (stacked) viewport the panel sits below the timeline and is otherwise off-screen.
+  if(had && dp.style.display!=='none'){
+    try{ dp.scrollIntoView({behavior:'smooth',block:'nearest'}); }catch(e){ dp.scrollIntoView(); }
+  }
 }
 // Box-selection view: aggregate the selected GPU slices by family (count, summed
 // kernel time, share of the selection) -- a quick "what did I just lasso" summary.
@@ -3246,7 +3317,7 @@ function renderFamilyMembers(){
 }
 function renderSelectedKernel(){
   const s=selectedSlice, fc=D.fam_counters[s.fam]||{};
-  const dg=diagnose(fc,s.fam);
+  const dg=diagnose(fc,s.fam,(s.map&&s.map.overfetch)||0);
   const hasCode = !!((D.att_code_by_fam||{})[s.fam]);
   const dbgBtn = hasCode
     ? `<button id="attdbg" style="cursor:pointer;background:#2a3a52;color:#dbe6f5;`+
@@ -4066,6 +4137,15 @@ function openDebugView(fam){
     `tr.sel td{background:#243044}`+
     `.bar{display:inline-block;height:9px;background:#ff6b6b;border-radius:2px;`+
     `vertical-align:middle}`+
+    // RGP-style latency bar: green = latency hidden by other waves, red = exposed stall.
+    `.lbar{display:inline-block;height:11px;vertical-align:middle;border-radius:2px;`+
+    `overflow:hidden;white-space:nowrap;background:#0d1117}`+
+    `.lhid{display:inline-block;height:100%;background:#3fb950;vertical-align:top}`+
+    `.lexp{display:inline-block;height:100%;background:#ff5555;vertical-align:top}`+
+    `.lcyc{color:#9fb0c4;font-family:monospace;margin-left:6px;font-size:11px}`+
+    `#lview{margin-left:10px;background:#1f2733;color:#d7dde5;border:1px solid #3a4553;`+
+    `border-radius:3px;padding:2px 9px;font-size:12px;cursor:pointer}`+
+    `#lview:hover{background:#2a3340}#lview.on{background:#2a3a52;border-color:#3a5578}`+
     `.hot td.isa{color:#ffd7b0}`+
     `tr.step td{background:#3a2f10 !important;box-shadow:inset 3px 0 #e0b341}`+
     `tr.step td.isa{color:#ffe0a0}`+
@@ -4124,10 +4204,12 @@ function openDebugView(fam){
     `<input id="f" placeholder="filter instructions (e.g. s_waitcnt, global_load)">`+
     `</header>`+
     `<div id="main">`+
-    `<section id="isapane"><div class="phdr">ISA (program order)`+
+    `<section id="isapane"><div class="phdr"><span id="isatitle">ISA (program order)</span>`+
+    `<button id="lview" title="RGP-style: latency bar per instruction, green=hidden by `+
+    `other waves, red=exposed stall; sorted by latency">Latency view</button>`+
     (split?` <span class="hint">click a row to jump to its source line</span>`:``)+
     `<span class="hint">hover an instruction for its ISA description</span>`+
-    `</div><div class="scroll"><table><thead><tr>`+
+    `</div><div class="scroll"><table><thead><tr id="isahead">`+
     (split?`<th class="src">source</th>`:``)+
     `<th>addr</th><th class="isa">ISA</th><th>hits</th><th>latency</th>`+
     `<th>stall</th><th>stall%</th><th>idle</th></tr></thead>`+
@@ -4179,18 +4261,36 @@ function openDebugView(fam){
     `function fstall(f){var s=0;for(var k in LA){if(k.indexOf(f+':')===0)s+=LA[k].st;}return s;}`+
     `FILES.sort(function(x,y){return fstall(y)-fstall(x);});`+
     `var curFile=FILES[0]||'';`+
+    `var LMODE=false;`+
+    // max latency across rows, for scaling the latency bars (RGP scales to the worst).
+    `var maxLat=0;for(var _i=0;_i<D.rows.length;_i++){var _l=D.rows[_i].lat||0;if(_l>maxLat)maxLat=_l;}`+
+    `if(maxLat<1)maxLat=1;`+
     `function drawISA(q){q=(q||'').toLowerCase();var tot=D.stall||1,b=[];`+
-    `for(var i=0;i<D.rows.length;i++){var r=D.rows[i];`+
+    // in latency view: iterate rows sorted by latency desc (worst first), like RGP.
+    `var idxs=[];for(var i=0;i<D.rows.length;i++)idxs.push(i);`+
+    `if(LMODE)idxs.sort(function(a,c){return (D.rows[c].lat||0)-(D.rows[a].lat||0);});`+
+    `for(var j=0;j<idxs.length;j++){var i=idxs[j],r=D.rows[i];`+
     `if(q&&r.isa.toLowerCase().indexOf(q)<0)continue;`+
     `var pct=100*(r.st||0)/tot,bw=Math.round(60*(r.st||0)/(D.maxStall||1));`+
-    `b.push('<tr data-idx='+i+' data-key=\"'+esc(r.src||'')+'\" class=\"'+(pct>=5?'hot':'')+'\">'+`+
+    `var tr='<tr data-idx='+i+' data-key=\"'+esc(r.src||'')+'\" class=\"'+(pct>=5?'hot':'')+'\">'+`+
     `(SPLIT?'<td class=src>'+esc(r.src||'')+'</td>':'')+`+
     `'<td class=a>0x'+(r.a||0).toString(16)+'</td>'+`+
-    `'<td class=isa>'+annotIsa(r.isa)+'</td>'+`+
-    `'<td>'+fmtc(r.hit)+'</td><td>'+fmtc(r.lat)+'</td>'+`+
+    `'<td class=isa>'+annotIsa(r.isa)+'</td>';`+
+    `if(LMODE){`+
+    // latency bar: total width scaled to maxLat; green = hidden (lat - stall), red = stall.
+    `var lat=r.lat||0,st=Math.min(r.st||0,lat),hid=lat-st;`+
+    `var W=Math.round(300*lat/maxLat),wS=lat>0?Math.round(W*st/lat):0,wH=W-wS;`+
+    `tr+='<td>'+fmtc(r.hit)+'</td>'+`+
+    `'<td style=\"text-align:left\"><span class=lbar style=\"width:'+W+'px\">'+`+
+    `'<span class=lhid style=\"width:'+wH+'px\"></span>'+`+
+    `'<span class=lexp style=\"width:'+wS+'px\"></span></span>'+`+
+    `'<span class=lcyc>'+fmtc(lat)+' clk'+(st>0?' ('+fmtc(st)+' exp)':'')+'</span></td>';`+
+    `}else{`+
+    `tr+='<td>'+fmtc(r.hit)+'</td><td>'+fmtc(r.lat)+'</td>'+`+
     `'<td>'+fmtc(r.st)+'</td>'+`+
     `'<td>'+pct.toFixed(1)+'% <span class=bar style=\"width:'+bw+'px\"></span></td>'+`+
-    `'<td>'+fmtc(r.idle)+'</td></tr>');}`+
+    `'<td>'+fmtc(r.idle)+'</td>';}`+
+    `b.push(tr+'</tr>');}`+
     `document.getElementById('b').innerHTML=b.join('');bindISA();applyISASel(false);`+
     `if(STEP&&EX!=null)applyStepISA(false);}`+
     `function bindISA(){var rows=document.querySelectorAll('#b tr');`+
@@ -4258,6 +4358,16 @@ function openDebugView(fam){
     `for(var k=EX+dir;k>=0&&k<ES.length;k+=dir){`+
     `var s=D.rows[ES[k][0]]?D.rows[ES[k][0]].src:'';`+
     `if(s&&s!==cur){stepTo(k);return;}}}`+
+    // swap the ISA table header between program-order columns and latency-view columns.
+    `function buildHead(){var hd=document.getElementById('isahead');if(!hd)return;`+
+    `var h=(SPLIT?'<th class=\"src\">source</th>':'')+'<th>addr</th><th class=\"isa\">ISA</th><th>hits</th>';`+
+    `h+=LMODE?'<th style=\"text-align:left\">latency (green=hidden, red=exposed stall)</th>'`+
+    `:'<th>latency</th><th>stall</th><th>stall%</th><th>idle</th>';`+
+    `hd.innerHTML=h;}`+
+    `function setLview(on){LMODE=on;var b=document.getElementById('lview');`+
+    `if(b)b.classList.toggle('on',on);var t=document.getElementById('isatitle');`+
+    `if(t)t.textContent=on?'ISA (by latency)':'ISA (program order)';`+
+    `buildHead();var f=document.getElementById('f');drawISA(f?f.value:'');}`+
     `drawISA('');`+
     // opcode hover tooltip: delegated on the (persistent) ISA tbody so it survives
     // re-render. pointer-events:none on #tip keeps row clicks/step working.
@@ -4286,6 +4396,7 @@ function openDebugView(fam){
     `if(SPLIT){var fs=document.getElementById('file');`+
     `if(fs){fs.value=curFile;fs.onchange=function(){curFile=this.value;renderSrc();};}renderSrc();}`+
     `document.getElementById('f').addEventListener('input',function(e){drawISA(e.target.value);});`+
+    `var _lv=document.getElementById('lview');if(_lv)_lv.onclick=function(){setLview(!LMODE);};`+
     `if(STEP){var _p=document.getElementById('sprev');if(_p)_p.onclick=function(){stepBy(-1);};`+
     `var _n=document.getElementById('snext');if(_n)_n.onclick=function(){stepBy(1);};`+
     `var _lp=document.getElementById('slprev');if(_lp)_lp.onclick=function(){stepLine(-1);};`+
