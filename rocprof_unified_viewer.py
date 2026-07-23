@@ -2422,12 +2422,19 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
   table{width:100%;border-collapse:collapse;font-size:11px;}
   th,td{padding:3px 6px;text-align:right;border-bottom:1px solid var(--line);}
   th:first-child,td:first-child{text-align:left;}
-  /* Summary (family) table: keep the default AUTO layout (columns size to content,
-     which reads well) -- but cap ONLY the family cell so a pathological ~290-char
-     Tensile name wraps within a bounded width instead of forcing the whole pane wide.
-     The numeric columns stay content-sized. */
-  #tbl td:first-child,#tbl th:first-child{max-width:200px;overflow-wrap:anywhere;
-    word-break:break-word;}
+  /* Summary (family) table -- DECOUPLED from the shared auto-layout `table{}` rules
+     (which caused repeated width regressions). Fixed layout with explicit numeric
+     column widths: the 4 value columns get a guaranteed comfortable width (values are
+     <=5 chars: counts, percentages, a short stall abbr), and the family column (no
+     width set) absorbs ALL remaining pane width -- so it is as wide as possible while
+     the numeric columns never wrap. A pathological ~290-char name wraps inside the
+     family column (overflow-wrap) instead of forcing the pane wide. */
+  #tbl{table-layout:fixed;}
+  #tbl td:first-child,#tbl th:first-child{overflow-wrap:anywhere;word-break:break-word;}
+  #tbl th:nth-child(2),#tbl td:nth-child(2),
+  #tbl th:nth-child(3),#tbl td:nth-child(3),
+  #tbl th:nth-child(4),#tbl td:nth-child(4){width:52px;white-space:nowrap;}
+  #tbl th:nth-child(5),#tbl td:nth-child(5){width:50px;white-space:nowrap;}
   th{color:var(--dim);font-weight:600;position:sticky;top:0;background:var(--panel);}
   /* Selected-kernel detail: keep label + value adjacent (not pushed to the two
      edges of the pane like the full-width family table). */
