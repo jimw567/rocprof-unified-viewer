@@ -50,6 +50,7 @@ Example:
 
 import argparse
 import base64
+import copy
 import csv
 import json
 import os
@@ -111,6 +112,12 @@ PEAK_BW_GBS_BY_ARCH = {
 PEAK_TOPS_BY_ARCH = {
     "gfx1151": 43.0,    # Strix Halo, WMMA fp16/int8
 }
+# MMQ prefill GEMM output-row tile height (mmq_y in ggml-cuda/mmq.cuh get_mmq_y_host):
+# the grid tiles the N output rows in blocks of mmq_y along grid.x, so the launched
+# N is recovered as (Grid_Size_X/Workgroup_Size_X) * mmq_y. RDNA3.5 (gfx115x) = 64.
+MMQ_Y_BY_ARCH = {
+    "gfx1151": 64, "gfx1150": 64, "gfx1152": 64, "gfx1153": 64,
+}
 DEFAULT_ARCH = "gfx1151"
 
 
@@ -118,6 +125,10 @@ def peak_bw_for(arch, override=None):
     if override:
         return float(override)
     return PEAK_BW_GBS_BY_ARCH.get(arch, PEAK_BW_GBS_BY_ARCH[DEFAULT_ARCH])
+
+
+def mmq_y_for(arch):
+    return MMQ_Y_BY_ARCH.get(arch, 64)
 
 
 def peak_tops_for(arch, override=None):
@@ -160,11 +171,12 @@ def dominant_stall(counters):
 
 # --- CSV loaders (stdlib only; duplicated on purpose so this file is standalone) --
 
-def load_kernel_slices(path):
+def load_kernel_slices(path, mmq_y=64):
     """Return {stream_id: [(start_ns, end_ns, kernel_name, N), ...] sorted by
     start}. N = Grid_Size_X / Workgroup_Size_X is the launched output-row count
     (one warp/workgroup-row per output row for mul_mat_vec), the join key onto the
-    GGUF weight's true N (ne[1]); 0 when the grid dims are absent/degenerate."""
+    GGUF weight's true N (ne[1]); 0 when the grid dims are absent/degenerate.
+    mmq_y is the MMQ prefill row-tile height used to recover N for mul_mat_q."""
     by_stream = defaultdict(list)
     with open(path) as fh:
         for r in csv.DictReader(fh):
@@ -179,6 +191,13 @@ def load_kernel_slices(path):
                 # 16-aligned decode shapes) so it still order-maps onto its weight.
                 if "wvsplitk" in kname:
                     n *= 16
+                # The mul_mat_q PREFILL GEMM tiles the N output rows in blocks of
+                # mmq_y along grid.x (nty = ceil(nrows_x/mmq_y)); recover launched N
+                # as (grid.x/wg.x)*mmq_y so it order-maps onto its GGUF weight just
+                # like decode's mmvq. (Small-N weights round up to a full mmq_y tile,
+                # so the recovered N shows the row-padding, which is real.)
+                elif "mul_mat_q" in kname:
+                    n *= mmq_y
             except (KeyError, ValueError, TypeError):
                 n = 0
             # Per-dispatch block (workgroup) count = product over grid dims of
@@ -383,17 +402,49 @@ def load_fetch_bytes_mapped(path, expected_seq):
 
 
 def parse_clean_tps(path, kind="tg"):
-    """Parse throughput from collect.sh's clean_tps.txt -- the untraced llama-bench
-    markdown table. Returns {"test": "tg64"/"pp128", "tps": float, "sd": float or
-    None} for the last matching row, or None if the file is missing or unparseable.
-    kind selects which row family to read: "tg" (decode token-generation, default)
-    or "pp" (prefill prompt-processing). This is the honest tok/s -- rocprofv3
-    perturbs the traced runs, so this bare number is what to quote."""
+    """Parse throughput from collect.sh's clean_tps.txt (the untraced llama-bench
+    run). Returns {"test": "tg64"/"pp128", "tps": float, "sd": float or None} for
+    the last matching row, or None if missing/unparseable. kind selects the row
+    family: "tg" (decode) or "pp" (prefill). This is the honest tok/s -- rocprofv3
+    perturbs the traced runs.
+
+    Prefers llama-bench JSON (-o json): takes the MEDIAN of samples_ts, exactly like
+    the llamacpp regression harness (statistics.median(samples_ts)) -- more stable
+    than a single -r 1 sample, whose first rep is often a cold-cache outlier (this is
+    why an -r 1 clean run reported a pp ~25%% low vs the regression's -r 3 median).
+    Falls back to the markdown table (avg +/- sd) for old text-format files."""
     try:
         with open(path, encoding="utf-8", errors="replace") as fh:
             text = fh.read()
     except OSError:
         return None
+    # llama-bench -o json: a list of per-(prompt,gen) rows carrying samples_ts.
+    stripped = text.lstrip()
+    if stripped[:1] in "[{":
+        try:
+            rows = json.loads(stripped)
+        except ValueError:
+            rows = None
+        if rows:
+            want_gen = kind == "tg"   # tg rows have n_gen>0; pp rows n_gen==0
+            best = None
+            for r in rows:
+                if bool(int(r.get("n_gen", 0))) != want_gen:
+                    continue
+                ts = [float(x) for x in (r.get("samples_ts") or [])]
+                if ts:
+                    tps = statistics.median(ts)
+                    sd = statistics.pstdev(ts) if len(ts) > 1 else 0.0
+                elif r.get("avg_ts") is not None:
+                    tps = float(r["avg_ts"])
+                    sd = float(r.get("stddev_ts") or 0.0)
+                else:
+                    continue
+                n = int(r.get("n_prompt", 0)) if kind == "pp" \
+                    else int(r.get("n_gen", 0))
+                best = {"test": "%s%d" % (kind, n), "tps": tps, "sd": sd}
+            return best
+    # Markdown table fallback (older clean_tps.txt without -o json).
     best = None
     row_re = re.compile(r"%s\d+" % kind)
     for line in text.splitlines():
@@ -754,13 +805,30 @@ def load_att_waves(dispatch_dir):
         return rle
 
     waves = []
+    # Aggregate wave-cycles per hardware state across ALL captured waves, from the raw
+    # (un-downsampled) timelines -- the exact wave-occupancy breakdown. States:
+    # 1=Idle, 2=Exec (issuing), 3=Wait (waitcnt / memory), 4=Stall (dependency/backpr).
+    # This is the "what were the waves doing over the kernel" summary: Exec% is useful
+    # issue, Stall% is where dependency/latency piles up (e.g. dequant-convert chains).
+    st_cy = {1: 0, 2: 0, 3: 0, 4: 0}
+    for r in raw:
+        for seg in r[7]:
+            if isinstance(seg, list) and len(seg) >= 2 and seg[1] > 0:
+                st_cy[seg[0]] = st_cy.get(seg[0], 0) + seg[1]
+    st_tot = sum(st_cy.values()) or 1
+    state_mix = {"Idle": st_cy.get(1, 0), "Exec": st_cy.get(2, 0),
+                 "Wait": st_cy.get(3, 0), "Stall": st_cy.get(4, 0),
+                 "total": st_tot,
+                 "pct": {k: round(100.0 * st_cy.get(v, 0) / st_tot, 1)
+                         for k, v in (("Idle", 1), ("Exec", 2), ("Wait", 3), ("Stall", 4))}}
     for se, sm, cu, sl, wv, begin, end, tl in sorted(
             raw, key=lambda r: (r[0], r[1], r[3], r[4])):
         waves.append({"lab": "se%d sm%d sl%d wv%d" % (se, sm, sl, wv),
                       "se": se, "cu": cu, "simd": sm, "slot": sl, "wv": wv,
                       "begin": begin, "end": end, "rle": _rle(begin, tl)})
     return {"t0": t0, "t1": t1, "nb": _WAVE_NB,
-            "states": ["", "Idle", "Exec", "Wait", "Stall"], "waves": waves}
+            "states": ["", "Idle", "Exec", "Wait", "Stall"],
+            "state_mix": state_mix, "n_waves": len(waves), "waves": waves}
 
 
 def _demangle_short(sym):
@@ -789,6 +857,58 @@ def _demangle_short(sym):
     return name
 
 
+def _att_isolate_run(dispatch_dir):
+    """Select the per-wave `se*_wv*.json` files for ONE representative run of the traced
+    kernel, discarding contamination the raw ATT buffer captured around it.
+
+    A shape-exact perf run invokes the kernel thousands of times and the ATT capture
+    window catches: (a) waves from the target mmq kernel, (b) waves from unrelated
+    neighbour kernels (very different instruction counts), and (c) SEVERAL back-to-back
+    generations of the target kernel time-multiplexed onto the traced SIMD. For a clean
+    per-run picture we keep only the DOMINANT-instruction-count kernel (its waves all
+    share one num_insts -- the mmq body) and then only its FIRST time-generation (waves
+    whose begin is within one wave-duration of the earliest such wave). Returns a list
+    of parsed wave dicts (with 'begin','end','timeline','instructions'); [] if none.
+
+    This is what makes the utilization / state-mix numbers reflect a single mmq launch
+    instead of a blend of 3 generations + two foreign kernels."""
+    import glob
+    waves = []
+    for p in glob.glob(os.path.join(dispatch_dir, "se*_sm*_sl*_wv*.json")):
+        try:
+            with open(p) as fh:
+                w = (json.load(fh).get("wave") or {})
+        except (OSError, ValueError):
+            continue
+        ins = w.get("instructions")
+        if ins and w.get("begin") is not None and w.get("end") is not None:
+            waves.append(w)
+    if not waves:
+        return []
+    # (a) dominant kernel = the instruction-count bucket with the most TOTAL work
+    # (sum of instructions), NOT the most waves -- a capture often has many tiny
+    # neighbour-kernel waves (e.g. 186-instr helpers) that outnumber but are dwarfed
+    # by the few heavy mmq-body waves (~18k instr each). Group by num_insts, pick the
+    # bucket maximizing count*num_insts.
+    work = defaultdict(int)
+    for w in waves:
+        work[len(w["instructions"])] += len(w["instructions"])
+    dom_n = max(work, key=work.get)
+    dom = [w for w in waves if len(w["instructions"]) == dom_n]
+    if not dom:
+        return []
+    # (b) first time-generation only: a launch's waves on one SIMD all START within a
+    # few hundred cycles of each other (co-scheduled), while the NEXT generation begins
+    # ~one wave-duration later. Keep waves whose begin is within a small tolerance of
+    # the earliest -- tight enough to exclude the next generation.
+    t_start = min(w["begin"] for w in dom)
+    durs = sorted(w["end"] - w["begin"] for w in dom)
+    med = durs[len(durs) // 2] or 1
+    tol = max(2000, int(med * 0.05))
+    gen0 = [w for w in dom if w["begin"] - t_start <= tol]
+    return gen0 or dom
+
+
 def load_att_occupancy(dispatch_dir):
     """Reconstruct rocprof-compute-viewer's Global View from one decoded ATT
     dispatch dir's `occupancy.json`. Unlike the per-wave `se*_wv*.json` files (which
@@ -810,6 +930,7 @@ def load_att_occupancy(dispatch_dir):
     (a valid placeholder) does not collide with any background sentinel."""
     if not dispatch_dir:
         return None
+    import glob
     path = os.path.join(dispatch_dir, "occupancy.json")
     try:
         with open(path) as fh:
@@ -870,7 +991,154 @@ def load_att_occupancy(dispatch_dir):
         lanes.append({"cu": cu, "simd": simd, "wv": wv, "iv": iv})
     if not lanes:
         return None
-    return {"t0": t0, "t1": t1, "kernels": kernels, "lanes": lanes}
+    # Aggregate wave-state cycles from the per-wave `se*_wv*.json` timelines in the SAME
+    # dispatch dir (occupancy.json has slot residency, not per-cycle state). Each wave's
+    # `timeline` is [[state,cycles],...] with 1=Idle 2=Exec 3=Wait 4=Stall. This gives
+    # the "what were the waves doing" utilization mix shown beside the stall table.
+    state_mix = None
+    st_cy = {1: 0, 2: 0, 3: 0, 4: 0}
+    nwv = 0
+    for w in _att_isolate_run(dispatch_dir):   # ONE representative run, not all gens
+        tl = w.get("timeline") or []
+        if not tl:
+            continue
+        nwv += 1
+        for seg in tl:
+            if isinstance(seg, list) and len(seg) >= 2 and seg[1] > 0:
+                st_cy[seg[0]] = st_cy.get(seg[0], 0) + seg[1]
+    tot = sum(st_cy.values())
+    if tot > 0:
+        state_mix = {"total": tot, "n_waves": nwv,
+                     "pct": {k: round(100.0 * st_cy.get(v, 0) / tot, 1)
+                             for k, v in (("Idle", 1), ("Exec", 2),
+                                          ("Wait", 3), ("Stall", 4))}}
+    return {"t0": t0, "t1": t1, "kernels": kernels, "lanes": lanes,
+            "state_mix": state_mix, "n_waves": nwv}
+
+
+# Per-wave instruction stream (se*_wv*.json `wave.instructions`) tuple:
+#   [issue_cycle, class, _, _, code_line_idx]
+# `class` maps to a hardware execution unit (verified against the ISA opcodes each
+# class carries). This is the RCV "Utilization view" grouping.
+_ATT_UNIT_BY_CLASS = {
+    1: "SMEM",    # s_load_*            scalar memory
+    2: "SALU",    # s_mov/add/lshl/cmp  scalar ALU
+    3: "VMEM",    # global/buffer       vector memory
+    5: "LDS",     # ds_load/store       local data share
+    6: "VALU",    # v_* (incl v_wmma)   vector ALU / matrix
+    7: "BRANCH", 8: "BRANCH",           # s_cbranch
+    9: "WAIT",    # s_waitcnt/s_clause  wait / decode
+    11: "MSG",    # s_barrier/sendmsg/endpgm
+}
+# Lane order (top -> bottom). NOTE (RDNA3.5/gfx1151): WMMA is NOT a separate matrix
+# engine -- v_wmma_* are VALU instructions executed on the vector ALU (same datapath +
+# register file as all other v_* ops). So WMMA and dequant/convert VALU CONTEND for the
+# one VALU. We still break WMMA out (adjacent to VALU) to show how much of the VALU
+# budget is the actual matmul vs the surrounding dequant/convert -- but both are VALU.
+_ATT_UNIT_ORDER = ["WMMA", "VALU", "LDS", "VMEM", "SMEM", "SALU", "WAIT", "BRANCH", "MSG"]
+_ATT_UTIL_NB = 1200   # horizontal cycle-bucket budget for the utilization timeline
+
+
+def load_att_util(dispatch_dir):
+    """Build the RCV-style per-hardware-unit utilization timeline for one decoded ATT
+    dispatch dir. Each per-wave `se*_wv*.json` carries `wave.instructions`, a list of
+    [issue_cycle, class, _, _, code_line] tuples. We classify each instruction to a HW
+    unit (VALU / WMMA / LDS / VMEM / SMEM / SALU / WAIT / BRANCH / MSG) and mark that
+    unit BUSY at the instruction's issue cycle. Aggregated across all captured waves and
+    downsampled onto a fixed grid of _ATT_UTIL_NB cycle-buckets: a lane's bucket is the
+    fraction of that bucket's waves-instructions that hit the unit (0..1 intensity), so
+    a dense v_wmma/v_fma region reads as a solid block like RCV's colored cells.
+
+    Returns {t0, t1, nb, units:[name...], lanes:{unit:[intensity per bucket]},
+             busy:{unit: pct of all instr-cycles}} or None. WMMA is detected by ISA
+    (v_wmma*) and pulled out of the VALU class so the matrix-engine lane is separate."""
+    import glob
+    if not dispatch_dir:
+        return None
+    # code line -> is-WMMA (to split WMMA out of the VALU class), from code.json.
+    is_wmma = {}
+    cpath = os.path.join(dispatch_dir, "code.json")
+    try:
+        with open(cpath) as fh:
+            code = (json.load(fh) or {}).get("code") or []
+        for idx, row in enumerate(code):
+            isa = (row[0] if row else "") or ""
+            if isa.lstrip().startswith("v_wmma"):
+                is_wmma[idx] = True
+    except (OSError, ValueError):
+        code = []
+    # Per-wave event lists (so the util view can break the merged 4-up back into the
+    # individual co-resident waves of the workgroup). wave_ev[i] = [(cycle, unit)...];
+    # wave_id[i] = a human slot label like "SIMD3 slot0". The merged aggregate is just
+    # the concatenation of all per-wave events over one shared time axis.
+    wave_ev = []
+    wave_lbl = []
+    t0 = None; t1 = 0
+    simds = set()
+    for w in _att_isolate_run(dispatch_dir):   # ONE representative run, not all gens
+        insns = w.get("instructions") or []
+        if not insns:
+            continue
+        simds.add((w.get("cu", 0), w.get("simd", 0)))
+        wev = []
+        for it in insns:
+            if not isinstance(it, list) or len(it) < 5:
+                continue
+            cyc, cl, ln = it[0], it[1], it[4]
+            unit = _ATT_UNIT_BY_CLASS.get(cl)
+            if unit is None:
+                continue
+            if unit == "VALU" and is_wmma.get(ln):
+                unit = "WMMA"
+            wev.append((cyc, unit))
+            if t0 is None or cyc < t0:
+                t0 = cyc
+            if cyc > t1:
+                t1 = cyc
+        if wev:
+            wave_ev.append(wev)
+            sm, sl = w.get("simd", 0), w.get("slot", 0)
+            wave_lbl.append("SIMD%d slot%d" % (sm, sl))
+    if not wave_ev or t0 is None:
+        return None
+    span = max(1, t1 - t0)
+    bw = span / float(_ATT_UTIL_NB)
+    units = [u for u in _ATT_UNIT_ORDER]
+
+    # Bucket ONE event list into {unit:[intensity per bucket]}, busy{unit:pct}, ntot.
+    # Intensity = fraction of that bucket's instructions (within this scope) that hit
+    # the unit -- identical definition whether scope is one wave or the merged set.
+    def _bucketize(evs):
+        lane_cnt = {u: [0] * _ATT_UTIL_NB for u in units}
+        buck_tot = [0] * _ATT_UTIL_NB
+        busy = {u: 0 for u in units}
+        for cyc, unit in evs:
+            b = int((cyc - t0) / bw)
+            if b >= _ATT_UTIL_NB:
+                b = _ATT_UTIL_NB - 1
+            if unit in lane_cnt:
+                lane_cnt[unit][b] += 1
+                busy[unit] += 1
+            buck_tot[b] += 1
+        ntot = len(evs) or 1
+        active = [u for u in units if busy[u] > 0]
+        lanes = {u: [round(lane_cnt[u][b] / buck_tot[b], 3) if buck_tot[b] else 0
+                     for b in range(_ATT_UTIL_NB)] for u in active}
+        return {"units": active, "lanes": lanes,
+                "busy": {u: round(100.0 * busy[u] / ntot, 1) for u in active},
+                "n_instr": ntot}
+
+    merged_evs = [e for wev in wave_ev for e in wev]
+    agg = _bucketize(merged_evs)
+    per_wave = []
+    for i, wev in enumerate(wave_ev):
+        d = _bucketize(wev)
+        d["label"] = wave_lbl[i]
+        per_wave.append(d)
+    return {"t0": t0, "t1": t1, "nb": _ATT_UTIL_NB,
+            "units": agg["units"], "lanes": agg["lanes"], "busy": agg["busy"],
+            "n_instr": agg["n_instr"], "n_waves": len(wave_ev),
+            "n_simd": len(simds), "waves": per_wave}
 
 
 def load_att_code(att_dir):
@@ -968,6 +1236,7 @@ def load_att_code(att_dir):
     out = {}
     max_src_bytes = 512 * 1024
     _occ_cache = {}    # dispatch dir -> occupancy (shared object; dedup at emit)
+    _util_cache = {}   # dispatch dir -> per-unit utilization timeline
     for fam, (_n, d) in best.items():
         # Read each referenced source file once (keyed by basename, path discarded).
         src_files = {}
@@ -991,10 +1260,13 @@ def load_att_code(att_dir):
         if ddir not in _occ_cache:
             _occ_cache[ddir] = load_att_occupancy(ddir)
         occ = _occ_cache[ddir]
+        if ddir not in _util_cache:
+            _util_cache[ddir] = load_att_util(ddir)
+        util = _util_cache[ddir]
         out[fam] = {"sym": d["sym"], "n_disp": ndisp[fam], "stall": d["stall"],
                     "lat": d["lat"], "idle": d["idle"], "rows": d["rows"],
                     "has_src": d.get("has_src", False), "src_files": src_files,
-                    "exec": exec_stream, "waves": waves, "occ": occ}
+                    "exec": exec_stream, "waves": waves, "occ": occ, "util": util}
     return out
 
 
@@ -1228,6 +1500,22 @@ def add_common_args(ap):
                          "(MMQ) as one span -- no per-token periodicity; the layer/"
                          "role lanes (decode order-map) are omitted, CPU+GPU+family "
                          "lanes render.")
+    # Second (alternate-regime) trace: when supplied, the overlay embeds BOTH this
+    # regime and the --mode one, and shows a prefill/decode dropdown that switches
+    # between them in-page. Each regime is its own clean sys-trace (collected with
+    # -p N -n 0 for prefill and -p 0 -n M for decode), so they stay measured in
+    # isolation -- more correct than splitting one mixed trace. --alt-mode is the
+    # OTHER regime; if omitted it is the opposite of --mode.
+    ap.add_argument("--alt-kernel-csv",
+                    help="second regime's *_kernel_trace.csv; enables the in-page "
+                         "prefill/decode dropdown (embeds both traces)")
+    ap.add_argument("--alt-hip-csv", help="second regime's *_hip_api_trace.csv")
+    ap.add_argument("--alt-pmc-csv", help="second regime's stall *_counter_collection.csv")
+    ap.add_argument("--alt-fetch-csv", help="second regime's FETCH_SIZE *_counter_collection.csv")
+    ap.add_argument("--alt-clean-tps-file",
+                    help="second regime's clean_tps.txt (its untraced pp/tg row)")
+    ap.add_argument("--alt-mode", choices=["decode", "prefill"],
+                    help="the second regime's mode (default: opposite of --mode)")
     ap.add_argument("--tokens", type=int, default=2,
                     help="decode tokens to show in the viewport (default 2)")
     ap.add_argument("--skip-tokens", type=int, default=30,
@@ -1273,7 +1561,7 @@ def build_payload(args):
     else:
         title = "%s (%s)" % (title, tag)
 
-    by_stream = load_kernel_slices(args.kernel_csv)
+    by_stream = load_kernel_slices(args.kernel_csv, mmq_y_for(args.arch))
     if not by_stream:
         sys.exit(f"error: no kernel rows in {args.kernel_csv}")
     # Compute stream = the one with the most dispatches (stream 1 is model load).
@@ -1281,18 +1569,36 @@ def build_payload(args):
     evs = by_stream[sid]
 
     if args.mode == "prefill":
-        # Prefill = ONE prompt-processing forward pass (MMQ GEMMs), not the
-        # periodic per-token decode stream. There are no token boundaries to
-        # segment on, so bake the whole compute span as a single "pass": drop
-        # the leading copyBuffer/quantize weight-upload prologue (everything
-        # before the first mul_mat*), then bake to the end.
-        a = next((i for i, ev in enumerate(evs) if "mul_mat" in ev[2]), 0)
-        b = len(evs)
-        baked = evs[a:b]
+        # Prefill = ONE prompt-processing forward pass (MMQ GEMMs), not the periodic
+        # per-token decode stream. llama-bench runs an EAGER warmup pass first (a wall
+        # of hipLaunchKernel with sparse, gappy GPU work), then the MEASURED pass as a
+        # single hipGraphLaunch under one long hipStreamSynchronize. We want the
+        # measured pass, not the warmup: bake the last contiguous run of dense GPU
+        # work, i.e. everything after the final large idle gap (the graph-setup /
+        # instantiate stall that separates warmup from the replay).
+        prologue = next((i for i, ev in enumerate(evs) if "mul_mat" in ev[2]), 0)
+        # Find the last big inter-dispatch gap; the measured pass starts after it.
+        GAP_NS = max(2_000_000, int(args.gap_threshold_us * 1000))  # >= 2ms
+        a = prologue
+        for i in range(len(evs) - 1, prologue, -1):
+            if evs[i][0] - evs[i - 1][1] > GAP_NS:
+                a = i
+                break
+        baked = evs[a:len(evs)]
         if not baked:
             sys.exit("error: no mul_mat* dispatches in prefill trace "
                      f"{args.kernel_csv}; is this a prefill (-p N -n 0) run?")
-        t0, t1 = baked[0][0], baked[-1][1]
+        t_first, t_last = baked[0][0], baked[-1][1]
+        # Start the window a touch before the first kernel so a little bit of the
+        # driving hipStreamSynchronize / launch shows in the CPU lane as lead-in,
+        # and extend the end past the last kernel so the finish reads clearly.
+        span = t_last - t_first
+        # Head lead-in: pull back far enough to show a sliver of the PREVIOUS launch
+        # (the warmup tail / graph-setup that precedes the measured pass), so the
+        # start reads in context rather than beginning cold at the first kernel.
+        head_pad = min(int(span * 0.10), 12_000_000)  # <= 12ms lead-in
+        tail_pad = min(int(span * 0.05), 8_000_000)   # <= 8ms trailing room
+        t0, t1 = t_first - head_pad, t_last + tail_pad
         # One span. The client viewport is [tok_starts[view_i0], tok_starts[view_i1]),
         # so hand it two entries (pass start, pass end) => the initial viewport spans
         # the whole forward pass instead of collapsing to zero width. These also render
@@ -1340,36 +1646,63 @@ def build_payload(args):
     # family's inline occ with an index (occ_ref) so the HTML embeds it ONCE, not 18x.
     att_occ_pool = []
     _occ_seen = {}
+    att_util_pool = []      # per-unit utilization timelines, pooled the same way
+    _util_seen = {}
     for _fam, _c in att_code_by_fam.items():
         _o = _c.pop("occ", None)
         if _o is None:
             _c["occ_ref"] = -1
-            continue
-        _key = id(_o)
-        if _key not in _occ_seen:
-            _occ_seen[_key] = len(att_occ_pool)
-            att_occ_pool.append(_o)
-        _c["occ_ref"] = _occ_seen[_key]
+        else:
+            _key = id(_o)
+            if _key not in _occ_seen:
+                _occ_seen[_key] = len(att_occ_pool)
+                att_occ_pool.append(_o)
+            _c["occ_ref"] = _occ_seen[_key]
+        _u = _c.pop("util", None)
+        if _u is None:
+            _c["util_ref"] = -1
+        else:
+            _uk = id(_u)
+            if _uk not in _util_seen:
+                _util_seen[_uk] = len(att_util_pool)
+                att_util_pool.append(_u)
+            _c["util_ref"] = _util_seen[_uk]
     clean_tps = (parse_clean_tps(args.clean_tps_file,
                                  "pp" if args.mode == "prefill" else "tg")
                  if args.clean_tps_file else None)
 
-    # Optional GGUF order-map: build the expected per-token matvec tensor sequence
-    # in decode execution order. llama.cpp fuses the SwiGLU gate+up into one
-    # dispatch at decode, so try both dropping and keeping ffn_up and pick whichever
-    # candidate's N-sequence best matches the actual matvec dispatches in one token.
+    # Prefill is COMPUTE-bound: it processes a batch of B prompt tokens per matmul
+    # (a GEMM), so the roofline denominator is peak TOPS, not peak DRAM BW. B is the
+    # prompt length (pp<B> from clean_tps, e.g. pp128 -> 128); each mapped matmul does
+    # 2*N*K*B MACs, so achieved TOPS = 2*N*K*B/kernel_time. Decode is B=1 (a matvec)
+    # and BW-bound, so it keeps the DRAM-BW roofline. compute_batch is 0 when the
+    # prompt length is unknown (no clean_tps) -> per-slice TOPS is omitted, not wrong.
+    is_prefill = args.mode == "prefill"
+    compute_batch = 0
+    if is_prefill and clean_tps:
+        _bm = re.search(r"(\d+)", clean_tps.get("test", "") or "")
+        compute_batch = int(_bm.group(1)) if _bm else 0
+
+    # Optional GGUF order-map: build the expected matmul tensor sequence in execution
+    # order and lockstep-match it onto the trace's matmul dispatches. llama.cpp fuses
+    # the SwiGLU gate+up into one dispatch at DECODE (mmvq) but keeps them separate at
+    # PREFILL (MMQ), so try both dropping and keeping ffn_up and pick whichever
+    # candidate's N-sequence best matches the actual matmul dispatches.
+    #  - decode:  matmul kernel = mul_mat_vec; reference = ONE steady-state token
+    #             (between two token boundaries); the whole sequence repeats/token.
+    #  - prefill: matmul kernel = mul_mat_q; reference = the WHOLE baked forward pass
+    #             (one pass, no per-token repeat). N recovered as grid.x*mmq_y (above).
     expected_seq = []
     gguf_meta = {}
-    # The decode order-map keys off the periodic per-token mmvq stream; prefill
-    # (single MMQ forward pass, 2D grid) needs a different join and is deferred
-    # to increment 2. Skip it so layer/role lanes stay empty for prefill.
-    if args.gguf and args.mode != "prefill":
+    mm_key = "mul_mat_q" if args.mode == "prefill" else "mul_mat_vec"
+    if args.gguf:
         gguf_tensors, gguf_meta = load_gguf_tensors(args.gguf)
-        # Reference token = the matvec N-stream between the first two boundaries in
-        # the baked span (a full steady-state token).
-        ref = [n for (s, e, nm, n, _nb) in evs[bounds[args.skip_tokens]:
-                                          bounds[args.skip_tokens + 1]]
-               if "mul_mat_vec" in nm and n]
+        if args.mode == "prefill":
+            ref = [n for (s, e, nm, n, _nb) in baked if mm_key in nm and n]
+        else:
+            ref = [n for (s, e, nm, n, _nb) in evs[bounds[args.skip_tokens]:
+                                              bounds[args.skip_tokens + 1]]
+                   if mm_key in nm and n]
         best = None
         for drop in (True, False):
             cand = build_expected_sequence(gguf_tensors, drop)
@@ -1426,6 +1759,7 @@ def build_payload(args):
     busy_ns = 0
     fam_busy = defaultdict(float)
     fam_count = defaultdict(int)
+    fam_macs = defaultdict(float)   # prefill: total 2*N*K*B MACs of a family's mapped slices
     ei = 0
     ti_ctr = 0
     mv_total = mv_mapped = 0
@@ -1445,7 +1779,7 @@ def build_payload(args):
         sl = {"s": s - t0, "e": e - t0, "fam": fam, "stall": stall,
               "blocks": nblk, "ti": ti_ctr}
         ti_ctr += 1
-        if expected_seq and "mul_mat_vec" in name and ncol:
+        if expected_seq and mm_key in name and ncol:
             mv_total += 1
             ent = expected_seq[ei] if ei < len(expected_seq) else None
             ei += 1
@@ -1486,10 +1820,22 @@ def build_payload(args):
                     "effbw": round(packed / dur, 1) if dur else 0,
                     "effbw_pct": (round(packed / dur / peak_bw * 100, 1)
                                   if dur else 0),
+                    # Prefill compute roofline: this matmul does 2*N*K*B MACs over B
+                    # prompt tokens; achieved TOPS = 2*N*K*B / kernel_time (1 MAC/ns ==
+                    # 1e-3 TOPS -> /1e3). tops_pct rooflines against peak TOPS. Uses
+                    # true N,K (algorithmic work, over-fetch/padding-immune). 0 for
+                    # decode (B=1, BW-bound) or when batch/peak unknown.
+                    "tops": (round(2.0 * true_n * k * compute_batch / dur / 1e3, 2)
+                             if (dur and compute_batch) else 0),
+                    "tops_pct": (round(2.0 * true_n * k * compute_batch / dur / 1e3
+                                       / peak_tops * 100, 1)
+                                 if (dur and compute_batch and peak_tops) else 0),
                     "nmatch": (true_n == ncol),
                 }
                 if true_n == ncol:
                     mv_mapped += 1
+                if compute_batch:
+                    fam_macs[fam] += 2.0 * true_n * k * compute_batch
         gpu_slices.append(sl)
 
     map_stats = ({"total": mv_total, "mapped": mv_mapped,
@@ -1538,8 +1884,12 @@ def build_payload(args):
                 _roles[int(m.group(1))].add(m.group(2))
         for L, rs in _roles.items():
             block_kind[L] = "GDN" if any(r.startswith("ssm") for r in rs) else "ATTN"
-        starts = sorted(tok_boundary_idx)
+        # Window edges: each token boundary starts a window that runs to the next
+        # boundary (decode), and the last window runs to the end of the baked slices.
+        # Prefill has a single boundary {0}, so this is one window spanning the whole
+        # forward pass -- append n as the closing edge so that window is processed.
         n = len(gpu_slices)
+        starts = sorted(tok_boundary_idx) + [n]
         lay_L = [None] * n
         for wi in range(len(starts) - 1):
             st = starts[wi]
@@ -1689,6 +2039,13 @@ def build_payload(args):
             "mb_tok": round(bytes_tok / 1e6, 1) if bytes_tok else 0,
             "bw_gbs": round(bw_gbs, 1),
             "bw_pct": round(bw_gbs / peak_bw * 100, 1) if bw_gbs else 0,
+            # Prefill compute roofline (family-level): total algorithmic MACs of this
+            # family's mapped matmuls / total family kernel time -> achieved TOPS,
+            # rooflined vs peak TOPS. 0 for decode or unmapped families.
+            "tops": (round(fam_macs[fam] / fam_busy[fam] / 1e3, 1)
+                     if fam_macs.get(fam) and fam_busy[fam] else 0),
+            "tops_pct": (round(fam_macs[fam] / fam_busy[fam] / 1e3 / peak_tops * 100, 1)
+                         if fam_macs.get(fam) and fam_busy[fam] and peak_tops else 0),
             "loadw": loadwidth.get(fam),
         })
 
@@ -1709,6 +2066,7 @@ def build_payload(args):
                           "kb_disp": summary_i["kb_disp"],
                           "mb_tok": summary_i["mb_tok"],
                           "bw_gbs": summary_i["bw_gbs"], "bw_pct": summary_i["bw_pct"],
+                          "tops": summary_i["tops"], "tops_pct": summary_i["tops_pct"],
                           "loadw": summary_i["loadw"]}
                     for summary_i, fam in ((s, s["fam"]) for s in summary)}
 
@@ -1795,6 +2153,7 @@ def build_payload(args):
         "has_att": bool(att_by_fam),
         "att_code_by_fam": att_code_by_fam,
         "att_occ_pool": att_occ_pool,
+        "att_util_pool": att_util_pool,
         "dbg_shortcuts": _DEBUG_SHORTCUTS_HTML,
         "has_att_code": bool(att_code_by_fam),
         # RDNA3.5 ISA one-line opcode glossary (mnemonic -> description), embedded
@@ -1824,6 +2183,13 @@ def build_payload(args):
         "kstats_ntok": kstats_ntok,
         "clean_tps": clean_tps,
         "peak_bw_gbs": peak_bw,
+        "peak_tops": peak_tops or 0,
+        # Prefill batch (prompt length B) behind the compute roofline; 0 in decode.
+        "compute_batch": compute_batch,
+        # MMQ output-row tile height (mmq_y) for the prefill GEMM tiling schematic.
+        "mmq_y": mmq_y_for(args.arch),
+        # Prefill leads with the compute roofline (peak TOPS); decode with DRAM BW.
+        "compute_bound": is_prefill,
         # gfx1151 (RDNA3.5) scheduling constants for the modeled occupancy row.
         # 20 WGP; each WGP = 2 CU = 4 SIMD32; each SIMD32 holds 16 wave32 slots
         # and a 1536-entry VGPR file (wave32); 128 KB LDS shared per WGP.
@@ -1836,13 +2202,8 @@ def build_payload(args):
     return payload
 
 
-def write_overlay(args):
-    payload = build_payload(args)
-    html = render_html(payload)
-    with open(args.out, "w") as f:
-        f.write(html)
-    print(f"wrote {args.out}", file=sys.stderr)
-    if args.mode == "prefill":
+def _print_payload_summary(payload):
+    if payload.get("mode") == "prefill":
         print(f"  prefill: 1 forward pass ({len(payload['gpu'])} GPU slices, "
               f"{len(payload['cpu'])} CPU calls).", file=sys.stderr)
     else:
@@ -1874,11 +2235,51 @@ def write_overlay(args):
               file=sys.stderr)
 
 
-def render_html(payload):
+def _alt_args(args):
+    """A shallow copy of args with the --alt-* regime fields promoted to the primary
+    input fields, so the same build_payload() produces the second regime's payload."""
+    a = copy.copy(args)
+    a.mode = args.alt_mode or ("decode" if args.mode == "prefill" else "prefill")
+    a.kernel_csv = args.alt_kernel_csv
+    a.hip_csv = args.alt_hip_csv
+    a.pmc_csv = args.alt_pmc_csv
+    a.fetch_csv = args.alt_fetch_csv
+    a.clean_tps_file = args.alt_clean_tps_file
+    return a
+
+
+def build_bundle(args):
+    """Return the render bundle. With no --alt-kernel-csv this is a single payload
+    (backward-compatible). With one, it is {"payloads": {mode: payload, ...},
+    "default_mode": args.mode} so the client can switch regimes via the dropdown."""
+    primary = build_payload(args)
+    if not getattr(args, "alt_kernel_csv", None):
+        return primary
+    alt = build_payload(_alt_args(args))
+    return {"multi": True,
+            "default_mode": primary["mode"],
+            "payloads": {primary["mode"]: primary, alt["mode"]: alt}}
+
+
+def write_overlay(args):
+    bundle = build_bundle(args)
+    html = render_html(bundle)
+    with open(args.out, "w") as f:
+        f.write(html)
+    print(f"wrote {args.out}", file=sys.stderr)
+    if isinstance(bundle, dict) and bundle.get("multi"):
+        for m, p in bundle["payloads"].items():
+            print(f" [{m}]", file=sys.stderr)
+            _print_payload_summary(p)
+    else:
+        _print_payload_summary(bundle)
+
+
+def render_html(bundle):
     # Escape "<" so any embedded markup in the payload (e.g. the child debug window's
     # help HTML, which contains a </script> close tag) cannot terminate the parent
     # <script> block early. JSON "<" decodes back to "<" in JS, so data is intact.
-    data = json.dumps(payload, separators=(",", ":")).replace("<", "\\u003c")
+    data = json.dumps(bundle, separators=(",", ":")).replace("<", "\\u003c")
     return (_HTML_TEMPLATE.replace("__DATA__", data)
             .replace("__SHORTCUTS__", _MAIN_SHORTCUTS_HTML))
 
@@ -1923,6 +2324,7 @@ _DEBUG_SHORTCUTS_HTML = shortcuts_help_html("dbgKeys", "Shortcuts -- trace view"
         ("left / right", "step one instruction (executed order)"),
         ("n / p  or  j / k", "step next / previous instruction"),
         ("H / L", "jump to previous / next source line"),
+        ("(Utilization view open)", "stepping moves a red playhead on the timeline"),
     ]),
     ("Occupancy view", [
         ("wheel", "scroll rows up / down"),
@@ -2001,7 +2403,11 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
 </style></head>
 <body>
 <header>
-  <h1 id="title"></h1>
+  <h1 id="title" style="display:flex;align-items:center;gap:10px">
+    <span id="titletext"></span>
+    <select id="modesel" style="display:none;background:#2a2e3a;color:var(--fg);
+      border:1px solid #3a3f4d;border-radius:6px;padding:3px 8px;font-size:13px;"></select>
+  </h1>
   <div class="sub" id="sub"></div>
 </header>
 <div class="wrap">
@@ -2035,9 +2441,10 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
   </div>
   <div class="right">
     <div class="panel grow">
-      <h2>Per-kernel-family/token (baked span)</h2>
+      <h2 id="tblh2">Per-kernel-family/token (baked span)</h2>
       <table id="tbl"><thead><tr>
-        <th>family</th><th>cnt/tok</th><th>time%</th><th>stall</th>
+        <th>family</th><th id="tblcnt">cnt/tok</th><th id="tblmet">time%</th>
+        <th id="tblmet2"></th><th>stall</th>
       </tr></thead><tbody></tbody><tfoot></tfoot></table>
       <div class="sub" id="bwnote" style="margin-top:8px"></div>
     </div>
@@ -2059,7 +2466,20 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
   </div>
 </div>
 <script>
-const D = __DATA__;
+const RAW = __DATA__;
+// The payload may be a single regime (bare payload, e.g. serve.py) or a bundle of
+// both regimes ({multi, payloads:{decode,prefill}, default_mode}) that the header
+// dropdown switches between. Pick the active regime from the URL hash (#mode=...)
+// so switching = set hash + reload, leaving all the const-D init below untouched.
+const IS_MULTI = !!(RAW && RAW.multi);
+function pickMode(){
+  if(!IS_MULTI) return null;
+  const h=(location.hash||'').match(/mode=(decode|prefill)/);
+  const m=h?h[1]:RAW.default_mode;
+  return RAW.payloads[m] ? m : RAW.default_mode;
+}
+const ACTIVE_MODE = pickMode();
+const D = IS_MULTI ? RAW.payloads[ACTIVE_MODE] : RAW;
 const cv = document.getElementById('cv');
 const ctx = cv.getContext('2d');
 const CPU_H = 70, GPU_H = 70, PAD_T = 8, GAP = 26, AXIS_H = 22;
@@ -2112,7 +2532,22 @@ function fallbackCopy(text,done){
 }
 
 const IS_PREFILL = D.mode === 'prefill';
-document.getElementById('title').textContent =
+document.getElementById('tblh2').textContent = IS_PREFILL
+  ? 'Per-kernel-family/forward (baked span)'
+  : 'Per-kernel-family/token (baked span)';
+// Multi-regime bundle: populate + show the prefill/decode dropdown. Switching sets
+// the URL hash and reloads, so the active payload is chosen at boot (pickMode) and
+// every downstream const-D init stays as-is. Single-payload runs hide the dropdown.
+if (IS_MULTI){
+  const sel=document.getElementById('modesel');
+  const order=['prefill','decode'].filter(m=>RAW.payloads[m]);
+  sel.innerHTML=order.map(m=>
+    `<option value="${m}"${m===ACTIVE_MODE?' selected':''}>`+
+    `${m==='prefill'?'Prefill':'Decode'}</option>`).join('');
+  sel.style.display='';
+  sel.onchange=()=>{ location.hash='mode='+sel.value; location.reload(); };
+}
+document.getElementById('titletext').textContent =
   D.title + (IS_PREFILL ? '  -- PREFILL' : '  -- DECODE');
 document.getElementById('sub').textContent =
   (IS_PREFILL ? `prefill: 1 forward pass` : `baked ${D.n_tokens_baked} tokens`)+
@@ -2128,11 +2563,16 @@ document.getElementById('sub').textContent =
   (D.ttft_est_ms!=null ? ` | TTFT (est) ${D.ttft_est_ms.toFixed(1)} ms` : '');
 document.getElementById('cpunote').textContent = D.has_cpu ? '' :
   '(no --hip-csv supplied: CPU lane empty)';
-document.getElementById('bwnote').textContent = D.has_bw ?
-  ('time% = share of window GPU-busy time. Aggregate DRAM read/token and achieved BW '+
-   '(all bytes / kernel time, vs '+D.peak_bw_gbs+' GB/s peak) are in the table footer. '+
-   'Per-family roofline is in the click-through detail panel (real per-shape effective BW).')
-  : '(no --fetch-csv supplied: achieved-bandwidth footer omitted)';
+document.getElementById('bwnote').textContent = IS_PREFILL ?
+  ('Prefill is COMPUTE-bound: TOPS% = achieved compute vs '+D.peak_tops+' TOPS peak '+
+   '(2*N*K*B MACs / kernel time, B='+(D.compute_batch||'?')+' prompt tokens; over-fetch-'+
+   'immune). time% = share of window GPU-busy time. DRAM BW% is shown secondarily '+
+   '(the few prefill ops that are BW-bound). Per-family + per-shape detail on click.')
+  : (D.has_bw ?
+     ('Decode is BW-bound: time% = share of window GPU-busy time; BW% = achieved DRAM '+
+      'bandwidth vs '+D.peak_bw_gbs+' GB/s peak (bytes / kernel time). Per-family roofline '+
+      'is in the click-through detail panel (real per-shape effective BW).')
+     : '(no --fetch-csv supplied: achieved-bandwidth footer omitted)');
 
 // legend
 const legOrder = ['memory','compute','occupancy','lds','copy','unknown'];
@@ -2349,10 +2789,20 @@ function draw(){
 
 // summary table
 const tb = document.querySelector('#tbl tbody');
+// Column layout is regime-specific: prefill (compute-bound) LEADS with achieved
+// compute (TOPS% of peak) then time%; decode (BW-bound) leads with time% then the
+// achieved DRAM BW% (its bottleneck meter). "cnt/tok" becomes "cnt/fwd" for prefill.
+document.getElementById('tblcnt').textContent = IS_PREFILL ? 'cnt/fwd' : 'cnt/tok';
+document.getElementById('tblmet').textContent  = IS_PREFILL ? 'TOPS%' : 'time%';
+document.getElementById('tblmet2').textContent = IS_PREFILL ? 'time%' : 'BW%';
 tb.innerHTML = D.summary.map(r=>{
   const col = D.colors[r.stall]||D.colors.unknown;
+  // prefill: [TOPS%][time%]; decode: [time%][BW%]. A dash when the metric is N/A
+  // (unmapped family has no TOPS; no-FETCH run has no BW%).
+  const m1 = IS_PREFILL ? (r.tops_pct? r.tops_pct : '-') : r.busy_pct;
+  const m2 = IS_PREFILL ? r.busy_pct : (r.bw_pct? r.bw_pct : '-');
   return `<tr data-fam="${r.fam}"><td><span class="fam-dot" style="background:${col}"></span>${r.fam}</td>`+
-    `<td>${r.per_tok}</td><td>${r.busy_pct}</td><td>${r.stall}</td></tr>`;
+    `<td>${r.per_tok}</td><td>${m1}</td><td>${m2}</td><td>${r.stall}</td></tr>`;
 }).join('');
 // selection: a table row selects a FAMILY (dims other families); a click on the
 // timeline selects a SINGLE kernel (bright outline) and shows its details below.
@@ -2407,18 +2857,46 @@ function toggleSlice(sl){
 // a replacement for them. Priority order matters: DRAM-bound is tested before
 // VALU-bound because BW-bound matvec kernels also read ALU>100% (VALU cycles
 // count across 4 SIMDs/CU), so ALU alone would mislabel them.
-function diagnose(fc){
+function diagnose(fc,famName){
   if(!fc) return null;
   // OccupancyPercent is intentionally NOT used: it is a derived SQ metric and is
   // unreliable on gfx1151 (SQ mis-attribution -> impossible >100% values).
   const ea=+fc.ea||0, alu=+fc.alu||0, l2=+fc.l2||0,
-        bw=+fc.bw_pct||0, scr=+fc.scratch||0, vg=+fc.vgpr||0;
+        bw=+fc.bw_pct||0, scr=+fc.scratch||0, vg=+fc.vgpr||0, tp=+fc.tops_pct||0;
   const lw=fc.loadw||{}, lane=+lw.dominant_lane_bytes||0;
   const havePmc = (fc.ea!==undefined) && (ea||alu||(+fc.mem||0));
   if(scr>0) return {c:'#ff6b6b',t:'REGISTER SPILLING',
     a:`spilling ${scr}B to scratch -- cut live VGPRs (split kernel / reduce unroll) `+
       `to stop spill/fill traffic.`};
+  // Prefill: lead with the achieved-TOPS roofline. Near peak -> done. Below peak, the
+  // WHY for a QUANTIZED MMQ GEMM is usually the dequant/convert path, not the matmul:
+  // ATT shows most VALU stall in v_fma_mix + v_cvt_f32_i32 (dequant + int32->f32),
+  // with the actual v_wmma only a small slice. So low TOPS% with high ALU (VALU busy)
+  // = DEQUANT/CONVERT-BOUND even when EA (DRAM iface) reads high (the interface stays
+  // busy streaming weights, but execution time is the on-chip conversion math).
+  if(IS_PREFILL && tp){
+    if(tp>=60) return {c:'#8fe388',t:'COMPUTE-BOUND (near peak)',
+      a:`${tp}% of ${D.peak_tops} TOPS peak (B=${D.compute_batch}) -- near the roofline; `+
+        `little headroom without a faster kernel.`};
+    // ATT confirmation: if the traced stall is dominated by dequant/convert VALU ops.
+    var att=(D.att_by_fam||{})[famName]||null;
+    if(alu>=90) return {c:'#ffb454',t:'VALU-BOUND (dequant/convert)',
+      a:`${tp}% of ${D.peak_tops} TOPS peak but VALU ${alu}% busy. On RDNA3.5 the WMMA `+
+        `matmul runs ON the VALU (v_wmma_* are VALU ops), and it shares that one vector `+
+        `ALU with the dequant + int32->f32 conversion (v_fma_mix, v_cvt_f32_i32) -- which `+
+        `dominate the VALU cycles, so the matmul itself is a small slice. EA ${ea}% (DRAM `+
+        `iface busy streaming weights/over-fetch, not the binding limit). Lever: cheaper `+
+        `dequant/convert to free VALU for the matmul, not more BW or tiling.`+
+        (att?` ATT traced -- see the utilization view (VALU:WMMA vs VALU:other).`:` (trace with ATT to confirm.)`)};
+    if(ea<70) return {c:'#ffb454',t:'COMPUTE-UNDERUTILIZED',
+      a:`only ${tp}% of ${D.peak_tops} TOPS peak with EA (DRAM iface) ${ea}% and VALU `+
+        `${alu}% -- compute left on the table (tiling / occupancy / low-ILP).`};
+    // low TOPS% + EA high + VALU not busy -> genuinely BW-bound; use the DRAM rules below.
+  }
   if(!havePmc){
+    if(IS_PREFILL && tp) return {c:'#8fe388',t:'COMPUTE',
+      a:`${tp}% of ${D.peak_tops} TOPS peak (B=${D.compute_batch}); no PMC counters for `+
+        `this family (not in the --pmc set) so the bottleneck is unconfirmed.`};
     if(bw) return {c:'#7fd1ff',t:'DRAM TRAFFIC',
       a:`achieved ${bw}% of peak BW; no PMC counters for this family (not in the `+
         `--pmc set) so the bottleneck is unconfirmed.`};
@@ -2654,7 +3132,7 @@ function renderFamilyMembers(){
     if(ma.L!==mb.L) return ma.L-mb.L;
     return a.s-b.s;
   });
-  let h=`<h2>Kernel family/Token</h2>`+
+  let h=`<h2>Kernel family/${IS_PREFILL?'Forward':'Token'}</h2>`+
     `<div style="color:#7fd1ff;word-break:break-all;margin-bottom:6px">${fam}`+
     `<span class="r"> (${rows.length} dispatch${rows.length===1?'':'es'})</span></div>`;
   if(!rows.length){
@@ -2689,10 +3167,15 @@ function renderFamilyMembers(){
   const modeCol=(ci,n)=> n<=1 ? '#8aa0b4'
       : n===2 ? (ci===0?'#8fe388':'#ff9f6b')
       : ['#8fe388','#ffd479','#ff9f6b','#ff6b6b','#c58cff'][Math.min(ci,4)];
+  // Prefill leads the per-shape table with the COMPUTE roofline (TOPS / TOPS%),
+  // then keeps eff BW as a secondary column; decode leads with eff BW.
+  const compCols = IS_PREFILL
+    ? `<th style="text-align:left">TOPS</th><th style="text-align:left">TOPS %</th>` : ``;
   h+=`<table><thead><tr><th style="text-align:left">role</th>`+
      `<th style="text-align:left">layer</th>`+
      `<th style="text-align:left">shape [K x N]</th><th style="text-align:left">packed</th>`+
      `<th style="text-align:left">kernel time</th>`+
+     compCols+
      `<th style="text-align:left">eff BW</th><th style="text-align:left">eff BW %</th>`+
      `<th style="text-align:left">over-fetch</th>`+
      `<th style="text-align:left">modes</th></tr></thead><tbody>`;
@@ -2708,8 +3191,17 @@ function renderFamilyMembers(){
     const m=s.map, dur=s.e-s.s;
     const eb=dur?(m.packed/dur):0;
     const ep=D.peak_bw_gbs?(eb/D.peak_bw_gbs*100):0;
-    const lowBW=memBound && ep>0 && ep<80;
-    const bwCol=lowBW?'#ff6b6b':'#8fe388';
+    // eff BW is INFORMATIONAL only for prefill (compute-bound) -> neutral color, no
+    // flag. In decode (BW-bound) keep the low-BW red flag as before.
+    const lowBW=(!IS_PREFILL)&&memBound && ep>0 && ep<80;
+    const bwCol=IS_PREFILL?'#9fb0c4':(lowBW?'#ff6b6b':'#8fe388');
+    // Prefill compute cells: achieved TOPS vs peak. RED when < 80% of peak (compute
+    // left on the table); green otherwise. This is the metric that matters for prefill.
+    const tpc=IS_PREFILL?(m.tops_pct||0):0;
+    const tpCol=tpc<80?'#ff5555':'#8fe388';
+    const compCells=IS_PREFILL
+      ? `<td style="color:${tpCol}">${(m.tops||0).toFixed(2)}</td>`+
+        `<td style="color:${tpCol}">${tpc.toFixed(1)}%${tpc<80?' <span class="r">(&lt;80%)</span>':''}</td>` : ``;
     const key=m.K+'x'+m.trueN+'|'+m.q+'|'+m.role+'|L'+m.L;
     if(key!==prevKey){ band^=1; prevKey=key; }
     h+=`<tr class="shrow" data-idx="${i}" title="frame this dispatch in the timeline"`+
@@ -2719,6 +3211,7 @@ function renderFamilyMembers(){
        `<td>${m.K} x ${m.trueN} <span class="r">${m.q}</span></td>`+
        `<td>${KB(m.packed)}${m.fused?` <span class="r">(${m.fused})</span>`:``}</td>`+
        `<td>${fmtus(dur)}</td>`+
+       compCells+
        `<td style="color:${bwCol}">${eb.toFixed(1)} GB/s</td>`+
        `<td style="color:${bwCol}">${ep.toFixed(1)}%${lowBW?' <span class="r">(BW-bound)</span>':''}</td>`+
        `<td>${m.overfetch?m.overfetch.toFixed(2)+'x':'<span class="r">-</span>'}</td>`+
@@ -2737,8 +3230,12 @@ function renderFamilyMembers(){
      `timestamp artifact -- visible as a lone inflated row); <b>modes</b> = this shape's `+
      `across-layer kernel-time clusters (per-layer medians, gap &gt; max(3&micro;s, 6% median)); `+
      `<b>k/N @center</b> marks which of N modes this layer falls in (fastest green -> slowest `+
-     `orange), so a bimodal/trimodal fast/slow layer split is visible per row; <b>eff BW</b> = `+
-     `packed / kernel time (over-fetch-immune, vs peak ${D.peak_bw_gbs} GB/s). `+
+     `orange), so a bimodal/trimodal fast/slow layer split is visible per row; `+
+     (IS_PREFILL?`<b>TOPS</b> = 2*N*K*B / kernel time (B=${D.compute_batch}, algorithmic `+
+       `work; over-fetch/pad-immune) vs peak ${D.peak_tops} TOPS -- prefill's primary `+
+       `(compute) roofline; <b>eff BW</b> is secondary. `
+       :`<b>eff BW</b> = packed / kernel time (over-fetch-immune, vs peak `+
+        `${D.peak_bw_gbs} GB/s). `)+
      `Click a row to frame that dispatch in the timeline.</div>`;
   dp.innerHTML=h; dp.style.display='block';
   // Row click frames + selects that exact dispatch, reusing find's framing.
@@ -2749,7 +3246,7 @@ function renderFamilyMembers(){
 }
 function renderSelectedKernel(){
   const s=selectedSlice, fc=D.fam_counters[s.fam]||{};
-  const dg=diagnose(fc);
+  const dg=diagnose(fc,s.fam);
   const hasCode = !!((D.att_code_by_fam||{})[s.fam]);
   const dbgBtn = hasCode
     ? `<button id="attdbg" style="cursor:pointer;background:#2a3a52;color:#dbe6f5;`+
@@ -2787,8 +3284,12 @@ function renderSelectedKernel(){
       `border:1px solid #3a5578;border-radius:3px;padding:3px 12px;font-size:12px;`+
       `flex:0 0 auto;white-space:nowrap">Open tiling view</button>`
     : ``;
-  let h=`<h2>Selected kernel</h2>`+
-    `<div style="display:flex;align-items:flex-start;gap:8px;margin-bottom:6px;flex-wrap:wrap">`+
+  let h=`<div style="display:flex;align-items:center;gap:10px">`+
+    `<button id="detback" style="cursor:pointer;background:#2a2e3a;color:#dbe6f5;`+
+    `border:1px solid #3a4553;border-radius:6px;padding:4px 12px;font-size:12px;`+
+    `flex:0 0 auto">&larr; back</button>`+
+    `<h2 style="margin:0">Selected kernel</h2></div>`+
+    `<div style="display:flex;align-items:flex-start;gap:8px;margin:6px 0">`+
     `<div style="color:#7fd1ff;word-break:break-all;flex:0 1 auto">${s.fam}</div>`+
     tileBtn+retraceBtn+dbgBtn+`</div>`+
     (dg?`<div style="margin:0 0 8px;padding:6px 9px;border-left:3px solid ${dg.c};`+
@@ -2843,8 +3344,9 @@ function renderSelectedKernel(){
        `<tr><td>WriteUnitStalled</td><td>${fc.wr}</td></tr>`;
     if(fc.ea) h+=`<tr><td>EA (DRAM iface) busy</td><td>${fc.ea}%</td></tr>`;
     if(fc.alu) h+=`<tr><td>ALU (VALU) busy</td><td>${fc.alu}%</td></tr>`;
-    if(fc.vgpr) h+=`<tr><td>VGPR / SGPR</td><td>${fc.vgpr} / ${fc.sgpr}`+
+    if(fc.vgpr) h+=`<tr><td>VGPR / thread</td><td>${fc.vgpr}`+
        (fc.accum_vgpr?` (+${fc.accum_vgpr} accum)`:``)+`</td></tr>`;
+    if(fc.sgpr) h+=`<tr><td>SGPR / wave</td><td>${fc.sgpr}</td></tr>`;
     const sc=fc.scratch||0;
     h+=`<tr><td>scratch size</td><td>${sc>=1024?(sc/1024).toFixed(1)+' KB':sc+' B'}</td></tr>`;
     // ---- occupancy limiter (LDS/block + resident blocks per WGP) ----
@@ -2907,6 +3409,24 @@ function renderSelectedKernel(){
        `<b style="color:#ff9d5c">ATT thread-trace stalls</b> `+
        `<span class="r">(${at.n_disp} dispatch${at.n_disp!==1?'es':''}, ~1 SIMD; `+
        `${fmtc(at.stall)} stall / ${fmtc(at.lat)} latency / ${fmtc(at.idle)} idle cyc)</span>`;
+    // Wave-state utilization bar: share of wave-cycles in Exec / Wait / Stall / Idle
+    // across all captured waves (from the ATT per-wave timelines). Answers "what were
+    // the waves doing over the kernel" -- Exec = issuing useful work, Stall = blocked
+    // on dependency/latency (where dequant-convert chains pile up), Wait = waitcnt/mem.
+    (()=>{const cc=(D.att_code_by_fam||{})[s.fam];
+      const occ=cc?((cc.occ_ref!=null&&cc.occ_ref>=0)?(D.att_occ_pool||[])[cc.occ_ref]:cc.occ):null;
+      const sm=occ&&occ.state_mix; if(!sm) return;
+      const segs=[['Exec',sm.pct.Exec,'#8fe388'],['Stall',sm.pct.Stall,'#ff6b6b'],
+                  ['Wait',sm.pct.Wait,'#ffd479'],['Idle',sm.pct.Idle,'#5a6675']];
+      h+=`<div style="margin-top:8px"><span class="r">wave-state utilization `+
+         `(${occ.n_waves||''} waves, ${occ.states?'':''}% of wave-cycles):</span>`+
+         `<div style="display:flex;height:16px;border-radius:3px;overflow:hidden;margin-top:3px;`+
+         `border:1px solid #2a3340">`+
+         segs.map(x=>x[1]>0?`<div title="${x[0]} ${x[1]}%" style="width:${x[1]}%;`+
+           `background:${x[2]};min-width:${x[1]>=6?'auto':'0'}"></div>`:'').join('')+`</div>`+
+         `<div class="r" style="margin-top:3px">`+
+         segs.map(x=>`<span style="color:${x[2]}">&#9632;</span> ${x[0]} ${x[1]}%`).join(' &nbsp; ')+
+         `</div></div>`;})();
     if(at.top && at.top.length){
       h+=`<table style="margin-top:6px"><thead><tr>`+
          `<th style="text-align:left">instruction</th>`+
@@ -2967,8 +3487,11 @@ function renderSelectedKernel(){
        `<code>${esc(sym)}</code>.)</div>`)+
      `</div>`;
   dp.innerHTML=h; dp.style.display='block';
+  // back: return to this kernel's family/token dispatch list.
+  var _bk=document.getElementById('detback'); if(_bk) _bk.onclick=()=>setSelection(s.fam);
   const tv=document.getElementById('tileview');
   if(tv && s.map) tv.onclick=()=>openTilingView({K:s.map.K, N:s.map.launchN||s.map.trueN,
+    trueN:s.map.trueN,
     q:s.map.q, nm:s.map.nm, role:s.map.role,
     // actual launched grid for THIS dispatch: blocks = workgroup count (Grid/Workgroup
     // from the kernel trace), wg = threads/block, wave = warp size (both from PMC).
@@ -2976,6 +3499,17 @@ function renderSelectedKernel(){
     // chip-wide wavefront slot capacity for the occupancy/tail view (WGP x SIMD/WGP
     // x slots/SIMD = 20*4*16 = 1280 on gfx1151).
     hwslots:(D.hw?D.hw.wgp*D.hw.simd_per_wgp*D.hw.slots_per_simd:0),
+    // for the concurrency (scheduling-round) strip: total SIMDs, wave-slot cap per
+    // SIMD, VGPR file per SIMD, and this kernel's VGPR/thread -> resident-WG count.
+    nsimd:(D.hw?D.hw.wgp*D.hw.simd_per_wgp:0),
+    slotsPerSimd:(D.hw?D.hw.slots_per_simd:16),
+    vgprPerSimd:(D.hw?D.hw.vgpr_per_simd:1536),
+    vgpr:(fc.vgpr||0),
+    // MMQ prefill GEMM: mmq==true selects the matrix*matrix (Y[NxB]=W[NxK]*X[KxB])
+    // tiling schematic instead of the mmvq matvec one. batch B = prompt tokens,
+    // tiled mmq_y x mmq_x into output tiles (1 workgroup = 1 tile, WMMA).
+    mmq:(s.fam.indexOf('mul_mat_q')>=0), batch:(D.compute_batch||0),
+    mmqY:(D.mmq_y||64),
     sbHelp:(D.concept_gloss||{}).superblock||''});
   const cp=document.getElementById('attcopy');
   if(cp) cp.onclick=()=>copyCmd(cmd);
@@ -3019,11 +3553,17 @@ function openTilingView(shape){
     `.sw{display:inline-block;width:13px;height:13px;border-radius:2px}`+
     `#formula{flex:1 1 100%;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:15px;`+
     `color:#ffd7b0}`+
+    // Two side-by-side key/value columns (4-col grid: key val key val) so the tiling
+    // params take half the vertical rows. Pairs flow row-major across the two columns.
     `#notes{flex:1 1 100%;margin-top:2px;font-family:ui-monospace,Menlo,Consolas,monospace;`+
-    `font-size:12px;color:#c8d0da;display:grid;grid-template-columns:max-content 1fr;`+
-    `column-gap:10px;row-gap:1px;max-width:640px}`+
+    `font-size:12px;color:#c8d0da;display:grid;`+
+    `grid-template-columns:max-content 1fr max-content 1fr;`+
+    `column-gap:10px;row-gap:1px;max-width:900px}`+
     `#notes .k{color:#9fb0c4}`+
-    `#foot{flex:0 0 auto;padding:10px 16px;background:#12161c;border-top:1px solid #2a3340}`+
+    // Footnotes live INSIDE the scroll pane (below the canvas), not as a fixed bottom
+    // bar -- so the schematic is always 100% visible and the notes are reached by
+    // scrolling down. margin-top separates them from the canvas.
+    `#foot{padding:10px 16px 16px;background:#12161c;border-top:1px solid #2a3340;margin-top:12px}`+
     `#occnote{font-size:12px;color:#9fb0c4;`+
     `display:flex;align-items:center;gap:6px;flex-wrap:wrap}#occnote b{color:#c8d0da}`+
     `.occbar{display:inline-block;width:46px;height:12px;background:#1b2130;`+
@@ -3032,19 +3572,23 @@ function openTilingView(shape){
     `.occmore{color:#6f7d8f}.occok{color:#8fe388}.occwarn{color:#e0a341}`+
     `#sbnote{margin-top:6px;font-size:12px;line-height:1.45;color:#9fb0c4;`+
     `max-width:900px}#sbnote b{color:#c8d0da}`+
+    `#tilenote{margin-top:6px;font-size:12px;line-height:1.45;color:#9fb0c4;`+
+    `max-width:900px}#tilenote b{color:#c8d0da}`+
     `#wrap{flex:1 1 auto;overflow:auto;min-height:0}#cv{display:block}`+
     `</style></head><body>`+
-    `<div id="bar"><h2>Tiling schematic</h2>`+
+    `<div id="bar"><h2>Tiling view</h2>`+
     `<button class="zb" id="zout">Zoom &minus;</button>`+
     `<button class="zb" id="zin">Zoom +</button>`+
     `<button class="zb" id="fit">Fit</button>`+
-    `<span class="lg"><span class="sw" style="background:#e8912a"></span>W: weight rows (colored by workgroup)</span>`+
-    `<span class="lg"><span class="sw" style="background:#2d3f2f;border:1px solid #3fb950"></span>X: activation (Q8_1, shared/LDS)</span>`+
-    `<span class="lg"><span class="sw" style="background:#c9d4e2"></span>Y: output (fp32, 1/wave)</span>`+
+    `<button class="zb" id="ccopen" style="display:none">Open concurrency view</button>`+
+    `<span class="lg"><span class="sw" style="background:#e8912a"></span><span id="lgW">W</span></span>`+
+    `<span class="lg"><span class="sw" style="background:#2d3f2f;border:1px solid #3fb950"></span><span id="lgX">X</span></span>`+
+    `<span class="lg"><span class="sw" style="background:#c9d4e2"></span><span id="lgY">Y</span></span>`+
     `<div id="formula"></div>`+
     `<div id="notes"></div></div>`+
-    `<div id="wrap"><canvas id="cv"></canvas></div>`+
-    `<div id="foot"><div id="occnote"></div><div id="sbnote"></div></div>`+
+    `<div id="wrap"><canvas id="cv"></canvas>`+
+    `<div id="foot"><div id="occnote"></div><div id="tilenote"></div><div id="sbnote"></div></div>`+
+    `</div>`+
     `<scr`+`ipt>`+
     `var SH=`+JSON.stringify(shape).replace(/</g,'\\u003c')+`;`+
     `var QK=256,QK81=32;`+
@@ -3057,17 +3601,45 @@ function openTilingView(shape){
     // ACTUAL launched grid from the trace/PMC (not hardcoded): NWG = workgroup count,
     // RPW = output rows per workgroup, WPW = waves per workgroup (Workgroup_Size/warp).
     // Fall back to 1 row/WG (== N workgroups) when the grid wasn't captured.
+    // NOTE on nwarps>1 (mmvq): the WPW waves in a workgroup do NOT each own a row --
+    // for decode rows_per_cuda_block==1, so 1 workgroup == 1 output row, and the waves
+    // SPLIT that row's K reduction (split-K): wave w strides the K weight-blocks
+    // (kbx += vdr*nwarps*warp/qi), each accumulates a partial dot product, then warps
+    // 1..n write partials to LDS and warp 0 reduces them to the single output. So more
+    // waves = deeper K parallelism per row, not more rows per workgroup.
     `var NWG=SH.blocks>0?SH.blocks:N;`+
     `var RPW=Math.max(1,Math.round(N/NWG));`+
-    `var WPW=(SH.wg>0&&SH.wave>0)?Math.round(SH.wg/SH.wave):RPW;`+
+    `var WPW=(SH.wg>0&&SH.wave>0)?Math.round(SH.wg/SH.wave):1;`+
     `var WGP=['#e8912a','#4d90fe','#c678dd','#3fb950','#e5c07b','#56b6c2','#e06c75','#61afef'];`+
     `var cv=document.getElementById('cv'),wrap=document.getElementById('wrap'),`+
     `notesEl=document.getElementById('notes'),fEl=document.getElementById('formula'),TZ=1;`+
-    // Write W as [rows x cols] = [N x K] (= PyTorch [out,in]), matching the drawing:
-    // N rows down, K values across. Plain matvec, no transpose: [N x K].[K x 1]=[N x 1].
+    // MMQ prefill GEMM parameters: batch B (prompt tokens as columns), output tiled
+    // mmq_y (rows) x mmq_x (cols). mmq_y is the fixed arch row-tile (64 on RDNA3.5).
+    // NTY (row-tiles) = grid.x/wg.x = N/mmq_y. The COLUMN-tile count NTX is recovered
+    // from the ACTUAL launched grid, not assumed: total workgroups (SH.blocks) = NTY
+    // x NTX, so NTX = blocks/NTY, and the true mmq_x = ceil(B/NTX). This is why B=128
+    // shows 2 col-tiles of mmq_x=64 on gfx1151 (the launch chose 64, not 128) instead
+    // of a single 128-wide tile. Falls back to ceil(B/128) if the grid wasn't captured.
+    `var B=SH.batch||0,MY=SH.mmqY||64;`+
+    `var NTY=Math.max(1,Math.ceil(N/MY));`+
+    `var NTX=(SH.blocks>0)?Math.max(1,Math.round(SH.blocks/NTY)):Math.max(1,Math.ceil((B||1)/128));`+
+    `var MX=(B>0)?Math.ceil(B/NTX):128,NTILES=NTY*NTX;`+
+    // Write W as [rows x cols] = [N x K] (= PyTorch [out,in]), matching the drawing.
+    // Decode is a matvec (X is [K x 1]); prefill (mmq) is a GEMM (X is [K x B]).
     // (GGUF labels the SAME bytes ne=[K,N], contiguous dim first -- noted parenthetically.)
-    `fEl.textContent='Y['+N+'x1] = W['+N+'x'+SH.K+'] * X['+SH.K+'x1]'`+
-    `+'   (K='+SH.K+' reduction, N='+N+' output; W gguf ne=['+SH.K+'x'+N+'], '+(SH.q||'')+')';`+
+    // Legend text depends on regime: mmq = GEMM (W matrix, X matrix, Y tile-grid);
+    // mmvq = matvec (W row split-K, X shared vector, Y one output/workgroup).
+    `(function(){var lw=document.getElementById('lgW'),lx=document.getElementById('lgX'),ly=document.getElementById('lgY');`+
+    `if(SH.mmq){if(lw)lw.textContent='W: weight matrix ['+N+'x'+SH.K+'], row-tiled';`+
+    `if(lx)lx.textContent='X: activation matrix ['+SH.K+'x'+B+'] (Q8_1)';`+
+    `if(ly)ly.textContent='Y: output tiles ('+MY+'x'+MX+', 1/workgroup)';}`+
+    `else{if(lw)lw.textContent='W: weight row, K split across waves (split-K)';`+
+    `if(lx)lx.textContent='X: activation (Q8_1, shared/LDS)';`+
+    `if(ly)ly.textContent='Y: output (fp32, 1/workgroup)';}})();`+
+    `if(SH.mmq){fEl.textContent='Y['+N+'x'+B+'] = W['+N+'x'+SH.K+'] * X['+SH.K+'x'+B+']'`+
+    `+'   (K='+SH.K+' reduction, N='+N+' rows, B='+B+' prompt tokens; W gguf ne=['+SH.K+'x'+(SH.trueN||N)+'], '+(SH.q||'')+' -- GEMM)';}`+
+    `else{fEl.textContent='Y['+N+'x1] = W['+N+'x'+SH.K+'] * X['+SH.K+'x1]'`+
+    `+'   (K='+SH.K+' reduction, N='+N+' output; W gguf ne=['+SH.K+'x'+N+'], '+(SH.q||'')+' -- matvec)';}`+
     // notes panel: one parameter per row (key | value), from the actual launched grid.
     `var wRow=Kb*SB,wTot=N*wRow,aBytes=Ab*36;`+
     // chip occupancy / tail effect: the chip runs HWS wavefronts concurrently
@@ -3077,12 +3649,29 @@ function openTilingView(shape){
     `var ROUNDS=Math.ceil(N/HWS),TAIL=N%HWS,TAILW=(TAIL===0?HWS:TAIL);`+
     `var TAILPCT=Math.round(100*TAILW/HWS),FULL=(TAIL===0);`+
     `function nrow(k,v){return '<span class="k">'+k+'</span><span>'+v+'</span>';}`+
+    `if(SH.mmq){`+
+    // MMQ GEMM notes: 1 workgroup = 1 output TILE (mmq_y rows x mmq_x cols), computed
+    // by nwarps=4 waves cooperatively via WMMA over K strips; activation X is a K x B
+    // matrix (Q8_1-requantized), not a shared vector.
     `notesEl.innerHTML=`+
-    `nrow('waves/workgroup (nwarps):', WPW)+`+
-    `nrow('rows/workgroup:', RPW+'   (1 wave = 1 output row)')+`+
+    `nrow('kernel:', 'mul_mat_q (prefill GEMM, WMMA)')+`+
+    `nrow('batch B (prompt tokens):', B)+`+
+    `nrow('output tile:', MY+' rows x '+MX+' cols   (mmq_y x mmq_x)')+`+
+    `nrow('waves/workgroup (nwarps):', WPW+'   (cooperate on 1 tile via WMMA)')+`+
+    `nrow('threads/block:', (SH.wg>0?SH.wg:(WPW*(SH.wave||32))))+`+
+    `nrow('output tiles (blocks):', NTILES+'   ('+NTY+' row-tiles x '+NTX+' col-tile'+(NTX>1?'s':'')+')')+`+
+    `nrow('device wavefront slots:', HWS+'   (WGP x SIMD x 16 slots)')+`+
+    `nrow('each tile reads:', 'W '+MY+'x'+SH.K+' ('+Kb+' SB/row) + X '+SH.K+'x'+MX+' (Q8_1)')+`+
+    `nrow('weight bytes:', (wTot/1048576).toFixed(2)+' MB   ('+N+' rows x '+Kb+' SB x'+SB+'B)')+`+
+    `nrow('MACs (2*N*K*B):', ((2*N*SH.K*B)/1e9).toFixed(2)+' GMAC');`+
+    `}else{`+
+    `notesEl.innerHTML=`+
+    `nrow('waves/workgroup (nwarps):', WPW+(WPW>1?'   (split-K: '+WPW+' waves share 1 row)':''))+`+
+    `nrow('rows/workgroup:', RPW+'   (1 workgroup = 1 output row)')+`+
+    `nrow('K per wave:', WPW>1?('~'+Math.ceil(Kb/WPW)+' of '+Kb+' superblocks   (K reduction split '+WPW+' ways)'):(Kb+' superblocks (whole row)'))+`+
     `nrow('workgroups (blocks):', NWG)+`+
     `nrow('threads/block:', (SH.wg>0?SH.wg:'(n/a)'))+`+
-    `nrow('total waves = output rows:', N)+`+
+    `nrow('total workgroups = output rows:', N)+`+
     `nrow('device wavefront slots:', HWS+'   (WGP x SIMD x 16 slots)')+`+
     `nrow('occupancy rounds:', ROUNDS+' waves-deep   (ceil('+N+'/'+HWS+'))')+`+
     `nrow('last round:', FULL?(HWS+' waves = full'):`+
@@ -3090,28 +3679,59 @@ function openTilingView(shape){
     `nrow('each row:', Kb+' superblocks x'+SB+'B='+wRow+'B weight')+`+
     `nrow('activation:', aBytes+'B shared in LDS')+`+
     `nrow('total weight:', (wTot/1048576).toFixed(2)+' MB');`+
-    // occupancy footnote: a mini bar of ROUNDS segments, last one partially filled
-    // to show the tail (partial chip occupancy when N not divisible by HWS).
+    `}`+
+    // occupancy footnote. Decode: N waves over HWS slots. MMQ: NTILES workgroups x
+    // WPW waves each. The ROUNDS denominator is the ACHIEVABLE resident waves, not the
+    // full HWS slot count -- register pressure caps residency: VGPR limits waves/SIMD
+    // to floor(vgprPerSimd/vgpr) (<= the 16-slot cap), so RESW = min(slots,vgprLim) x
+    // nSIMD. Using HWS here (as before) under-counted rounds (showed 1 when the VGPR
+    // cap forces 2). Falls back to HWS when VGPR data is absent.
+    `var OW=SH.mmq?(NTILES*WPW):N;`+
+    `var vgLimO=(SH.vgpr>0?Math.floor(SH.vgprPerSimd/SH.vgpr):SH.slotsPerSimd);`+
+    `var wSimdO=Math.min(SH.slotsPerSimd||16,vgLimO);`+
+    `var RESW=(SH.nsimd>0)?(wSimdO*SH.nsimd):HWS;`+
+    `var vgCapped=(SH.mmq&&SH.vgpr>0&&vgLimO<(SH.slotsPerSimd||16));`+
+    `ROUNDS=Math.ceil(OW/RESW);TAIL=OW%RESW;TAILW=(TAIL===0?RESW:TAIL);`+
+    `TAILPCT=Math.round(100*TAILW/RESW);FULL=(TAIL===0);`+
     `var occ=document.getElementById('occnote');`+
     `if(occ){var seg='';var shown=Math.min(ROUNDS,8);`+
     `for(var i=0;i<shown;i++){var last=(i===ROUNDS-1);var pct=last?TAILPCT:100;`+
-    `seg+='<span class="occbar" title="round '+(i+1)+': '+pct+'% of '+HWS+' slots">'`+
+    `seg+='<span class="occbar" title="round '+(i+1)+': '+pct+'% of '+RESW+' resident waves">'`+
     `+'<span class="occfill" style="width:'+pct+'%;background:'+(last&&!FULL?'#e0a341':'#3fb950')+'"></span></span>';}`+
     `if(ROUNDS>shown)seg+='<span class="occmore">+'+(ROUNDS-shown)+' more</span>';`+
-    `occ.innerHTML='<b>device occupancy:</b> '+ROUNDS+' round'+(ROUNDS>1?'s':'')+' of '+HWS+' wavefronts '`+
-    `+seg+(FULL?' <span class="occok">fully packed</span>':' <span class="occwarn">last round '+TAILPCT+'% ('+(HWS-TAILW)+' idle slots)</span>');}`+
+    `occ.innerHTML='<b>device occupancy:</b> '+(SH.mmq?(NTILES+' tiles x '+WPW+' waves = '+OW+' waves, '):'')+ROUNDS+' round'+(ROUNDS>1?'s':'')+' of '+RESW+' resident waves '`+
+    `+(vgCapped?('<span class=\"occwarn\">(VGPR-capped: '+wSimdO+'/'+SH.slotsPerSimd+' slots/SIMD, '+SH.vgpr+' VGPR)</span> '):('of '+HWS+' slots '))+`+
+    `seg+(FULL?' <span class="occok">fully packed</span>':' <span class="occwarn">last round '+TAILPCT+'% ('+(RESW-TAILW)+' idle)</span>');}`+
     // superblock definition (from the concept glossary), shown as a footnote
     `var sbn=document.getElementById('sbnote');`+
     `if(sbn&&SH.sbHelp)sbn.innerHTML='<b>superblock (SB):</b> '+`+
     `SH.sbHelp.replace(/&/g,'&amp;').replace(/</g,'&lt;');`+
+    // MMQ tile-size provenance: how mmq_y and mmq_x are chosen (from ggml mmq.cuh).
+    `var tn=document.getElementById('tilenote');`+
+    `if(tn&&SH.mmq)tn.innerHTML='<b>mmq_y='+MY+'</b> (output row-tile) is a hard-coded '+`+
+    `'per-arch constant in ggml-cuda mmq.cuh (get_mmq_y_host): 64 on RDNA3.5 (gfx115x), '+`+
+    `'128 on most other AMD/NVIDIA. It sets N-tiling: N is split into ceil(N/'+MY+') row-tiles. '+`+
+    `'&nbsp;&nbsp;<b>mmq_x='+MX+'</b> (output col-tile) is chosen at launch (mul_mat_q_case): '+`+
+    `'try mmq_x from 8 up to the cap (128 on gfx1151) in steps of 8, keep any value that '+`+
+    `'meets the WMMA granularity and fits shared memory, and pick the one giving the fewest '+`+
+    `'column tiles -- i.e. the largest mmq_x that fits (LDS/granularity often bind before '+`+
+    `'the 128 cap). ncols_to_tile is the batch (ncols_max, or 2x ncols_per_expert for MoE). '+`+
+    `'Recovered from the launched grid: NTX = blocks/NTY = '+NTX+', so mmq_x = ceil('+B+'/'+NTX+`+
+    `') = '+MX+' ('+NTX+' col-tile'+(NTX>1?'s':'')+' of '+MY+'x'+MX+').';`+
     `var FN='ui-monospace,Menlo,Consolas,monospace';`+
     // Elided conceptual schematic: show only the FIRST + LAST output row (N-2 rows
     // collapsed to an ellipsis band) and, within each row, only the FIRST + LAST
     // super-block (K/256-2 collapsed to a "..." column). Fixed size, not 8192 lanes.
-    `function draw(){var dpr=window.devicePixelRatio||1;`+
-    `var GUT=110,GAP=28,ACT=48,OUT=96,AX=52;`+
-    `var cw=Math.round(200*TZ),ew=96,CH=Math.round(104*TZ),EH=Math.round(72*TZ);`+
-    `var Wx=GUT,Wend=Wx+cw+ew+cw,Xx=Wend+GAP,Yx=Xx+ACT+GAP;`+
+    `function draw(){if(SH.mmq){return drawMMQ();}var dpr=window.devicePixelRatio||1;`+
+    `var GUT=150,GAP=28,ACT=48,OUT=96,AX=56;`+
+    `var CH=Math.round(104*TZ),EH=Math.round(72*TZ);`+
+    // Row weight strip is split into up to WPW wave-segments along K (split-K). Show
+    // the first + last K-superblock of each wave-segment, wave-segments elided when
+    // WPW>3. Each segment is colored by wave. cwSeg = width of one wave-segment.
+    `var nSeg=Math.min(WPW,3),segEll=(WPW>nSeg),sc=Math.round(84*TZ),se=Math.round(30*TZ);`+
+    `var segW=sc+se+sc,SEGGAP=Math.round(10*TZ);`+
+    `var stripW=nSeg*segW+(nSeg-1)*SEGGAP+(segEll?(SEGGAP+Math.round(28*TZ)):0);`+
+    `var Wx=GUT,Xx=Wx+stripW+GAP,Yx=Xx+ACT+GAP;`+
     `var y0=AX,yE=AX+CH,y1=AX+CH+EH,bot=y1+CH;`+
     `var W=Math.max(wrap.clientWidth||900,Yx+OUT+16),H=bot+14;`+
     `cv.style.width=W+'px';cv.style.height=H+'px';`+
@@ -3121,44 +3741,153 @@ function openTilingView(shape){
     // header band
     `g.fillStyle='#161b22';g.fillRect(0,0,W,AX);g.fillStyle='#c8d0da';g.textAlign='center';`+
     `g.font='18px '+FN;`+
-    `g.fillText('row (wave)',GUT/2,AX/2);`+
-    `g.fillText('W: '+N+' rows x '+Kb+' superblocks',Wx+(cw+ew+cw)/2,AX/2);`+
+    `g.fillText('workgroup (=1 row)',GUT/2,AX/2);`+
+    `g.fillText(WPW>1?('W row: '+Kb+' superblocks, K split across '+WPW+' waves'):('W row: '+Kb+' superblocks'),Wx+stripW/2,AX/2);`+
     `g.fillText('X[K]',Xx+ACT/2,AX/2);`+
     `g.fillText('Y[N]',Yx+OUT/2,AX/2);`+
     // one labeled cell (fill + bold title + optional subtitle)
-    `function cell(x,y,w,h,fill,txt,sub){g.fillStyle=fill;g.fillRect(x,y,w,h);`+
-    `g.strokeStyle='#0d1117';g.lineWidth=1;g.strokeRect(x+0.5,y+0.5,w-1,h-1);`+
-    `g.fillStyle='#0d1117';g.textAlign='center';g.font='bold 19px '+FN;`+
-    `g.fillText(txt,x+w/2,y+h/2+(sub?-11:0));`+
-    `if(sub){g.font='15px '+FN;g.fillText(sub,x+w/2,y+h/2+13);}}`+
-    // draw one shown output row: SB0 | ... | SB(last) weight cells + Y output cell
-    `function rowband(yy,ri,wg){var col=WGP[wg%WGP.length];`+
+    `function cell(x,yy,w,h,fill,txt,sub){g.fillStyle=fill;g.fillRect(x,yy,w,h);`+
+    `g.strokeStyle='#0d1117';g.lineWidth=1;g.strokeRect(x+0.5,yy+0.5,w-1,h-1);`+
+    `g.fillStyle='#0d1117';g.textAlign='center';g.font='bold 17px '+FN;`+
+    `g.fillText(txt,x+w/2,yy+h/2+(sub?-11:0));`+
+    `if(sub){g.font='13px '+FN;g.fillText(sub,x+w/2,yy+h/2+13);}}`+
+    // Kb superblocks partitioned across WPW waves: wave w owns superblocks
+    // [w*per, (w+1)*per). Return [sb0,sbLast] for the shown wave segment index si.
+    `var per=Math.ceil(Kb/WPW);`+
+    `function segSB(si){var lo=si*per,hi=Math.min((si+1)*per,Kb)-1;return [lo,hi];}`+
+    // draw one WG band (= one output row ri): the K weight strip (wave-colored
+    // segments) + the shared X + the single Y output.
+    `function rowband(yy,ri){`+
     `g.fillStyle='#9fb0c4';g.textAlign='right';g.font='18px '+FN;`+
-    `g.fillText('row '+ri,GUT-8,yy+CH/2-11);`+
-    `g.fillStyle='#7fd0ff';g.font='15px '+FN;g.fillText('WG'+wg,GUT-8,yy+CH/2+13);`+
-    `cell(Wx,yy,cw,CH,col,'SB0',SB+'B');`+
-    `cell(Wx+cw+ew,yy,cw,CH,col,'SB'+(Kb-1),SB+'B');`+
-    `g.fillStyle='#6f7d8f';g.textAlign='center';g.font='26px '+FN;`+
-    `g.fillText('...',Wx+cw+ew/2,yy+CH/2);`+
+    `g.fillText('row '+ri,GUT-10,yy+CH/2-10);`+
+    `g.fillStyle='#7fd0ff';g.font='13px '+FN;`+
+    `g.fillText('WG'+ri,GUT-10,yy+CH/2+12);`+
+    `var x=Wx;`+
+    `for(var si=0;si<nSeg;si++){var col=WGP[si%WGP.length],sb=segSB(si);`+
+    `cell(x,yy,sc,CH,col,'SB'+sb[0],(WPW>1?'w'+si:SB+'B'));`+
+    `g.fillStyle='#6f7d8f';g.textAlign='center';g.font='22px '+FN;g.fillText('...',x+sc+se/2,yy+CH/2);`+
+    `cell(x+sc+se,yy,sc,CH,col,'SB'+sb[1],(WPW>1?'w'+si:SB+'B'));`+
+    `x+=segW;`+
+    `if(si<nSeg-1){g.fillStyle='#6f7d8f';g.textAlign='center';g.font='18px '+FN;`+
+    `g.fillText('|',x-SEGGAP/2,yy+CH/2);}}`+
+    `if(segEll){g.fillStyle='#6f7d8f';g.textAlign='center';g.font='24px '+FN;`+
+    `g.fillText(String.fromCharCode(8943),x+SEGGAP+14,yy+CH/2);`+                 // horizontal ellipsis
+    `g.fillStyle='#9fb0c4';g.font='12px '+FN;`+
+    `g.fillText('+'+(WPW-nSeg)+' waves',x+SEGGAP+14,yy+CH/2+18);}`+
     `cell(Yx,yy,OUT,CH,'#c9d4e2','y['+ri+']','fp32');}`+
-    `rowband(y0,0,0);`+
-    `rowband(y1,N-1,Math.floor((N-1)/RPW));`+
-    // ellipsis band between first & last row (vertical dots + count)
+    `rowband(y0,0);`+
+    `rowband(y1,N-1);`+
+    // ellipsis band between first & last workgroup/row
     `g.fillStyle='#6f7d8f';g.textAlign='center';g.font='26px '+FN;`+
-    `g.fillText(String.fromCharCode(8942),Wx+cw/2,yE+EH/2);`+                 // vertical ellipsis
-    `g.fillText(String.fromCharCode(8942),Wx+cw+ew+cw/2,yE+EH/2);`+
+    `g.fillText(String.fromCharCode(8942),Wx+stripW/2,yE+EH/2);`+
     `g.fillText(String.fromCharCode(8942),Yx+OUT/2,yE+EH/2);`+
     `g.fillStyle='#9fb0c4';g.font='16px '+FN;`+
-    `g.fillText('('+(N-2)+' rows elided)',Wx+(cw+ew+cw)/2,yE+EH/2);`+
-    // X activation strip: shared vector, spans all rows; first/last element labeled
+    `g.fillText('('+(N-2)+' workgroups / rows elided)',Wx+stripW/2,yE+EH/2+22);`+
+    // X activation strip: shared vector, spans all rows; labeled
     `g.fillStyle='#2d3f2f';g.fillRect(Xx,y0,ACT,bot-y0);`+
     `g.strokeStyle='#3fb950';g.lineWidth=1;g.strokeRect(Xx+0.5,y0+0.5,ACT-1,bot-y0-1);`+
     `g.save();g.translate(Xx+ACT/2,(y0+bot)/2);g.rotate(-Math.PI/2);`+
     `g.fillStyle='#9fe6b0';g.textAlign='center';g.font='15px '+FN;`+
     `g.fillText('x[0..'+(SH.K-1)+'] shared (LDS)',0,0);g.restore();`+
-    // count of elided super-blocks, under the '...' column of the first row
-    `if(Kb>2){g.fillStyle='#6f7d8f';g.textAlign='center';g.font='14px '+FN;`+
-    `g.fillText('+'+(Kb-2),Wx+cw+ew/2,y0+CH/2+13);}`+
+    `}`+
+    // MMQ prefill GEMM schematic, TEXTBOOK "staircase" layout:
+    //
+    //                 [ X : K x B ]        (top-right)
+    //   [ W : N x K ] [ Y : N x B ]        (bottom-left, bottom-right)
+    //
+    // Y[i,j] sits at the intersection of W's row-band i and X's col-band j -- the
+    // classic outer-product placement. Top-left quadrant is empty. All three are
+    // drawn as elided cells (first+last on each axis); Y cells are the output tiles,
+    // each = one workgroup (WG = tr + tc*NTY). W row-bands align vertically with Y
+    // rows; X col-bands align horizontally with Y cols, so you can read Y[tr,tc] as
+    // "W band tr" x "X band tc".
+    `function drawMMQ(){var dpr=window.devicePixelRatio||1;`+
+    `var FN='ui-monospace,Menlo,Consolas,monospace';`+
+    // Whole canvas picture at 1.5x baseline (cells + text + gaps scale together).
+    // Zoom (TZ) scales on top; Fit resets to this 1.5x baseline.
+    `var Z=TZ*1.5,CZ=Z;`+
+    `var CELL=Math.round(42*CZ),EL=Math.round(15*Z),GX=Math.round(7*Z);`+
+    `var yr=(NTY<=2?NTY:3),yc=(NTX<=2?NTX:3),kc=(Kb<=2?Kb:3);`+
+    `function em(s,shown,tot){if(tot<=2)return s;if(s===0)return 0;if(s===shown-1)return tot-1;return -1;}`+
+    // axis(tot,shown): per-slot {pos,size} (ellipsis slot = EL, real = CELL) + total.
+    `function axis(tot,shown){var pos=[],sz=[],x=0;for(var s=0;s<shown;s++){`+
+    `var w=(em(s,shown,tot)<0)?EL:CELL;pos.push(x);sz.push(w);x+=w+GX;}`+
+    `return {pos:pos,sz:sz,tot:x-GX};}`+
+    `var axN=axis(NTY,yr),axK=axis(Kb,kc),axB=axis(NTX,yc);`+
+    `var wBoxW=axK.tot,wBoxH=axN.tot,xBoxW=axB.tot,xBoxH=axK.tot,yBoxW=axB.tot,yBoxH=axN.tot;`+
+    // HGAP (W<->Y horizontal) is wider than VGAP (X<->Y vertical): it holds the '='
+    // sign AND keeps W's centered K-caption from colliding with Y's centered caption.
+    `var GUT=Math.round(60*Z),TOP=Math.round(42*Z),HGAP=Math.round(64*Z),VGAP=Math.round(26*Z),PAD=Math.round(16*Z);`+
+    `var Wx=GUT,Yx=Wx+wBoxW+HGAP,Xx=Yx;`+
+    `var Xy=TOP,Wy=Xy+xBoxH+VGAP,Yy=Wy;`+
+    // extra right margin for X's B/col-tile caption drawn to the right of the X block.
+    // right margin holds the X B-caption and the Y[i,j] hint drawn beside the grids.
+    `var Wcanvas=Math.max(wrap.clientWidth||900,Yx+yBoxW+Math.round(170*Z)+PAD),`+
+    `Hc=Yy+yBoxH+PAD+Math.round(34*Z);`+
+    `cv.style.width=Wcanvas+'px';cv.style.height=Hc+'px';`+
+    `cv.width=Math.floor(Wcanvas*dpr);cv.height=Math.floor(Hc*dpr);`+
+    `var g=cv.getContext('2d');g.setTransform(dpr,0,0,dpr,0,0);`+
+    `g.clearRect(0,0,Wcanvas,Hc);g.textBaseline='middle';`+
+    `function lbl(t,x,y,c,sz){g.fillStyle=c||'#c8d0da';g.textAlign='center';`+
+    `g.font=Math.round((sz||12)*Z)+'px '+FN;g.fillText(t,x,y);}`+
+    `function hbr(a,b,y,t,col){g.strokeStyle=col;g.lineWidth=1;var tk=Math.round(4*Z);`+
+    `g.beginPath();g.moveTo(a+0.5,y+tk);g.lineTo(a+0.5,y);g.lineTo(b+0.5,y);g.lineTo(b+0.5,y+tk);g.stroke();`+
+    `g.fillStyle=col;g.textAlign='center';g.font=Math.round(10*Z)+'px '+FN;g.fillText(t,(a+b)/2,y-Math.round(6*Z));}`+
+    `function vbr(a,b,x,t,col){g.strokeStyle=col;g.lineWidth=1;var tk=Math.round(4*Z);`+
+    `g.beginPath();g.moveTo(x-tk,a+0.5);g.lineTo(x,a+0.5);g.lineTo(x,b+0.5);g.lineTo(x-tk,b+0.5);g.stroke();`+
+    `g.save();g.translate(x-Math.round(8*Z),(a+b)/2);g.rotate(-Math.PI/2);`+
+    `g.fillStyle=col;g.textAlign='center';g.font=Math.round(10*Z)+'px '+FN;g.fillText(t,0,0);g.restore();}`+
+    // draw one cell at (bx+col.pos, by+row.pos) sized col.sz x row.sz; ellipsis slots
+    // (real idx <0) render a thin dots band instead of a labelled cell.
+    `function cellAt(bx,by,ax,ay,ci,ri,realC,realR,fill,stroke,txt,tc2){`+
+    `var x=bx+ax.pos[ci],y=by+ay.pos[ri],w=ax.sz[ci],h=ay.sz[ri];`+
+    `if(realC<0||realR<0){g.fillStyle='#6f7d8f';g.textAlign='center';g.font=Math.round(14*Z)+'px '+FN;`+
+    `g.fillText(String.fromCharCode(realR<0?8942:8230),x+w/2,y+h/2);return;}`+
+    `g.fillStyle=fill;g.fillRect(x,y,w,h);g.strokeStyle=stroke;g.lineWidth=1;g.strokeRect(x+0.5,y+0.5,w-1,h-1);`+
+    `if(txt&&w>=Math.round(24*Z)){g.fillStyle=tc2||'#0d1117';g.textAlign='center';g.font=Math.round(9*Z)+'px '+FN;g.fillText(txt,x+w/2,y+h/2);}}`+
+    // ---- X (top-right): axK rows (K) x axB cols (B); col-band 0 highlighted green ----
+    `for(var xr=0;xr<kc;xr++){for(var xc=0;xc<yc;xc++){`+
+    `var kk=em(xr,kc,Kb),tc=em(xc,yc,NTX),hl=(tc===0);`+
+    `cellAt(Xx,Xy,axB,axK,xc,xr,tc,kk,hl?'#2d6f3f':'rgba(63,185,80,.16)',hl?'#8fe3a0':'#356b45','c'+tc,hl?'#dff3e4':'#8fe3a0');}}`+
+    `lbl('X ['+SH.K+'x'+B+']',Xx+xBoxW/2,Xy-Math.round(22*Z),'#3fb950',12);`+
+    `hbr(Xx+axB.pos[0],Xx+axB.pos[0]+axB.sz[0],Xy-Math.round(6*Z),'mmq_x='+MX,'#8fe3a0');`+
+    `vbr(Xy,Xy+xBoxH,Xx-Math.round(6*Z),'K='+SH.K,'#9fb0c4');`+
+    // X's B/col-tile caption goes to the RIGHT of the X block (not in the gap below,
+    // which the W title + '=' occupy), stacked under the K bracket area.
+    `g.fillStyle='#9fb0c4';g.textAlign='left';g.font=Math.round(10*Z)+'px '+FN;`+
+    `g.fillText('B='+B+', '+NTX+' col-tile'+(NTX>1?'s':''),Xx+xBoxW+Math.round(8*Z),Xy+xBoxH/2);`+
+    // ---- W (bottom-left): axN rows (N) x axK cols (K); row-band 0 highlighted orange ----
+    `for(var wr=0;wr<yr;wr++){for(var wc=0;wc<kc;wc++){`+
+    `var tr=em(wr,yr,NTY),kk=em(wc,kc,Kb),hl=(tr===0);`+
+    `cellAt(Wx,Wy,axK,axN,wc,wr,kk,tr,hl?'#e8912a':'rgba(232,145,42,.18)',hl?'#ffcf9b':'#7a5a34','SB'+kk,hl?'#0d1117':'#c8994a');}}`+
+    `lbl('W ['+N+'x'+SH.K+']',Wx+wBoxW/2,Wy-Math.round(9*Z),'#e8912a',12);`+
+    `vbr(Wy+axN.pos[0],Wy+axN.pos[0]+axN.sz[0],Wx-Math.round(6*Z),'mmq_y='+MY,'#ffb454');`+
+    `vbr(Wy,Wy+wBoxH,Wx-Math.round(28*Z),'N='+N,'#9fb0c4');`+
+    `lbl('K='+SH.K+'='+Kb+' SB ('+SH.q+')',Wx+wBoxW/2,Wy+wBoxH+Math.round(12*Z),'#9fb0c4',10);`+
+    // ---- Y (bottom-right): axN rows x axB cols; each cell = one WG output tile ----
+    `for(var yrr=0;yrr<yr;yrr++){for(var ycc=0;ycc<yc;ycc++){`+
+    `var tr=em(yrr,yr,NTY),tc=em(ycc,yc,NTX);`+
+    `var x=Yx+axB.pos[ycc],y=Yy+axN.pos[yrr],w=axB.sz[ycc],h=axN.sz[yrr];`+
+    `if(tr<0||tc<0){g.fillStyle='#6f7d8f';g.textAlign='center';g.font=Math.round(14*Z)+'px '+FN;`+
+    `g.fillText(String.fromCharCode(tr<0?8942:8230),x+w/2,y+h/2);continue;}`+
+    `var first=(tr===0&&tc===0),wgid=tr+tc*NTY;`+
+    `g.fillStyle=first?'#c9d4e2':'rgba(201,212,226,.16)';g.fillRect(x,y,w,h);`+
+    `g.strokeStyle=first?'#ffffff':'#8a94a6';g.lineWidth=first?2:1;g.strokeRect(x+0.5,y+0.5,w-1,h-1);`+
+    `if(w>=Math.round(24*Z)){g.textAlign='center';`+
+    `g.fillStyle=first?'#0d1117':'#c8d0da';g.font='bold '+Math.round(9*Z)+'px '+FN;`+
+    `g.fillText('WG'+wgid,x+w/2,y+h/2-Math.round(4*Z));`+
+    `g.fillStyle=first?'#33414f':'#8a94a6';g.font=Math.round(8*Z)+'px '+FN;`+
+    `g.fillText('t'+tr+','+tc,x+w/2,y+h/2+Math.round(6*Z));}}}`+
+    // Y captions below the Y block (dims/tiles + WG rule); the outer-product hint
+    // goes to the RIGHT of the grid (two short lines, left-aligned, centered on the
+    // block) to save a vertical row.
+    `lbl('Y ['+N+'x'+B+'] = '+NTILES+' tiles ('+NTY+'x'+NTX+')',Yx+yBoxW/2,Wy+wBoxH+Math.round(12*Z),'#c9d4e2',11);`+
+    `lbl('1 WG = 1 tile '+MY+'x'+MX+', '+WPW+' waves (WMMA)',Yx+yBoxW/2,Wy+wBoxH+Math.round(26*Z),'#9fb0c4',10);`+
+    `g.fillStyle='#8a94a6';g.textAlign='left';g.font=Math.round(10*Z)+'px '+FN;`+
+    `g.fillText('Y[i,j] =',Yx+yBoxW+Math.round(10*Z),Yy+yBoxH/2-Math.round(8*Z));`+
+    `g.fillText('W row i . X col j',Yx+yBoxW+Math.round(10*Z),Yy+yBoxH/2+Math.round(8*Z));`+
+    `g.fillStyle='#c8d0da';g.textAlign='center';g.font=Math.round(18*Z)+'px '+FN;`+
+    `g.fillText('=',Wx+wBoxW+HGAP/2,Wy+axN.sz[0]/2);`+
     `}`+
     `function zoom(f){TZ=Math.max(0.25,Math.min(20,TZ*f));draw();}`+
     `document.getElementById('zin').onclick=function(){zoom(1.4);};`+
@@ -3166,6 +3895,103 @@ function openTilingView(shape){
     `document.getElementById('fit').onclick=function(){TZ=1;draw();};`+
     `cv.addEventListener('wheel',function(e){if(e.ctrlKey||e.altKey){zoom(e.deltaY<0?1.15:1/1.15);e.preventDefault();return;}`+
     `wrap.scrollTop+=e.deltaY;e.preventDefault();},{passive:false});`+
+    // ---- CONCURRENCY VIEW (opens in its OWN full window) ----
+    // A condensed full-grid picture: every cell of W (NTY x Kb), X (Kb x NTX), Y
+    // (NTY x NTX) at ~cell-px scale in the staircase placement, with a round stepper
+    // that lights the workgroups (+ the W row / X col they read) running each
+    // scheduling round. Built as a self-contained popup so it fills the whole screen.
+    `document.getElementById('ccopen').style.display=SH.mmq?'':'none';`+
+    `function openCC(){`+
+    `var wpwg=WPW||1,vgLim=(SH.vgpr>0?Math.floor(SH.vgprPerSimd/SH.vgpr):SH.slotsPerSimd);`+
+    `var wSimd=Math.min(SH.slotsPerSimd,vgLim),resWG=Math.max(1,Math.floor(wSimd*SH.nsimd/wpwg));`+
+    `var rounds=Math.ceil((NTY*NTX)/resWG);`+
+    `var cw=window.open('','_blank');if(!cw){alert('Popup blocked -- allow popups.');return;}`+
+    `var P={N:N,Kb:Kb,NTY:NTY,NTX:NTX,MY:MY,MX:MX,B:B,K:SH.K,resWG:resWG,rounds:rounds};`+
+    // NOTE: esc() is NOT available here (this runs in the tiling-view popup, its own
+    // document). Sanitize the title inline instead of calling esc().
+    `var nm=(SH.nm||'').replace(/[<>&]/g,'');`+
+    `var d='<!doctype html><html><head><meta charset=\"utf-8\"><title>concurrency -- '+nm+'</title><style>'+`+
+    `'*{box-sizing:border-box}body{margin:0;background:#0d1117;color:#d7dde5;font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif;'+`+
+    `'display:flex;flex-direction:column;height:100vh}'+`+
+    `'#b{flex:0 0 auto;display:flex;align-items:center;gap:12px;padding:10px 16px;background:#161b22;border-bottom:1px solid #2a3340;flex-wrap:wrap}'+`+
+    `'#b h2{margin:0;font-size:16px;color:#dbe6f5}#b button{background:#1f2733;color:#d7dde5;border:1px solid #3a4553;'+`+
+    `'border-radius:4px;padding:5px 12px;font-size:13px;cursor:pointer}#b button:hover{background:#2a3340}'+`+
+    `'#i{color:#9fb0c4;font-size:13px}#w{flex:1 1 auto;overflow:auto;min-height:0}#c{display:block}'+`+
+    `'</style></head><body><div id=\"b\"><h2>Concurrency: workgroups by scheduling round</h2>'+`+
+    `'<button id=\"pv\">&lt; prev</button><button id=\"nx\">next &gt;</button><button id=\"al\">show all</button>'+`+
+    `'<button id=\"zo\">Zoom &minus;</button><button id=\"zi\">Zoom +</button><button id=\"zf\">Fit</button>'+`+
+    `'<span id=\"i\"></span></div><div id=\"w\"><canvas id=\"c\"></canvas></div><scr'+'ipt>'+`+
+    `'var P='+JSON.stringify(P)+';var R=0,ZM=1;'+`+
+    `'var FN=\"ui-monospace,Menlo,Consolas,monospace\";'+`+
+    `'var cv=document.getElementById(\"c\"),info=document.getElementById(\"i\"),wrap=document.getElementById(\"w\");'+`+
+    `'function draw(){var dpr=window.devicePixelRatio||1;'+`+
+    // N-axis banding: a tall/narrow tile grid (e.g. 128x2) becomes a skinny strip if
+    // every row is drawn. Instead collapse the NTY rows into at most RBMAX bands, each
+    // covering bandN=ceil(NTY/RBMAX) real rows. A band lights if ANY row it covers runs
+    // the round (so the resident-set boundary still shows). With few rows (<=RBMAX) it
+    // is 1 row/band (no loss). This keeps the picture readable AND lets cells be big.
+    `'var availH=(wrap.clientHeight||600)-40,availW=(wrap.clientWidth||900);'+`+
+    `'var RBMAX=48,RB=Math.min(P.NTY,RBMAX),bandN=Math.ceil(P.NTY/RB);RB=Math.ceil(P.NTY/bandN);'+`+
+    // cell size fits RB bands into ~85% height (bands, not rows -> much bigger cells);
+    // separate cell width so narrow col counts (NTX/Kb) also get a decent size.
+    // base cell sizes fit the view; ZM (zoom, buttons/ctrl+wheel) scales on top so the
+    // pane can scroll to a larger picture.
+    `'var csz=Math.max(5,Math.min(24,Math.floor(availH*0.68/RB)))*ZM;'+`+
+    `'var cw=Math.max(csz,Math.min(37,Math.floor(availW*0.16/Math.max(P.Kb,P.NTX)))*ZM);'+`+
+    `'var gap=Math.round(cw*1.5)+30,lbl=96;'+`+
+    `'var wgw=P.Kb*cw,xgw=P.NTX*cw,gh=RB*csz,xh=P.Kb*csz;'+`+
+    `'var Wx=lbl,Yx=Wx+wgw+gap,Xx=Yx,Xy=40,Wy=Xy+xh+gap,Yy=Wy;'+`+
+    `'var Wpix=Math.max(Yx+xgw+240,availW),Hpix=Wy+gh+40;'+`+
+    `'cv.style.width=Wpix+\"px\";cv.style.height=Hpix+\"px\";cv.width=Math.floor(Wpix*dpr);cv.height=Math.floor(Hpix*dpr);'+`+
+    `'var g=cv.getContext(\"2d\");g.setTransform(dpr,0,0,dpr,0,0);g.clearRect(0,0,Wpix,Hpix);g.textBaseline=\"middle\";'+`+
+    `'function aw(tr,tc){if(R<0)return true;var id=tr+tc*P.NTY;return id>=R*P.resWG&&id<(R+1)*P.resWG;}'+`+
+    // band+col active: any row in band b, at column tc, running this round. Y uses this
+    // (per-tile) so a column only lights where its WGs actually run -- not the whole
+    // column. bandA (any column) is used for W rows (a W row is read by whichever
+    // col-tile includes it).
+    `'function bcA(b,tc){if(R<0)return true;var lo=b*bandN,hi=Math.min(lo+bandN,P.NTY);'+`+
+    `'for(var r=lo;r<hi;r++)if(aw(r,tc))return true;return false;}'+`+
+    `'function bandA(b){for(var t=0;t<P.NTX;t++)if(bcA(b,t))return true;return false;}'+`+
+    `'function cA(tc){if(R<0)return true;for(var t=0;t<P.NTY;t++)if(aw(t,tc))return true;return false;}'+`+
+    `'var cs=Math.max(1,csz-(csz>=8?1.5:0.4)),cwc=Math.max(1,cw-(cw>=8?1.5:0.4));'+`+
+    // ACTIVE (accessed / executing this round) cells are RED; inactive cells stay dim
+    // in each matrix tint (W amber, X green, Y grey) so red pops. Titles keep the
+    // matrix color so W/X/Y remain identifiable.
+    `'var HOT=\"#ff4d4d\";'+`+
+    // W: RB row-bands x Kb superblock-cols; band red when any of its rows run.
+    `'for(var b=0;b<RB;b++){var on=bandA(b);for(var k=0;k<P.Kb;k++){'+`+
+    `'g.fillStyle=on?HOT:\"#3a2f22\";g.fillRect(Wx+k*cw,Wy+b*csz,cwc,cs);}}'+`+
+    `'g.fillStyle=\"#e8912a\";g.textAlign=\"center\";g.font=\"13px \"+FN;g.fillText(\"W \"+P.NTY+\"x\"+P.Kb,Wx+wgw/2,Xy+xh/2);'+`+
+    // X cols red when accessed this round
+    `'for(var k2=0;k2<P.Kb;k2++){for(var tc=0;tc<P.NTX;tc++){var o2=cA(tc);'+`+
+    `'g.fillStyle=o2?HOT:\"#22331f\";g.fillRect(Xx+tc*cw,Xy+k2*csz,cwc,cs);}}'+`+
+    `'g.fillStyle=\"#3fb950\";g.textAlign=\"left\";g.font=\"13px \"+FN;g.fillText(\"X \"+P.Kb+\"x\"+P.NTX,Xx+xgw+10,Xy+xh/2);'+`+
+    // Y: RB row-bands x NTX cols; each TILE red only where its own WGs run this round.
+    `'for(var yb=0;yb<RB;yb++){for(var x=0;x<P.NTX;x++){'+`+
+    `'g.fillStyle=bcA(yb,x)?HOT:\"#2a3038\";g.fillRect(Yx+x*cw,Yy+yb*csz,cwc,cs);}}'+`+
+    `'g.fillStyle=\"#c9d4e2\";g.textAlign=\"left\";g.font=\"13px \"+FN;g.fillText(\"Y \"+P.NTY+\"x\"+P.NTX,Yx+xgw+10,Wy+gh/2);'+`+
+    `'g.fillStyle=\"#9fb0c4\";g.textAlign=\"right\";g.font=\"11px \"+FN;'+`+
+    `'g.fillText(\"N=\"+P.N,Wx-8,Wy+gh/2-8);'+`+
+    `'if(bandN>1){g.font=\"10px \"+FN;g.fillText(\"(\"+bandN+\" rows/band)\",Wx-8,Wy+gh/2+8);}'+`+
+    `'var lit=(R<0?(P.NTY*P.NTX):Math.min(P.resWG,P.NTY*P.NTX-R*P.resWG));'+`+
+    `'info.textContent=(R<0?(\"all \"+(P.NTY*P.NTX)+\" workgroups\"):(\"round \"+(R+1)+\" of \"+P.rounds+\": \"+lit+\" workgroups running (\"+P.resWG+\"/round)\"))+`+
+    `\"  --  each lit Y tile = 1 WG reading its W row (all K) + shared X col\";}'+`+
+    `'document.getElementById(\"pv\").onclick=function(){R=(R<0?P.rounds-1:Math.max(0,R-1));draw();};'+`+
+    `'document.getElementById(\"nx\").onclick=function(){R=(R<0?0:Math.min(P.rounds-1,R+1));draw();};'+`+
+    `'document.getElementById(\"al\").onclick=function(){R=-1;draw();};'+`+
+    `'function zoom(f){ZM=Math.max(0.4,Math.min(8,ZM*f));draw();}'+`+
+    `'document.getElementById(\"zi\").onclick=function(){zoom(1.3);};'+`+
+    `'document.getElementById(\"zo\").onclick=function(){zoom(1/1.3);};'+`+
+    `'document.getElementById(\"zf\").onclick=function(){ZM=1;draw();};'+`+
+    `'cv.addEventListener(\"wheel\",function(e){if(e.ctrlKey||e.altKey){zoom(e.deltaY<0?1.15:1/1.15);e.preventDefault();}},{passive:false});'+`+
+    `'window.addEventListener(\"resize\",draw);'+`+
+    `'window.addEventListener(\"keydown\",function(e){if(e.key===\"Escape\")window.close();'+`+
+    `'else if(e.key===\"ArrowRight\")document.getElementById(\"nx\").click();'+`+
+    `'else if(e.key===\"ArrowLeft\")document.getElementById(\"pv\").click();'+`+
+    `'else if(e.key===\"+\"||e.key===\"=\")zoom(1.3);else if(e.key===\"-\")zoom(1/1.3);});draw();'+`+
+    `'</scr'+'ipt></body></html>';`+
+    `cw.document.open();cw.document.write(d);cw.document.close();}`+
+    `document.getElementById('ccopen').onclick=openCC;`+
     `window.addEventListener('resize',draw);draw();`+
     // Esc closes this tab (allowed: opened via window.open).
     `window.addEventListener('keydown',function(e){if(e.key==='Escape')window.close();});`+
@@ -3183,7 +4009,9 @@ function openTilingView(shape){
 function openDebugView(fam){
   const c=(D.att_code_by_fam||{})[fam];
   if(!c){ alert('No decoded ISA for this kernel yet -- trace it first.'); return; }
-  const w=window.open('','_blank');
+  // Named window: re-opening the trace view reuses the same tab instead of stacking a
+  // second popup on top of the first. One debug window per fam.
+  const w=window.open('','ruv_debug_'+fam.replace(/[^A-Za-z0-9_]/g,'_'));
   if(!w){ alert('Popup blocked -- allow popups for this page to open the debug view.'); return; }
   const maxStall=c.rows.reduce((m,r)=>Math.max(m,r.st||0),0)||1;
   const srcFiles=c.src_files||{};
@@ -3193,6 +4021,7 @@ function openDebugView(fam){
                  src_files:srcFiles, split:split, exec:c.exec||null,
                  waves:c.waves||null,
                  occ:((c.occ_ref!=null&&c.occ_ref>=0)?(D.att_occ_pool||[])[c.occ_ref]:(c.occ||null)),
+                 util:((c.util_ref!=null&&c.util_ref>=0)?(D.att_util_pool||[])[c.util_ref]:(c.util||null)),
                  gloss:(D.isa_gloss||{}), regGloss:(D.reg_gloss||{}),
                  dbgHelp:(D.dbg_shortcuts||'')};
   const fileOpts=Object.keys(srcFiles).map(f=>`<option value="`+esc(f)+`">`+esc(f)+`</option>`).join('');
@@ -3229,7 +4058,8 @@ function openDebugView(fam){
     `th,td{padding:3px 10px;text-align:right;white-space:nowrap}`+
     `th{position:sticky;top:0;background:#1a2029;color:#9fb0c4;text-align:right;`+
     `border-bottom:1px solid #2a3340}`+
-    `td.isa,th.isa{text-align:left;font-family:monospace;color:#d7dde5;white-space:pre}`+
+    `td.isa,th.isa{text-align:left;font-family:monospace;color:#d7dde5;white-space:pre;`+
+    `max-width:340px;overflow:hidden;text-overflow:ellipsis}`+
     `td.src,th.src{text-align:left;font-family:monospace;color:#7fa7d8;white-space:nowrap}`+
     `td.a{text-align:right;font-family:monospace;color:#6f7d8f}`+
     `tbody tr{cursor:pointer}tbody tr:hover td{background:#161b22}`+
@@ -3251,9 +4081,9 @@ function openDebugView(fam){
     `box-shadow:0 4px 14px rgba(0,0,0,.5);pointer-events:none;display:none}`+
     `#tip b{color:#ffd7b0;font-family:monospace}`+
     `.reg{color:#7fd0ff;cursor:help;text-decoration:underline dotted #4a6a80}`+
-    `#wvbtn{margin-left:12px;background:#1f2733;color:#d7dde5;border:1px solid #3a4553;`+
+    `#wvbtn,#utbtn{margin-left:12px;background:#1f2733;color:#d7dde5;border:1px solid #3a4553;`+
     `border-radius:3px;padding:4px 12px;font-size:13px;cursor:pointer}`+
-    `#wvbtn:hover{background:#2a3340}`+
+    `#wvbtn:hover,#utbtn:hover{background:#2a3340}`+
     `#wavepane{position:fixed;inset:0;z-index:30;background:#0d1117;display:none;`+
     `flex-direction:column}#wavepane.show{display:flex}`+
     `#wvbar{flex:0 0 auto;display:flex;align-items:center;gap:14px;padding:10px 16px;`+
@@ -3278,7 +4108,8 @@ function openDebugView(fam){
     payload.n_disp+` dispatch(es), ~1 SIMD &middot; `+
     fmtc(payload.stall)+` stall / `+fmtc(payload.lat)+` latency / `+
     fmtc(payload.idle)+` idle cyc`+
-    (payload.occ?`<button id="wvbtn">Occupancy view</button>`:``)+`</div>`+
+    (payload.occ?`<button id="wvbtn">Occupancy view</button>`:``)+
+    (payload.util?`<button id="utbtn">Utilization view</button>`:``)+`</div>`+
     (payload.has_src?``:`<div class="note">Source lines unavailable: the traced `+
       `code object has no DWARF line tables (build ggml-hip with `+
       `-gline-tables-only/-g and re-trace to link ISA to source). Showing ISA only.`+
@@ -3415,7 +4246,8 @@ function openDebugView(fam){
     `if(SPLIT&&key){var f=key.split(':')[0];`+
     `if(f&&D.src_files[f]&&f!==curFile){curFile=f;var s=document.getElementById('file');`+
     `if(s)s.value=f;renderSrc();}}`+
-    `applyStepISA(scroll);if(SPLIT)applyStepSrc(scroll);stepReadout();}`+
+    `applyStepISA(scroll);if(SPLIT)applyStepSrc(scroll);stepReadout();`+
+    `if(UTWIN&&!UTWIN.closed&&UTWIN.setPlayhead&&EX!=null&&ES)UTWIN.setPlayhead(ES[EX][1]);}`+
     `function ensureUnfiltered(){var f=document.getElementById('f');`+
     `if(f&&f.value){f.value='';drawISA('');}}`+
     `function stepTo(k){if(!ES)return;EX=Math.max(0,Math.min(ES.length-1,k));`+
@@ -3442,8 +4274,12 @@ function openDebugView(fam){
     `TIP.innerHTML='<b>'+esc(rk)+'</b> - '+esc(rd);TIP.style.display='block';posTip(e);return;}}`+
     `var td=e.target&&e.target.closest?e.target.closest('td.isa'):null;`+
     `if(!td){hideTip();return;}var m=mnemOf(td.textContent),g=lookGloss(m);`+
-    `if(!g){hideTip();return;}`+
-    `TIP.innerHTML='<b>'+esc(m)+'</b> - '+esc(g);TIP.style.display='block';posTip(e);});`+
+    // show the full instruction when the cell is ellipsized, plus the opcode gloss.
+    `var trunc=td.scrollWidth>td.clientWidth+1;`+
+    `if(!g&&!trunc){hideTip();return;}`+
+    `var html=trunc?('<div style=\"font-family:monospace;color:#ffd7b0\">'+esc(td.textContent)+'</div>'):'';`+
+    `if(g)html+='<b>'+esc(m)+'</b> - '+esc(g);`+
+    `TIP.innerHTML=html;TIP.style.display='block';posTip(e);});`+
     `B.addEventListener('mousemove',function(e){if(TIP.style.display==='block')posTip(e);});`+
     `B.addEventListener('mouseout',function(e){var to=e.relatedTarget;`+
     `if(!to||!to.closest||!to.closest('td.isa'))hideTip();});}`+
@@ -3479,7 +4315,7 @@ function openDebugView(fam){
     // gutter columns mirror RCV's Global View, prefixed with a sequential group
     // ordinal (#) so the number of distinct SM groups shown is countable at a glance.
     // SA is not carried in ATT records (single-SA capture) so it renders 0.
-    `var WCOLS=[['#','seq'],['SE','se'],['SA','sa'],['WG','cu'],['SM','sm']];`+
+    `var WCOLS=[['#','seq'],['SE','se'],['SA','sa'],['WG','cu'],['SM','sm'],['WID','id']];`+
     `var CW=26,GUT=WCOLS.length*CW+10;`+
     `function AM(){return D.occ;}`+
     // Within a single lane (WG/SIMD/wave-slot) the kernel appears as one or more
@@ -3499,8 +4335,10 @@ function openDebugView(fam){
     `if(run>NBURST)NBURST=run;return out;}`+
     `function regroup(){WROWS=[];var ls=D.occ.lanes.slice();`+
     `ls.sort(function(a,b){return (a.cu-b.cu)||(a.simd-b.simd)||(a.wv-b.wv);});`+
+    `var seq=-1,pg=null;`+
     `for(var i=0;i<ls.length;i++){var l=ls[i],w=laneWaves(l.iv);if(!w.length)continue;`+
-    `WROWS.push({grp:l.cu+'/'+l.simd,coords:{se:0,sa:0,cu:l.cu,sm:l.simd,sl:-1,id:l.wv},`+
+    `var grp=l.cu+'/'+l.simd;if(grp!==pg){seq++;pg=grp;}`+
+    `WROWS.push({grp:grp,gseq:seq,coords:{se:0,sa:0,cu:l.cu,sm:l.simd,sl:-1,id:l.wv},`+
     `waves:w});}}`+
     `regroup();`+
     // data window in CYCLES (relative to occ t0): first wave start .. last wave end,
@@ -3534,21 +4372,27 @@ function openDebugView(fam){
     `g.fillStyle='#3a4553';g.fillRect(Math.round(fx),AX,1,H-AX);`+
     `g.fillStyle='#9fb0c4';g.textAlign=(t===0?'left':(t===ND?'right':'center'));`+
     `g.fillText(fmtk(WV0+(WV1-WV0)*t/ND-DC0),fx,AX/2);}`+
-    // gutter coords drawn ONCE per group (centered), bars per lane.
-    `function gut(row,y0,y1,seq){if(!row.coords)return;var cc=row.coords,`+
-    `cv=[seq,cc.se,cc.sa,cc.cu,cc.sm];g.textAlign='center';`+
-    `var yc=(y0+y1)/2;if(y1-y0<9)return;`+
-    `for(var c=0;c<WCOLS.length;c++){g.fillStyle=(c===0?'#7fd0ff':'#c8d0da');`+
-    `g.fillText(''+cv[c],c*CW+CW/2,yc);}}`+
-    `var gs=0,gseq=0;`+
+    // bars per lane + a full-width hairline at each WG/SIMD group boundary.
     `for(var i=0;i<n;i++){var row=WROWS[i],y=AX+i*ROWH,wl=row.waves;`+
-    `if(i>0&&row.grp!==WROWS[i-1].grp){gut(WROWS[gs],AX+gs*ROWH,y,gseq);gseq++;`+
-    `g.strokeStyle='#2a3340';g.beginPath();g.moveTo(0,y+0.5);g.lineTo(W,y+0.5);g.stroke();gs=i;}`+
+    `if(i>0&&row.grp!==WROWS[i-1].grp){`+
+    `g.strokeStyle='#2a3340';g.beginPath();g.moveTo(GUT,y+0.5);g.lineTo(W,y+0.5);g.stroke();}`+
     `for(var wi=0;wi<wl.length;wi++){var s=wl[wi][0],e=wl[wi][1],col=wl[wi][2];`+
     `var x0=cx(s),x1=cx(e);`+
     `if(x1>GUT&&x0<GUT+PLOTW){if(x0<GUT)x0=GUT;if(x1>GUT+PLOTW)x1=GUT+PLOTW;`+
     `g.fillStyle=colorOf(col);g.fillRect(x0,y+1,Math.max(1,x1-x0),Math.max(1,ROWH-1));}}}`+
-    `gut(WROWS[gs],AX+gs*ROWH,AX+n*ROWH,gseq);`+
+    // merged-cell gutter: one centered label per RUN of equal values down a column, so
+    // SE/SA/WG/SM/# each span their group like a spreadsheet; WID is per-row (never
+    // merges). Cells too short to fit text are left blank but keep their separators.
+    `function gval(r,key){return key==='seq'?r.gseq:(key==='id'?r.coords.id:r.coords[key]);}`+
+    `for(var c=0;c<WCOLS.length;c++){var key=WCOLS[c][1],xc=c*CW+CW/2,rs=0;`+
+    `for(var i=1;i<=n;i++){if(i===n||gval(WROWS[i],key)!==gval(WROWS[rs],key)){`+
+    `var yA=AX+rs*ROWH,yB=AX+i*ROWH;`+
+    `if(rs>0){g.strokeStyle='#232a33';g.beginPath();g.moveTo(c*CW,yA+0.5);g.lineTo(c*CW+CW,yA+0.5);g.stroke();}`+
+    `if(yB-yA>=9){g.fillStyle=(c===0?'#7fd0ff':'#c8d0da');g.textAlign='center';`+
+    `g.fillText(''+gval(WROWS[rs],key),xc,(yA+yB)/2);}rs=i;}}}`+
+    // vertical separators between gutter columns + the gutter/plot boundary.
+    `g.strokeStyle='#232a33';for(var c=1;c<WCOLS.length;c++){`+
+    `g.beginPath();g.moveTo(c*CW+0.5,AX);g.lineTo(c*CW+0.5,H);g.stroke();}`+
     `g.strokeStyle='#3a4553';g.beginPath();g.moveTo(GUT+0.5,0);g.lineTo(GUT+0.5,H);g.stroke();}`+
     `function renderLegend(){var el=document.getElementById('wvlegend');if(!el)return;`+
     `var h='<span class="lg"><span class="sw" style="background:'+BURSTCOL[1]+`+
@@ -3563,6 +4407,85 @@ function openDebugView(fam){
     `syncChrome();drawWaves();}`+
     `function closeWaves(){wpane.classList.remove('show');WOPEN=false;hideTip();}`+
     `if(wbtn)wbtn.onclick=openWaves;if(wclose)wclose.onclick=closeWaves;`+
+    // ---- Utilization view: RCV-style per-HW-unit activity timeline, OWN window ----
+    // One lane per hardware unit (VALU/WMMA/LDS/VMEM/SMEM/SALU/WAIT/BRANCH/MSG); X is
+    // cycles; each bucket shaded by how busy that unit was there (RCV colored cells).
+    `var UT=D.util,UTWIN=null;`+
+    `if(UT){var utb=document.getElementById('utbtn');if(utb)utb.onclick=openUtil;}`+
+    `function openUtil(){`+
+    `var UC={VALU:'#3fb950',WMMA:'#c678dd',LDS:'#e8912a',VMEM:'#e0b341',SMEM:'#56b6c2',`+
+    `SALU:'#7f9cc0',WAIT:'#8a94a6',BRANCH:'#e06c75',MSG:'#b5651d'};`+
+    // display labels: on RDNA3.5 WMMA IS VALU, so show both as VALU subclasses.
+    `var UL={WMMA:'VALU:WMMA',VALU:'VALU:other',LDS:'LDS',VMEM:'VMEM',SMEM:'SMEM',`+
+    `SALU:'SALU',WAIT:'WAIT',BRANCH:'BRANCH',MSG:'MSG'};`+
+    `var uw=window.open('','ruv_util');if(!uw){alert('Popup blocked -- allow popups.');return;}UTWIN=uw;`+
+    `var P={units:UT.units,lanes:UT.lanes,busy:UT.busy,nb:UT.nb,t0:UT.t0,t1:UT.t1,`+
+    `n_instr:UT.n_instr,n_waves:UT.n_waves||0,fam:D.fam,col:UC,lbl:UL,waves:UT.waves||[]};`+
+    `var d='<!doctype html><html><head><meta charset=\"utf-8\"><title>utilization -- '+`+
+    `(D.fam||'').replace(/[<>&]/g,'')+'</title><style>'+`+
+    `'*{box-sizing:border-box}body{margin:0;background:#0d1117;color:#d7dde5;'+`+
+    `'font:13px/1.4 -apple-system,Segoe UI,Roboto,sans-serif;display:flex;flex-direction:column;height:100vh}'+`+
+    `'#b{flex:0 0 auto;background:#161b22;border-bottom:1px solid #2a3340;padding:9px 14px;display:flex;'+`+
+    `'align-items:center;gap:12px;flex-wrap:wrap}#b h2{margin:0;font-size:15px;color:#dbe6f5}'+`+
+    `'#b button{background:#1f2733;color:#d7dde5;border:1px solid #3a4553;border-radius:4px;'+`+
+    `'padding:4px 10px;font-size:12px;cursor:pointer}#b button:hover{background:#2a3340}'+`+
+    `'#b select{background:#1f2733;color:#d7dde5;border:1px solid #3a4553;border-radius:4px;'+`+
+    `'padding:3px 6px;font-size:12px;margin-left:4px}'+`+
+    `'#i{color:#9fb0c4;font-size:12px}#w{flex:1 1 auto;overflow:auto;min-height:0}#c{display:block}'+`+
+    `'</style></head><body><div id=\"b\"><h2>Utilization: HW units over cycles (1 SIMD)</h2>'+`+
+    `'<label style=\"color:#9fb0c4;font-size:12px\">scope <select id=\"ws\"></select></label>'+`+
+    `'<button id=\"zi\">Zoom +</button><button id=\"zo\">Zoom &minus;</button><button id=\"zf\">Fit</button>'+`+
+    `'<span id=\"i\"></span></div><div id=\"w\"><canvas id=\"c\"></canvas></div><scr'+'ipt>'+`+
+    `'var P='+JSON.stringify(P)+';var ZX=1,PH=null;'+`+
+    `'var FN=\"ui-monospace,Menlo,Consolas,monospace\";'+`+
+    `'var cv=document.getElementById(\"c\"),wrap=document.getElementById(\"w\"),info=document.getElementById(\"i\");'+`+
+    // scope: -1 = merged (all co-resident waves), 0..n-1 = one wave of the workgroup.
+    `'var SCOPE=-1;'+`+
+    `'function scopeData(){if(SCOPE<0||!P.waves||!P.waves[SCOPE])'+`+
+    `'return {units:P.units,lanes:P.lanes,busy:P.busy,n_instr:P.n_instr,lbltxt:\"merged (\"+P.n_waves+\" waves)\"};'+`+
+    `'var w=P.waves[SCOPE];return {units:w.units,lanes:w.lanes,busy:w.busy,n_instr:w.n_instr,lbltxt:w.label};}'+`+
+    `'function draw(){var dpr=window.devicePixelRatio||1;var S=scopeData();'+`+
+    `'var LBL=150,AX=26,rh=Math.max(16,Math.min(40,Math.floor(((wrap.clientHeight||500)-AX-20)/Math.max(1,S.units.length))));'+`+
+    `'var plotW=Math.max((wrap.clientWidth||900)-LBL-16,300)*ZX;'+`+
+    `'var W=LBL+plotW+16,H=AX+S.units.length*rh+16;'+`+
+    `'cv.style.width=W+\"px\";cv.style.height=H+\"px\";cv.width=Math.floor(W*dpr);cv.height=Math.floor(H*dpr);'+`+
+    `'var g=cv.getContext(\"2d\");g.setTransform(dpr,0,0,dpr,0,0);g.clearRect(0,0,W,H);g.textBaseline=\"middle\";'+`+
+    // cycle axis ticks
+    `'g.fillStyle=\"#161b22\";g.fillRect(0,0,W,AX);g.fillStyle=\"#9fb0c4\";g.font=\"10px \"+FN;g.textAlign=\"center\";'+`+
+    `'var ND=8,span=P.t1-P.t0;for(var t=0;t<=ND;t++){var fx=LBL+plotW*t/ND;'+`+
+    `'g.fillStyle=\"#3a4553\";g.fillRect(Math.round(fx),AX,1,H-AX);'+`+
+    `'g.fillStyle=\"#9fb0c4\";g.fillText(Math.round(P.t0+span*t/ND),fx,AX/2);}'+`+
+    // one lane per unit; bucket intensity -> alpha of unit color
+    `'var bw=plotW/P.nb;'+`+
+    `'for(var u=0;u<S.units.length;u++){var name=S.units[u],lane=S.lanes[name],col=P.col[name]||\"#888\",y=AX+u*rh;'+`+
+    `'g.fillStyle=\"#0d1117\";g.fillRect(LBL,y,plotW,rh-1);'+`+
+    `'for(var b=0;b<P.nb;b++){var v=lane[b];if(v<=0)continue;'+`+
+    `'g.globalAlpha=Math.max(0.15,Math.min(1,v*3));g.fillStyle=col;'+`+
+    `'g.fillRect(LBL+b*bw,y+1,Math.max(1,bw+0.5),rh-3);}g.globalAlpha=1;'+`+
+    `'g.textAlign=\"left\";g.font=\"11px \"+FN;g.fillStyle=col;g.fillText((P.lbl[name]||name),6,y+rh/2);'+`+
+    `'g.textAlign=\"right\";g.font=\"bold 11px \"+FN;g.fillStyle=col;g.fillText(S.busy[name]+\"%\",LBL-8,y+rh/2);}'+`+
+    // red playhead: current ISA step cycle pushed from the debug window (one-way).
+    `'if(PH!=null&&span>0){var px=LBL+plotW*(PH-P.t0)/span;if(px>=LBL&&px<=LBL+plotW){'+`+
+    `'g.fillStyle=\"#ff3b3b\";g.fillRect(Math.round(px),AX,2,H-AX);'+`+
+    `'g.fillStyle=\"#ff3b3b\";g.font=\"10px \"+FN;g.textAlign=\"center\";'+`+
+    `'g.fillRect(Math.round(px)-20,AX,40,12);g.fillStyle=\"#0d1117\";g.fillText(\"step\",Math.round(px),AX+6);}}'+`+
+    `'info.textContent=\"scope: \"+S.lbltxt+\" (\"+S.n_instr+\" instr) on SIMD3, 1 mmq run. The \"+P.n_waves+\" waves are 1 workgroup (nwarps=4) CO-RESIDENT on this SIMD, cycle-interleaved. On RDNA3.5 WMMA runs on the VALU (v_wmma_* are VALU ops) -- VALU:WMMA + VALU:other share ONE vector ALU and contend. Cell shade = unit busy in that cycle window; %=share of issued instr.\";}'+`+
+    // scope selector: merged (all co-resident waves) + one entry per wave/slot.
+    `'(function(){var ws=document.getElementById(\"ws\");if(!ws)return;'+`+
+    `'var o=document.createElement(\"option\");o.value=\"-1\";o.textContent=\"merged (\"+P.n_waves+\" waves)\";ws.appendChild(o);'+`+
+    `'for(var i=0;i<(P.waves||[]).length;i++){var op=document.createElement(\"option\");op.value=\"\"+i;'+`+
+    `'op.textContent=P.waves[i].label;ws.appendChild(op);}'+`+
+    `'ws.value=\"\"+SCOPE;ws.onchange=function(){SCOPE=parseInt(this.value,10);draw();};})();'+`+
+    `'document.getElementById(\"zi\").onclick=function(){ZX=Math.min(20,ZX*1.4);draw();};'+`+
+    `'document.getElementById(\"zo\").onclick=function(){ZX=Math.max(1,ZX/1.4);draw();};'+`+
+    `'document.getElementById(\"zf\").onclick=function(){ZX=1;draw();};'+`+
+    `'cv.addEventListener(\"wheel\",function(e){if(e.ctrlKey||e.altKey){ZX=Math.max(1,Math.min(20,ZX*(e.deltaY<0?1.15:1/1.15)));draw();e.preventDefault();}},{passive:false});'+`+
+    `'window.setPlayhead=function(c){PH=c;draw();};'+`+
+    `'window.addEventListener(\"resize\",draw);'+`+
+    `'window.addEventListener(\"keydown\",function(e){if(e.key===\"Escape\")window.close();});draw();'+`+
+    `'</scr'+'ipt></body></html>';`+
+    `uw.document.open();uw.document.write(d);uw.document.close();`+
+    `try{if(uw.setPlayhead&&typeof EX!=='undefined'&&EX!=null&&ES)uw.setPlayhead(ES[EX][1]);}catch(e){}}`+
     `window.addEventListener('resize',function(){if(WOPEN)drawWaves();});`+
     `var wzi=document.getElementById('wvzin'),wzo=document.getElementById('wvzout'),`+
     `wri=document.getElementById('wvrin'),wro=document.getElementById('wvrout'),`+
@@ -3687,6 +4610,20 @@ tb.querySelectorAll('tr').forEach(tr=>{
     rows +=
       `<tr><td colspan="3">TTFT (est, n_prompt / clean pp)</td>`+
       `<td>${D.ttft_est_ms.toFixed(1)} ms</td></tr>`;
+  }
+  // Prefill compute roofline (LEADS, since prefill is compute-bound): total
+  // algorithmic MACs of all mapped matmuls / total matmul kernel time -> achieved
+  // TOPS vs peak. Over-fetch/padding-immune (true N,K * batch). Shown before the
+  // BW rows so compute reads as the primary metric; BW stays visible below.
+  if (IS_PREFILL && D.has_map && D.compute_batch){
+    let totMacs=0, mmTime=0;
+    for(const s of D.gpu){ if(s.map && s.map.tops){
+      totMacs += 2*s.map.trueN*s.map.K*D.compute_batch; mmTime += (s.e-s.s); }}
+    const achTops = mmTime ? totMacs/mmTime/1e3 : 0;   // MAC/ns /1e3 == TOPS
+    const pct = D.peak_tops ? (achTops/D.peak_tops*100) : 0;
+    rows +=
+      `<tr><td colspan="3">achieved compute (mapped matmuls, B=${D.compute_batch})</td>`+
+      `<td>${achTops.toFixed(1)} TOPS (${pct.toFixed(0)}% of ${D.peak_tops})</td></tr>`;
   }
   if (D.has_bw){
     const totMB = D.summary.reduce((a,r)=>a+(r.mb_tok||0),0);
