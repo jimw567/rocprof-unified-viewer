@@ -4,6 +4,8 @@ __pycache__/
 *.csv
 *.pftrace
 loadwidth.json
+# but DO track the trimmed CI smoke-test fixtures
+!tests/fixtures/*.csv
 *.egg-info/
 dist/
 build/
