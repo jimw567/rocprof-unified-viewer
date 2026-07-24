@@ -2186,6 +2186,7 @@ def build_payload(args):
 
     payload = {
         "title": title,
+        "model_name": os.path.basename(args.gguf) if args.gguf else "",
         "provenance": _provenance(),
         "mode": args.mode,
         "ttft_est_ms": ttft_est_ms,
@@ -2632,6 +2633,7 @@ if (IS_MULTI){
 document.getElementById('titletext').textContent =
   D.title + (IS_PREFILL ? '  -- PREFILL' : '  -- DECODE');
 document.getElementById('sub').textContent =
+  (D.model_name ? `${D.model_name} | ` : ``)+
   (IS_PREFILL ? `prefill: 1 forward pass` : `baked ${D.n_tokens_baked} tokens`)+
   ` | ${D.gpu.length} GPU slices | `+
   `${D.cpu.length} HIP calls | window GPU-busy ${fmtms(D.busy_ns)} / span `+
