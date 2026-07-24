@@ -4172,7 +4172,7 @@ function openDebugView(fam){
     `color:#d7dde5;border:1px solid #3a4553;border-radius:3px;font-size:14px}`+
     `#main{flex:1 1 auto;display:flex;min-height:0}`+
     `section{display:flex;flex-direction:column;min-width:0;min-height:0}`+
-    `#isapane{flex:1 1 56%;border-right:1px solid #2a3340}#srcpane{flex:1 1 44%}`+
+    `#isapane{flex:1 1 70%;border-right:1px solid #2a3340}#srcpane{flex:1 1 30%}`+
     `.phdr{flex:0 0 auto;padding:6px 12px;background:#12161c;border-bottom:1px solid #2a3340;`+
     `color:#9fb0c4;font-size:13px}`+
     `.hint{color:#6f7d8f;font-size:12px;margin-left:6px}`+
@@ -4192,9 +4192,12 @@ function openDebugView(fam){
     `th{position:sticky;top:0;background:#1a2029;color:#9fb0c4;text-align:right;`+
     `border-bottom:1px solid #2a3340}`+
     `td.isa,th.isa{text-align:left;font-family:monospace;color:#d7dde5;white-space:pre;`+
-    `max-width:340px;overflow:hidden;text-overflow:ellipsis}`+
-    `td.src,th.src{text-align:left;font-family:monospace;color:#7fa7d8;white-space:nowrap}`+
+    `max-width:300px;overflow:hidden;text-overflow:ellipsis}`+
+    `td.src,th.src{text-align:left;font-family:monospace;color:#7fa7d8;white-space:nowrap;`+
+    `max-width:150px;overflow:hidden;text-overflow:ellipsis}`+
     `td.a{text-align:right;font-family:monospace;color:#6f7d8f}`+
+    `td.ln,th.ln{text-align:right;font-family:monospace;color:#5a6675;user-select:none;`+
+    `padding-right:8px}`+
     `tbody tr{cursor:pointer}tbody tr:hover td{background:#161b22}`+
     `tr.sel td{background:#243044}`+
     `.bar{display:inline-block;height:9px;background:#ff6b6b;border-radius:2px;`+
@@ -4208,6 +4211,9 @@ function openDebugView(fam){
     `#lview{margin-left:10px;background:#1f2733;color:#d7dde5;border:1px solid #3a4553;`+
     `border-radius:3px;padding:2px 9px;font-size:12px;cursor:pointer}`+
     `#lview:hover{background:#2a3340}#lview.on{background:#2a3a52;border-color:#3a5578}`+
+    `#isasort{margin-left:8px;background:#1f2733;color:#d7dde5;border:1px solid #3a4553;`+
+    `border-radius:3px;padding:2px 6px;font-size:12px}`+
+    `#stepbar.off{opacity:.4;pointer-events:none}`+
     `.hot td.isa{color:#ffd7b0}`+
     `tr.step td{background:#3a2f10 !important;box-shadow:inset 3px 0 #e0b341}`+
     `tr.step td.isa{color:#ffe0a0}`+
@@ -4267,11 +4273,15 @@ function openDebugView(fam){
     `</header>`+
     `<div id="main">`+
     `<section id="isapane"><div class="phdr"><span id="isatitle">ISA (program order)</span>`+
-    `<button id="lview" title="RGP-style: latency bar per instruction, green=hidden by `+
-    `other waves, red=exposed stall; sorted by latency">Latency view</button>`+
+    `<button id="lview" title="RGP-style latency bar per instruction: green=latency `+
+    `hidden by other waves, red=exposed stall. Independent of sort.">Latency bars</button>`+
+    `<select id="isasort" title="Row order. Sorting by exposed stall disables stepping.">`+
+    `<option value="prog">program order</option>`+
+    `<option value="stall">by exposed stall</option></select>`+
     (split?` <span class="hint">click a row to jump to its source line</span>`:``)+
     `<span class="hint">hover an instruction for its ISA description</span>`+
     `</div><div class="scroll"><table><thead><tr id="isahead">`+
+    `<th class="ln">#</th>`+
     (split?`<th class="src">source</th>`:``)+
     `<th>addr</th><th class="isa">ISA</th><th>hits</th><th>latency</th>`+
     `<th>stall</th><th>stall%</th><th>idle</th></tr></thead>`+
@@ -4323,42 +4333,58 @@ function openDebugView(fam){
     `function fstall(f){var s=0;for(var k in LA){if(k.indexOf(f+':')===0)s+=LA[k].st;}return s;}`+
     `FILES.sort(function(x,y){return fstall(y)-fstall(x);});`+
     `var curFile=FILES[0]||'';`+
-    `var LMODE=false;`+
+    // BARS: show RGP-style latency bars vs numeric columns. SORT: 'prog' (program/exec
+    // order, stepping enabled) or 'stall' (rows sorted by exposed-stall desc, stepping
+    // off). The two are INDEPENDENT -- bars can render in either sort.
+    `var BARS=false,SORT='prog';`+
     // max latency across rows, for scaling the latency bars (RGP scales to the worst).
     `var maxLat=0;for(var _i=0;_i<D.rows.length;_i++){var _l=D.rows[_i].lat||0;if(_l>maxLat)maxLat=_l;}`+
     `if(maxLat<1)maxLat=1;`+
     `function drawISA(q){q=(q||'').toLowerCase();var tot=D.stall||1,b=[];`+
-    // in latency view: iterate rows sorted by latency desc (worst first), like RGP.
+    // sort-by-exposed-stall desc (the red part -- the real bottleneck); else program order.
     `var idxs=[];for(var i=0;i<D.rows.length;i++)idxs.push(i);`+
-    `if(LMODE)idxs.sort(function(a,c){return (D.rows[c].lat||0)-(D.rows[a].lat||0);});`+
+    `if(SORT==='stall')idxs.sort(function(a,c){return (D.rows[c].st||0)-(D.rows[a].st||0);});`+
     `for(var j=0;j<idxs.length;j++){var i=idxs[j],r=D.rows[i];`+
     `if(q&&r.isa.toLowerCase().indexOf(q)<0)continue;`+
     `var pct=100*(r.st||0)/tot,bw=Math.round(60*(r.st||0)/(D.maxStall||1));`+
     `var tr='<tr data-idx='+i+' data-key=\"'+esc(r.src||'')+'\" class=\"'+(pct>=5?'hot':'')+'\">'+`+
+    // line number = 1-based program-order index (stable across sorts, so a sorted row
+    // still shows where it lives in execution order).
+    `'<td class=ln>'+(i+1)+'</td>'+`+
     `(SPLIT?'<td class=src>'+esc(r.src||'')+'</td>':'')+`+
     `'<td class=a>0x'+(r.a||0).toString(16)+'</td>'+`+
     `'<td class=isa>'+annotIsa(r.isa)+'</td>';`+
-    `if(LMODE){`+
+    `if(BARS){`+
     // latency bar: total width scaled to maxLat; green = hidden (lat - stall), red = stall.
     `var lat=r.lat||0,st=Math.min(r.st||0,lat),hid=lat-st;`+
     `var W=Math.round(300*lat/maxLat),wS=lat>0?Math.round(W*st/lat):0,wH=W-wS;`+
+    // tooltip: spell out total latency vs hidden (green) vs exposed stall (red = "exp").
+    `var ltip='Latency '+lat.toLocaleString()+' cyc = time from issue to result. '+`+
+    `'Green '+hid.toLocaleString()+' cyc HIDDEN: the SIMD ran other wavefronts during '+`+
+    `'this wait, so it cost no real time. Red '+st.toLocaleString()+' cyc EXPOSED (exp): '+`+
+    `'no other wave was ready, so the SIMD actually stalled here -- this is the real cost. '+`+
+    `'Sort by exposed stall to surface the true bottlenecks.';`+
     `tr+='<td>'+fmtc(r.hit)+'</td>'+`+
-    `'<td style=\"text-align:left\"><span class=lbar style=\"width:'+W+'px\">'+`+
+    `'<td style=\"text-align:left\" title=\"'+ltip+'\"><span class=lbar style=\"width:'+W+'px\">'+`+
     `'<span class=lhid style=\"width:'+wH+'px\"></span>'+`+
     `'<span class=lexp style=\"width:'+wS+'px\"></span></span>'+`+
-    `'<span class=lcyc>'+fmtc(lat)+' clk'+(st>0?' ('+fmtc(st)+' exp)':'')+'</span></td>';`+
+    // exact cycle counts (grouped thousands), not k/M -- users want the real numbers.
+    `'<span class=lcyc>'+lat.toLocaleString()+' clk'+(st>0?' ('+st.toLocaleString()+' exp)':'')+'</span></td>';`+
     `}else{`+
-    `tr+='<td>'+fmtc(r.hit)+'</td><td>'+fmtc(r.lat)+'</td>'+`+
-    `'<td>'+fmtc(r.st)+'</td>'+`+
+    // exact cycle counts (grouped thousands) for the latency/stall/idle columns too.
+    `tr+='<td>'+fmtc(r.hit)+'</td><td>'+(r.lat||0).toLocaleString()+'</td>'+`+
+    `'<td>'+(r.st||0).toLocaleString()+'</td>'+`+
     `'<td>'+pct.toFixed(1)+'% <span class=bar style=\"width:'+bw+'px\"></span></td>'+`+
-    `'<td>'+fmtc(r.idle)+'</td>';}`+
+    `'<td>'+(r.idle||0).toLocaleString()+'</td>';}`+
     `b.push(tr+'</tr>');}`+
     `document.getElementById('b').innerHTML=b.join('');bindISA();applyISASel(false);`+
-    `if(STEP&&EX!=null)applyStepISA(false);}`+
+    `if(STEP&&EX!=null&&SORT==='prog')applyStepISA(false);}`+
     `function bindISA(){var rows=document.querySelectorAll('#b tr');`+
     `for(var i=0;i<rows.length;i++){rows[i].onclick=function(){`+
     `var idx=+this.getAttribute('data-idx');`+
-    `if(ES&&POS2EX[idx]!=null){EX=POS2EX[idx];stepRender(true);}`+
+    // In program order a click also moves the step cursor; when sorted, stepping is off
+    // so a click only drives selection-sync (highlight the source line, order-independent).
+    `if(SORT==='prog'&&ES&&POS2EX[idx]!=null){EX=POS2EX[idx];stepRender(true);}`+
     `if(SPLIT){var k=this.getAttribute('data-key');if(k)selectKey(k,true,false);}};}}`+
     `function renderSrc(){var lines=D.src_files[curFile]||[],mx=1;`+
     `for(var k in LA){if(k.indexOf(curFile+':')===0&&LA[k].st>mx)mx=LA[k].st;}`+
@@ -4412,25 +4438,35 @@ function openDebugView(fam){
     `if(UTWIN&&!UTWIN.closed&&UTWIN.setPlayhead&&EX!=null&&ES)UTWIN.setPlayhead(ES[EX][1]);}`+
     `function ensureUnfiltered(){var f=document.getElementById('f');`+
     `if(f&&f.value){f.value='';drawISA('');}}`+
-    `function stepTo(k){if(!ES)return;EX=Math.max(0,Math.min(ES.length-1,k));`+
+    // Stepping walks the executed stream in program order; it is disabled while the
+    // table is sorted by exposed stall (row order != exec order -> confusing).
+    `function stepTo(k){if(!ES||SORT!=='prog')return;EX=Math.max(0,Math.min(ES.length-1,k));`+
     `ensureUnfiltered();stepRender(true);}`+
-    `function stepBy(d){if(!ES)return;stepTo(EX==null?0:EX+d);}`+
-    `function stepLine(dir){if(EX==null||!ES)return;`+
+    `function stepBy(d){if(!ES||SORT!=='prog')return;stepTo(EX==null?0:EX+d);}`+
+    `function stepLine(dir){if(EX==null||!ES||SORT!=='prog')return;`+
     `var cur=D.rows[ES[EX][0]]?D.rows[ES[EX][0]].src:'';`+
     `for(var k=EX+dir;k>=0&&k<ES.length;k+=dir){`+
     `var s=D.rows[ES[k][0]]?D.rows[ES[k][0]].src:'';`+
     `if(s&&s!==cur){stepTo(k);return;}}}`+
-    // swap the ISA table header between program-order columns and latency-view columns.
+    // header columns keyed on BARS only (bar column vs numeric); independent of sort.
     `function buildHead(){var hd=document.getElementById('isahead');if(!hd)return;`+
-    `var h=(SPLIT?'<th class=\"src\">source</th>':'')+'<th>addr</th><th class=\"isa\">ISA</th><th>hits</th>';`+
-    `h+=LMODE?'<th style=\"text-align:left\">latency (green=hidden, red=exposed stall)</th>'`+
+    `var h='<th class=\"ln\">#</th>'+(SPLIT?'<th class=\"src\">source</th>':'')+'<th>addr</th><th class=\"isa\">ISA</th><th>hits</th>';`+
+    `h+=BARS?'<th style=\"text-align:left\">latency (green=hidden, red=exposed stall)</th>'`+
     `:'<th>latency</th><th>stall</th><th>stall%</th><th>idle</th>';`+
     `hd.innerHTML=h;}`+
-    `function setLview(on){LMODE=on;var b=document.getElementById('lview');`+
-    `if(b)b.classList.toggle('on',on);var t=document.getElementById('isatitle');`+
-    `if(t)t.textContent=on?'ISA (by latency)':'ISA (program order)';`+
+    // update the title + stepping availability for the current BARS/SORT state.
+    `function syncMode(){var t=document.getElementById('isatitle');`+
+    `if(t)t.textContent=(SORT==='stall'?'ISA (by exposed stall)':'ISA (program order)');`+
+    `var sb=document.getElementById('stepbar');`+
+    `if(sb)sb.classList.toggle('off',SORT!=='prog');`+
+    `if(SORT!=='prog'){var rows=document.querySelectorAll('#b tr.step');`+
+    `for(var i=0;i<rows.length;i++)rows[i].classList.remove('step');}`+
+    `else if(STEP&&EX!=null)applyStepISA(false);}`+
+    `function setLbars(on){BARS=on;var b=document.getElementById('lview');`+
+    `if(b)b.classList.toggle('on',on);`+
     `buildHead();var f=document.getElementById('f');drawISA(f?f.value:'');}`+
-    `drawISA('');`+
+    `function setSort(v){SORT=v;var f=document.getElementById('f');drawISA(f?f.value:'');syncMode();}`+
+    `buildHead();drawISA('');`+
     // opcode hover tooltip: delegated on the (persistent) ISA tbody so it survives
     // re-render. pointer-events:none on #tip keeps row clicks/step working.
     `var TIP=document.getElementById('tip'),B=document.getElementById('b');`+
@@ -4458,7 +4494,8 @@ function openDebugView(fam){
     `if(SPLIT){var fs=document.getElementById('file');`+
     `if(fs){fs.value=curFile;fs.onchange=function(){curFile=this.value;renderSrc();};}renderSrc();}`+
     `document.getElementById('f').addEventListener('input',function(e){drawISA(e.target.value);});`+
-    `var _lv=document.getElementById('lview');if(_lv)_lv.onclick=function(){setLview(!LMODE);};`+
+    `var _lv=document.getElementById('lview');if(_lv)_lv.onclick=function(){setLbars(!BARS);};`+
+    `var _ss=document.getElementById('isasort');if(_ss)_ss.onchange=function(){setSort(this.value);};`+
     `if(STEP){var _p=document.getElementById('sprev');if(_p)_p.onclick=function(){stepBy(-1);};`+
     `var _n=document.getElementById('snext');if(_n)_n.onclick=function(){stepBy(1);};`+
     `var _lp=document.getElementById('slprev');if(_lp)_lp.onclick=function(){stepLine(-1);};`+
