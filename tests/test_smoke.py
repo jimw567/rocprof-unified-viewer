@@ -62,3 +62,25 @@ def test_pmc_coloring_present(tmp_path):
     # is DRAM-bound, so the memory rung must appear somewhere in the overlay.
     html = _gen(tmp_path)
     assert "DRAM-BOUND" in html, "expected a DRAM-bound ladder verdict from PMC fixtures"
+
+
+def test_model_name_field(tmp_path):
+    # No --gguf fixture (real model is multi-GB), so we can only assert the key exists
+    # and is empty here; the frontend guard must gate the sub-line on it either way.
+    html = _gen(tmp_path)
+    raw = _raw(html)
+    assert "model_name" in raw, "payload missing model_name field"
+    assert raw["model_name"] == "", "model_name should be empty without --gguf"
+    assert "D.model_name ?" in html, "frontend sub-line must guard on D.model_name"
+
+
+def test_unmapped_family_lists_dispatches(tmp_path):
+    # A family that does not stream a GGUF weight (e.g. k_bin_bcast) has no order-map,
+    # but the family panel must still list its dispatches instead of dead-ending. The
+    # fixtures contain such families; assert the "unmapped" fallback branch is present
+    # and a non-weight family (k_bin_bcast) actually appears in the payload.
+    html = _gen(tmp_path)
+    raw = _raw(html)
+    fams = {s["fam"] for s in raw["gpu"]}
+    assert "k_bin_bcast" in fams, "fixture should contain the unmapped k_bin_bcast family"
+    assert ", unmapped)</" in html, "frontend must render an unmapped-dispatch table branch"
