@@ -135,7 +135,7 @@ _GGML_TYPES = {
     8: "Q8_0", 9: "Q8_1", 10: "Q2_K", 11: "Q3_K", 12: "Q4_K", 13: "Q5_K",
     14: "Q6_K", 15: "Q8_K", 16: "IQ2_XXS", 17: "IQ2_XS", 18: "IQ3_XXS",
     19: "IQ1_S", 20: "IQ4_NL", 21: "IQ3_S", 22: "IQ2_S", 23: "IQ4_XS",
-    29: "IQ1_M", 30: "BF16",
+    29: "IQ1_M", 30: "BF16", 39: "MXFP4",
 }
 
 # Per-arch peak DRAM bandwidth (GB/s) used as the roofline denominator. Built up
@@ -1322,6 +1322,9 @@ _GGML_BLOCK = {
     0: (1, 4), 1: (1, 2), 2: (32, 18), 3: (32, 20), 6: (32, 22), 7: (32, 24),
     8: (32, 34), 9: (32, 40), 10: (256, 84), 11: (256, 110), 12: (256, 144),
     13: (256, 176), 14: (256, 210), 15: (256, 292), 30: (1, 2),
+    # MXFP4 (type 39, gpt-oss MoE experts): QK_MXFP4=32 elems/block,
+    # sizeof(block_mxfp4)=1 scale byte + 32/2 packed nibbles = 17 bytes.
+    39: (32, 17),
 }
 
 
@@ -1399,11 +1402,19 @@ _MATVEC_ROLE_ORDER = [
     "attn_qkv", "attn_q", "attn_v", "attn_k",
     "ssm_in", "ssm_alpha", "ssm_beta",
     "attn_gate", "ssm_out", "attn_output",
+    # MoE (gpt-oss): the router (ffn_gate_inp, an F32 mul_mat_vec_f) picks experts,
+    # then the fused expert gate+up and the expert down projection dispatch. These
+    # sit where the dense ffn_gate/up/down would in a non-MoE model.
+    "ffn_gate_inp", "ffn_gate_exps", "ffn_up_exps", "ffn_down_exps",
     "ffn_gate", "ffn_up", "ffn_down",
 ]
+# Roles whose weight is a router/gating projection dispatched as F32 mul_mat_vec_f
+# (not a quantized mul_mat_vec_q), so they are matvec-eligible regardless of quant.
+_ROUTER_ROLES = {"ffn_gate_inp"}
 # ne-dim quant/dense types dispatched as a matvec at decode (K-quants, legacy
-# quants, and Q8_0 which carries the ssm alpha/beta scale projections).
-_MATVEC_TYPES = {2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}
+# quants, Q8_0 which carries the ssm alpha/beta scale projections, and MXFP4 which
+# carries gpt-oss MoE expert weights -> mul_mat_vec_q<(ggml_type)39>).
+_MATVEC_TYPES = {2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 39}
 
 
 def _seq_entry(t, layer, role):
@@ -1433,18 +1444,24 @@ def build_expected_sequence(tensors, drop_ffn_up):
     for layer in sorted(bylayer):
         roles = bylayer[layer]
         for role in _MATVEC_ROLE_ORDER:
-            if role == "ffn_up" and drop_ffn_up:
+            # Fused SwiGLU: the single gate dispatch also streams the up weight, so
+            # its up sibling is not a separate dispatch. This holds for the dense
+            # ffn_up and the MoE ffn_up_exps alike.
+            if role in ("ffn_up", "ffn_up_exps") and drop_ffn_up:
                 continue
             t = roles.get(role)
-            if t is None or len(t["ne"]) < 2 or t["gt"] not in _MATVEC_TYPES:
+            if t is None or len(t["ne"]) < 2:
+                continue
+            # Router (ffn_gate_inp) is an F32 mul_mat_vec_f -- matvec-eligible despite
+            # not being a quant type; all other roles must be a quant/dense matvec type.
+            if role not in _ROUTER_ROLES and t["gt"] not in _MATVEC_TYPES:
                 continue
             ent = _seq_entry(t, layer, role)
-            # Fused SwiGLU: the single ffn_gate dispatch streams BOTH the gate and
-            # up weights from DRAM, so its true footprint is gate+up. Fold up's
-            # bytes in, else the theoretical denominator is ~2x too small (the
-            # dispatch would look like it over-fetches ~2x when it does not).
-            if role == "ffn_gate" and drop_ffn_up:
-                up = roles.get("ffn_up")
+            # Fold the up weight's bytes into the fused gate dispatch (dense or MoE),
+            # else the theoretical denominator is ~2x too small and the dispatch looks
+            # like it over-fetches ~2x when it does not.
+            if role in ("ffn_gate", "ffn_gate_exps") and drop_ffn_up:
+                up = roles.get("ffn_up") or roles.get("ffn_up_exps")
                 if up is not None and up["gt"] in _MATVEC_TYPES:
                     ent["bytes"] += up["bytes"]
                     ent["fused"] = "gate+up"
