@@ -1,0 +1,189 @@
+{
+ "topology_key": "qwen3vl-6f20aa45",
+ "architecture": "qwen3vl",
+ "source": "ggml-roofline (PR#66) storage-id topology, last-writer-wins; layer/token-deduped, timing-free. Faithful node->src[] edges. Keyed by architecture + block tensor-role fingerprint.",
+ "n_variants": 1,
+ "nodes": [
+  {
+   "name": "node",
+   "op": "PAD",
+   "src": []
+  },
+  {
+   "name": "norm",
+   "op": "RMS_NORM",
+   "src": [
+    "node"
+   ]
+  },
+  {
+   "name": "Qcur",
+   "op": "MUL_MAT",
+   "src": [
+    "norm"
+   ]
+  },
+  {
+   "name": "norm",
+   "op": "RMS_NORM",
+   "src": [
+    "Qcur"
+   ]
+  },
+  {
+   "name": "Qcur",
+   "op": "ROPE",
+   "src": [
+    "norm"
+   ]
+  },
+  {
+   "name": "Vcur",
+   "op": "MUL_MAT",
+   "src": [
+    "norm"
+   ]
+  },
+  {
+   "name": "Kcur",
+   "op": "MUL_MAT",
+   "src": [
+    "norm"
+   ]
+  },
+  {
+   "name": "norm",
+   "op": "RMS_NORM",
+   "src": [
+    "Kcur"
+   ]
+  },
+  {
+   "name": "Kcur",
+   "op": "ROPE",
+   "src": [
+    "norm"
+   ]
+  },
+  {
+   "name": "cache_k (view)",
+   "op": "SET_ROWS",
+   "src": [
+    "Kcur"
+   ]
+  },
+  {
+   "name": "cache_v (view)",
+   "op": "SET_ROWS",
+   "src": [
+    "Vcur"
+   ]
+  },
+  {
+   "name": "node",
+   "op": "FLASH_ATTN_EXT",
+   "src": [
+    "Qcur",
+    "cache_k (view)",
+    "cache_v (view)"
+   ]
+  },
+  {
+   "name": "node",
+   "op": "MUL_MAT",
+   "src": []
+  },
+  {
+   "name": "ffn_gate",
+   "op": "MUL_MAT",
+   "src": [
+    "norm"
+   ]
+  },
+  {
+   "name": "ffn_out",
+   "op": "MUL_MAT",
+   "src": [
+    "ffn_gate",
+    "node"
+   ]
+  },
+  {
+   "name": "deepstack_out",
+   "op": "ADD",
+   "src": [
+    "ffn_out",
+    "node"
+   ]
+  },
+  {
+   "name": "norm",
+   "op": "RMS_NORM",
+   "src": [
+    "deepstack_out"
+   ]
+  },
+  {
+   "name": "node",
+   "op": "MUL_MAT",
+   "src": [
+    "deepstack_out"
+   ]
+  },
+  {
+   "name": "norm",
+   "op": "RMS_NORM",
+   "src": [
+    "ffn_out"
+   ]
+  },
+  {
+   "name": "node",
+   "op": "MUL_MAT",
+   "src": [
+    "ffn_out"
+   ]
+  },
+  {
+   "name": "node",
+   "op": "GET_ROWS",
+   "src": []
+  },
+  {
+   "name": "node",
+   "op": "GET_ROWS",
+   "src": [
+    "ffn_out"
+   ]
+  },
+  {
+   "name": "ffn_inp",
+   "op": "ADD",
+   "src": [
+    "node"
+   ]
+  },
+  {
+   "name": "norm",
+   "op": "RMS_NORM",
+   "src": [
+    "ffn_inp"
+   ]
+  },
+  {
+   "name": "ffn_out",
+   "op": "MUL_MAT",
+   "src": [
+    "ffn_gate",
+    "ffn_inp"
+   ]
+  },
+  {
+   "name": "result_output",
+   "op": "MUL_MAT",
+   "src": [
+    "norm"
+   ]
+  }
+ ]
+}

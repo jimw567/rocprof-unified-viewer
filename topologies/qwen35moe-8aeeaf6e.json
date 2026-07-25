@@ -1,0 +1,394 @@
+{
+ "topology_key": "qwen35moe-8aeeaf6e",
+ "architecture": "qwen35moe",
+ "source": "ggml-roofline (PR#66) storage-id topology, last-writer-wins; layer/token-deduped, timing-free. Faithful node->src[] edges. Keyed by architecture + block tensor-role fingerprint.",
+ "n_variants": 2,
+ "nodes": [
+  {
+   "name": "norm",
+   "op": "RMS_NORM",
+   "src": []
+  },
+  {
+   "name": "cache_r (reshaped) (view) (view)",
+   "op": "SCALE",
+   "src": []
+  },
+  {
+   "name": "conv_states",
+   "op": "GET_ROWS",
+   "src": [
+    "cache_r (reshaped) (view) (view)"
+   ]
+  },
+  {
+   "name": "node",
+   "op": "MUL_MAT",
+   "src": [
+    "norm"
+   ]
+  },
+  {
+   "name": "conv_input",
+   "op": "CONCAT",
+   "src": [
+    "conv_states",
+    "node"
+   ]
+  },
+  {
+   "name": "conv_state_update (copy of conv_state_last)",
+   "op": "CPY",
+   "src": [
+    "cache_r (reshaped) (view) (view)",
+    "conv_input"
+   ]
+  },
+  {
+   "name": "cache_s (reshaped) (view) (view)",
+   "op": "SCALE",
+   "src": []
+  },
+  {
+   "name": "node",
+   "op": "GET_ROWS",
+   "src": [
+    "cache_s (reshaped) (view) (view)"
+   ]
+  },
+  {
+   "name": "conv_output_raw",
+   "op": "SSM_CONV",
+   "src": [
+    "conv_input"
+   ]
+  },
+  {
+   "name": "q_conv_predelta",
+   "op": "L2_NORM",
+   "src": [
+    "conv_output_raw"
+   ]
+  },
+  {
+   "name": "k_conv_predelta",
+   "op": "L2_NORM",
+   "src": [
+    "conv_output_raw"
+   ]
+  },
+  {
+   "name": "node",
+   "op": "ADD",
+   "src": []
+  },
+  {
+   "name": "a_softplus",
+   "op": "SOFTPLUS",
+   "src": [
+    "node"
+   ]
+  },
+  {
+   "name": "beta_sigmoid",
+   "op": "SIGMOID",
+   "src": [
+    "node"
+   ]
+  },
+  {
+   "name": "node",
+   "op": "GATED_DELTA_NET",
+   "src": [
+    "a_softplus",
+    "beta_sigmoid",
+    "conv_output_raw",
+    "k_conv_predelta",
+    "q_conv_predelta"
+   ]
+  },
+  {
+   "name": "z",
+   "op": "MUL_MAT",
+   "src": [
+    "norm"
+   ]
+  },
+  {
+   "name": "node",
+   "op": "SILU",
+   "src": [
+    "norm",
+    "z"
+   ]
+  },
+  {
+   "name": "linear_attn_out",
+   "op": "MUL_MAT",
+   "src": [
+    "node"
+   ]
+  },
+  {
+   "name": "attn_residual",
+   "op": "ADD",
+   "src": [
+    "linear_attn_out"
+   ]
+  },
+  {
+   "name": "norm",
+   "op": "RMS_NORM",
+   "src": [
+    "attn_residual"
+   ]
+  },
+  {
+   "name": "ffn_moe_logits",
+   "op": "MUL_MAT",
+   "src": [
+    "norm"
+   ]
+  },
+  {
+   "name": "ffn_moe_probs",
+   "op": "SOFT_MAX",
+   "src": [
+    "ffn_moe_logits"
+   ]
+  },
+  {
+   "name": "ffn_moe_gate",
+   "op": "MUL_MAT_ID",
+   "src": [
+    "norm"
+   ]
+  },
+  {
+   "name": "ffn_moe_down",
+   "op": "MUL_MAT_ID",
+   "src": [
+    "ffn_moe_gate"
+   ]
+  },
+  {
+   "name": "ffn_moe_weighted",
+   "op": "MUL",
+   "src": [
+    "ffn_moe_down",
+    "ffn_moe_probs"
+   ]
+  },
+  {
+   "name": "node",
+   "op": "ADD",
+   "src": [
+    "ffn_moe_weighted"
+   ]
+  },
+  {
+   "name": "ffn_gate",
+   "op": "MUL_MAT",
+   "src": [
+    "norm"
+   ]
+  },
+  {
+   "name": "ffn_shexp",
+   "op": "MUL_MAT",
+   "src": [
+    "ffn_gate"
+   ]
+  },
+  {
+   "name": "shared_expert_gate",
+   "op": "MUL_MAT",
+   "src": [
+    "norm"
+   ]
+  },
+  {
+   "name": "shared_expert_gate_sigmoid",
+   "op": "SIGMOID",
+   "src": [
+    "shared_expert_gate"
+   ]
+  },
+  {
+   "name": "ffn_shexp_gated",
+   "op": "MUL",
+   "src": [
+    "ffn_shexp",
+    "shared_expert_gate_sigmoid"
+   ]
+  },
+  {
+   "name": "ffn_out",
+   "op": "ADD",
+   "src": [
+    "attn_residual",
+    "ffn_shexp_gated",
+    "node"
+   ]
+  },
+  {
+   "name": "norm",
+   "op": "RMS_NORM",
+   "src": [
+    "ffn_out"
+   ]
+  },
+  {
+   "name": "attn_residual",
+   "op": "ADD",
+   "src": [
+    "ffn_out",
+    "linear_attn_out"
+   ]
+  },
+  {
+   "name": "Qcur_full",
+   "op": "MUL_MAT",
+   "src": [
+    "norm"
+   ]
+  },
+  {
+   "name": "norm",
+   "op": "RMS_NORM",
+   "src": [
+    "Qcur_full"
+   ]
+  },
+  {
+   "name": "Qcur",
+   "op": "ROPE",
+   "src": [
+    "norm"
+   ]
+  },
+  {
+   "name": "Vcur",
+   "op": "MUL_MAT",
+   "src": [
+    "norm"
+   ]
+  },
+  {
+   "name": "Kcur",
+   "op": "MUL_MAT",
+   "src": [
+    "norm"
+   ]
+  },
+  {
+   "name": "norm",
+   "op": "RMS_NORM",
+   "src": [
+    "Kcur"
+   ]
+  },
+  {
+   "name": "Kcur",
+   "op": "ROPE",
+   "src": [
+    "norm"
+   ]
+  },
+  {
+   "name": "cache_k (view)",
+   "op": "SET_ROWS",
+   "src": [
+    "Kcur"
+   ]
+  },
+  {
+   "name": "cache_v (view)",
+   "op": "SET_ROWS",
+   "src": [
+    "Vcur"
+   ]
+  },
+  {
+   "name": "node",
+   "op": "FLASH_ATTN_EXT",
+   "src": [
+    "Qcur",
+    "cache_k (view)",
+    "cache_v (view)"
+   ]
+  },
+  {
+   "name": "gate_reshaped",
+   "op": "CONT",
+   "src": [
+    "Qcur_full"
+   ]
+  },
+  {
+   "name": "gate_sigmoid",
+   "op": "SIGMOID",
+   "src": [
+    "gate_reshaped",
+    "node"
+   ]
+  },
+  {
+   "name": "attn_output",
+   "op": "MUL_MAT",
+   "src": [
+    "ffn_out",
+    "gate_sigmoid"
+   ]
+  },
+  {
+   "name": "norm",
+   "op": "RMS_NORM",
+   "src": [
+    "attn_output"
+   ]
+  },
+  {
+   "name": "ffn_out",
+   "op": "ADD",
+   "src": [
+    "attn_output",
+    "ffn_shexp_gated",
+    "node"
+   ]
+  },
+  {
+   "name": "result_norm",
+   "op": "GET_ROWS",
+   "src": [
+    "norm"
+   ]
+  },
+  {
+   "name": "result_output",
+   "op": "MUL_MAT",
+   "src": [
+    "result_norm"
+   ]
+  },
+  {
+   "name": "conv_states",
+   "op": "GET_ROWS",
+   "src": [
+    "conv_state_update (copy of conv_state_last)"
+   ]
+  },
+  {
+   "name": "conv_state_update (copy of conv_state_last)",
+   "op": "CPY",
+   "src": [
+    "conv_input"
+   ]
+  },
+  {
+   "name": "node",
+   "op": "GET_ROWS",
+   "src": []
+  }
+ ]
+}

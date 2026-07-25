@@ -62,3 +62,76 @@ def test_pmc_coloring_present(tmp_path):
     # is DRAM-bound, so the memory rung must appear somewhere in the overlay.
     html = _gen(tmp_path)
     assert "DRAM-BOUND" in html, "expected a DRAM-bound ladder verdict from PMC fixtures"
+
+
+def test_layer_graph_input(tmp_path):
+    # --graph-json attaches the ggml compute graph. Assert the payload carries it,
+    # the node's block index L is parsed from the blk.<N>. name prefix, and the
+    # frontend layer-graph popup function is present in the overlay.
+    html = _gen(tmp_path, "--graph-json", os.path.join(FIX, "decode_graph.json"))
+    raw = _raw(html)
+    assert raw.get("has_layer_graph"), "payload missing has_layer_graph"
+    lg = raw["layer_graph"]
+    assert lg["n_nodes"] >= 1, "layer_graph has no nodes"
+    by_layer = lg["by_layer"]
+    # blk.0.* -> L0, blk.1.* -> L1, non-block (output/inp_embd) -> L-1. JSON keys
+    # are strings.
+    assert "0" in by_layer and "1" in by_layer, "block layers not indexed"
+    assert "-1" in by_layer, "non-block nodes should bucket under L-1"
+    assert "function openLayerGraph" in html, "frontend missing openLayerGraph popup"
+    assert "D.has_layer_graph" in html, "frontend must gate layer click on D.has_layer_graph"
+    # A trace-derived graph flags its edges as inferred; the loader must pass that
+    # through so the popup can honestly label edge trust.
+    assert lg.get("edges_inferred") is True, "edges_inferred flag not passed through"
+    assert "inferred edges" in html, "frontend missing inferred-edges honesty banner"
+
+
+def test_roofline_topology_reconstruction(tmp_path):
+    # A ggml-roofline artifact with per-invocation storage-id topology (PR #66) must
+    # reconstruct FAITHFUL edges via last-writer-wins -- no inferred flag. Build a tiny
+    # 2-node artifact: op A writes storage 100; op B reads storage 100 -> edge B<-A.
+    import json as _json
+    art = {"step": "decode", "ops": [
+        {"invocation": 1, "name": "blk.0.attn_norm", "ggml_op": "RMS_NORM",
+         "out_storage_id": 100, "in_storage_ids": [],
+         "kernels": [{"name": "rms", "gpu_time_us": 5.0}]},
+        {"invocation": 2, "name": "blk.0.attn_q", "ggml_op": "MUL_MAT",
+         "out_storage_id": 101, "in_storage_ids": [100],
+         "kernels": [{"name": "mm", "gpu_time_us": 50.0}]},
+    ]}
+    fp = os.path.join(str(tmp_path), "roofline.json")
+    with open(fp, "w") as fh:
+        _json.dump(art, fh)
+    html = _gen(tmp_path, "--graph-json", fp)
+    lg = _raw(html)["layer_graph"]
+    assert lg["edges_inferred"] is False, "roofline path must NOT be flagged inferred"
+    nodes = {n["name"]: n for n in lg["nodes"]}
+    q = nodes["blk.0.attn_q"]
+    norm = nodes["blk.0.attn_norm"]
+    assert q["src"] == [norm["i"]], "edge not reconstructed via last-writer-wins"
+    assert "function layerGraphUnavailable" in html, "missing ask-maintainer fallback"
+
+
+def test_checked_in_topologies_are_valid():
+    # The checked-in arch-keyed topology skeletons must load, be model-name-free, and
+    # expand across layers with faithful (non-inferred) edges. This guards the ~KB
+    # data assets that give faithful graphs for all covered architectures with no dump.
+    import importlib.util as _il
+    spec = _il.spec_from_file_location("ruv", os.path.join(ROOT, "rocprof_unified_viewer.py"))
+    ruv = _il.module_from_spec(spec)
+    spec.loader.exec_module(ruv)
+    topo_dir = os.path.join(ROOT, "topologies")
+    files = [f for f in os.listdir(topo_dir) if f.endswith(".json")]
+    assert files, "no checked-in topologies found"
+    for fn in files:
+        obj = json.load(open(os.path.join(topo_dir, fn)))
+        # filename == topology_key == "<arch>-<8hex>", model-agnostic
+        assert fn[:-5] == obj["topology_key"], "filename must equal topology_key"
+        assert obj["nodes"], "%s has no nodes" % fn
+        # expand across a few layers and check edges resolve to node indices, no inferred
+        lg = ruv.expand_topology_to_layers(obj, 3)
+        assert lg["edges_inferred"] is False
+        assert lg["n_nodes"] == len(obj["nodes"]) * 3
+        for nd in lg["nodes"]:
+            for s in nd["src"]:
+                assert isinstance(s, int) and 0 <= s < lg["n_nodes"], "bad edge index"

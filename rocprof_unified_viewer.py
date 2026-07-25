@@ -182,13 +182,19 @@ def family_of(kernel_name):
     aggregation used when collecting PMC, so PMC families join onto trace slices).
     For quantized kernels whose first template arg is a (ggml_type)N, keep the
     quant type so e.g. mul_mat_vec_q<(ggml_type)12,...> vs <(ggml_type)14,...>
-    (Q4_K vs Q6_K) are distinct families instead of one blend."""
+    (Q4_K vs Q6_K) are distinct families instead of one blend. For generic
+    elementwise kernels that carry the operation in the template (k_bin_bcast
+    <&(op_add(...))> vs op_mul), keep the op so add/mul/sub are distinct families
+    (otherwise a residual ADD and an expert-weighted MUL blend into one family)."""
     short = re.sub(r"<.*", "", kernel_name).split("(")[0]
     short = short.split("void ")[-1].strip()
     m = re.search(r"<\s*\(ggml_type\)(\d+)", kernel_name)
     if m:
         n = int(m.group(1))
         short += "[" + _GGML_TYPES.get(n, "type%d" % n) + "]"
+    mo = re.search(r"op_([a-z]+)\s*\(", kernel_name)
+    if mo:
+        short += "[" + mo.group(1) + "]"
     return short
 
 
@@ -587,6 +593,235 @@ def load_loadwidth(path):
     objects. Keyed by the same family_of() names, so it joins onto slices."""
     with open(path) as fh:
         return json.load(fh)
+
+
+_LAYER_BLK_RE = re.compile(r"^blk\.(\d+)\.")
+_LAYER_SUFFIX_RE = re.compile(r"[-_]l?(\d+)(?:\s|\(|$)")
+
+
+def _layer_of_name(name):
+    """Recover the decoder block index from a ggml node name. Two conventions appear:
+    GGUF tensor names use the `blk.<N>.` prefix (e.g. blk.3.attn_q.weight); the runtime
+    cgraph cb() labels use a `-<N>` / `_l<N>` suffix (e.g. Qcur-23, ffn_moe_down-23,
+    cache_k_l23). Returns the block index, or -1 for non-block nodes (norm, output).
+    NOTE: ggml names UNNAMED ops `node_<N>` where N is a global node id, NOT a layer --
+    those must resolve to -1 (they inherit their layer from the graph, not the number)."""
+    if not name:
+        return -1
+    if name.startswith("node_"):
+        return -1
+    m = _LAYER_BLK_RE.match(name)
+    if m:
+        return int(m.group(1))
+    m = _LAYER_SUFFIX_RE.search(name)
+    if m:
+        return int(m.group(1))
+    return -1
+
+
+def topology_key_for_gguf(gguf_tensors, gguf_meta):
+    """Structural topology key for a model, from its gguf -- NO name, NO size. The key is
+    `<general.architecture>-<8hex>` where the hex hashes the SET of distinct per-layer
+    tensor roles (blk.<N>.<role> -> role). Identical for every size of one architecture,
+    different exactly when the block structure differs (dense vs MoE vs per-layer-embd).
+    Must stay byte-identical to extract_topology._arch_key so the checked-in
+    topologies/<key>.json is found."""
+    import hashlib
+    arch = gguf_meta.get("general.architecture", "unknown")
+    roles = set()
+    for t in (gguf_tensors or []):
+        nm = t.get("name", "") if isinstance(t, dict) else str(t)
+        m = re.match(r"^blk\.\d+\.(.+)$", nm)
+        if m:
+            roles.add(m.group(1))
+    fp = hashlib.sha1((arch + "|" + "|".join(sorted(roles))).encode()).hexdigest()[:8]
+    return "%s-%s" % (arch, fp)
+
+
+def load_checked_in_topology(key):
+    """Load the checked-in structural topology for a key from topologies/<key>.json, or
+    None if that architecture has not been captured yet. The stored skeleton is one
+    representative layer's faithful node->src[] structure (timing-free); the viewer
+    replays it per layer and overlays live kernel timings from the run's trace."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(here, "topologies", key + ".json")
+    if not os.path.isfile(path):
+        return None
+    with open(path) as fh:
+        return json.load(fh)
+
+
+def expand_topology_to_layers(skel, n_layer):
+    """Expand a one-layer structural skeleton into a per-layer node list the frontend
+    consumes. The skeleton's nodes carry NORMALIZED names (Qcur, norm, ffn_moe_down) and
+    string `src` referencing sibling normalized names. We instantiate the block for each
+    of the n_layer layers -- suffixing names with `-<L>`, resolving intra-block edges to
+    node indices, and threading the residual stream across layers (a node reading a name
+    not produced within its own layer links to the most recent prior producer, so the
+    inter-layer residual connects). Returns {step, nodes:[{i,name,op,L,src:[idx],...}],
+    by_layer, edges_inferred:False}."""
+    sk = skel.get("nodes", [])
+    nodes = []
+    last_by_name = {}          # normalized name -> most recent global node index
+    for L in range(max(n_layer, 1)):
+        local = {}             # normalized name -> node index within THIS layer
+        for nd in sk:
+            i = len(nodes)
+            nm = nd.get("name", "?")
+            srcs = []
+            for s in nd.get("src", []):
+                # prefer a producer within this layer; else the running (prior-layer) one
+                w = local.get(s, last_by_name.get(s))
+                if w is not None and w != i:
+                    srcs.append(w)
+            nodes.append({"i": i, "name": "%s-%d" % (nm, L), "op": nd.get("op", "?"),
+                          "L": L, "ne": [], "type": "",
+                          "us_in": None, "src": list(dict.fromkeys(srcs)), "chain": False})
+            local[nm] = i
+            last_by_name[nm] = i
+    by_layer = defaultdict(list)
+    for nd in nodes:
+        by_layer[nd["L"]].append(nd["i"])
+    return {"step": "topology (checked-in)", "n_nodes": len(nodes), "nodes": nodes,
+            "by_layer": dict(by_layer), "edges_inferred": False,
+            "provenance": "FAITHFUL topology from checked-in architecture skeleton "
+                          "(ggml-roofline storage-id edges, arch-keyed); live timings "
+                          "not attached in this view."}
+
+
+def _first_token_rows(rows):
+    """A roofline dump from an N-token decode run replays the WHOLE graph once per token,
+    so every layer's block appears N times. For the graph view we want ONE forward pass.
+    Each token ends at the final lm_head op (name 'result_output' / 'result_embd', or the
+    last row's name); the next token restarts the graph. Return just the first pass: rows
+    up to and including the first terminal op. Falls back to the full list if no terminal
+    marker is found (single-pass dump)."""
+    if not rows:
+        return rows
+    terminals = ("result_output", "result_embd", "result_norm")
+    for i, r in enumerate(rows):
+        nm = str(r.get("name", ""))
+        if nm in terminals:
+            return rows[:i + 1]
+    # No named terminal: detect a restart -- the first row's name recurring after a gap.
+    first = str(rows[0].get("name", ""))
+    if first:
+        for i in range(1, len(rows)):
+            if str(rows[i].get("name", "")) == first and i > len(rows) // 2 - 1:
+                return rows[:i]
+    return rows
+
+
+def _reconstruct_from_roofline(rows):
+    """Reconstruct the TRUE per-layer dataflow graph from a ggml-roofline artifact that
+    carries per-invocation storage-id topology (llama.cpp fork PR #66). Each row is one
+    op launch with:
+
+        {"invocation": <int>, "name": "blk.3.attn_q", "ggml_op": "MUL_MAT",
+         "out_storage_id": <int>, "in_storage_ids": [<int>, ...],
+         "kernels": [{"name": ..., "gpu_time_us": <float>}, ...]}
+
+    Edges are EXACT (not inferred): the `*_storage_id`s are real view-root-resolved
+    tensor identities from node->src[]. We recover producer->consumer edges by
+    last-writer-wins over execution order -- sort by `invocation`, track the most recent
+    launch that wrote each storage id, and link each `in_storage_id` to that writer.
+    This is architecture-agnostic: no per-model topology template is used, so it covers
+    every model (dense, MoE, GDN/SSM, VLM) identically. Returns the standard node list
+    (i, name, op, L, src=[node indices], us_in, ...) the frontend expects."""
+    rows = [r for r in rows if r.get("in_storage_ids") is not None
+            or r.get("out_storage_id") is not None]
+    rows = sorted(rows, key=lambda r: r.get("invocation", 0))
+    rows = _first_token_rows(rows)
+    nodes = []
+    writer = {}                 # storage_id -> node index that last wrote it
+    for idx, r in enumerate(rows):
+        name = r.get("name", "") or ("#%d" % idx)
+        L = _layer_of_name(name)
+        kernels = r.get("kernels", [])
+        us = sum(k.get("gpu_time_us", 0.0) for k in kernels) or None
+        # Derive the kernel FAMILY (same normalization as the swim lane) from this op's
+        # dominant kernel -- the last one, which is the real compute (a matmul op emits a
+        # quantize prep kernel then the mul_mat_vec; we want the mul_mat). This `fam` is
+        # what the swim lane shows and is the join key for two-way selection sync, since
+        # a roofline dump carries durations but no absolute start/end to match by time.
+        fam = family_of(kernels[-1]["name"]) if kernels else (r.get("ggml_op", "?"))
+        op = r.get("ggml_op", "?")
+        # Display label: usually the kernel family (matches the swim lane), BUT for generic
+        # multi-purpose kernels the family is uninformative -- k_bin_bcast implements ADD,
+        # MUL, SUB, etc., so three different ops (two residual ADDs + an expert MUL) would
+        # all read "k_bin_bcast". For those, prefer the ggml OP name so the node says what
+        # it actually IS. `fam` is kept separately for the swim-lane highlight join.
+        GENERIC = ("k_bin_bcast", "ggml_compute_forward", "op_")
+        label = op if any(gk in fam for gk in GENERIC) else fam
+        # One ggml op can launch several GPU kernels (e.g. a quantized MUL_MAT launches
+        # quantize_q8_1 then mul_mat_vec_q). The graph is one-node-per-op, so those
+        # sub-kernels are folded into this node; carry their family + time so the node
+        # detail can list them (nothing is hidden, the DAG stays clean).
+        subk = [{"fam": family_of(k.get("name", "")),
+                 "us": round(k.get("gpu_time_us", 0.0), 2)} for k in kernels]
+        srcs = []
+        for sid in (r.get("in_storage_ids") or []):
+            w = writer.get(sid)
+            if w is not None and w != idx:
+                srcs.append(w)
+        nodes.append({"i": idx, "name": name, "op": op, "label": label,
+                      "fam": fam, "kernels": subk, "L": L, "ne": [], "type": "",
+                      "us_in": (us * 1000.0) if us is not None else None,  # us -> ns
+                      "src": list(dict.fromkeys(srcs)), "chain": False})
+        out_sid = r.get("out_storage_id")
+        if out_sid is not None:
+            writer[out_sid] = idx        # last writer wins (also handles in-place aliasing)
+    return nodes
+
+
+def load_graph_json(path):
+    """Load a compute-graph artifact for one step and index it by layer. Two schemas
+    are accepted:
+
+    (A) ROOFLINE with topology (llama.cpp fork PR #66) -- the FAITHFUL path. Rows carry
+        per-invocation storage-id edges; we reconstruct exact producer->consumer edges
+        via last-writer-wins (see _reconstruct_from_roofline). Detected by the presence
+        of `in_storage_ids`/`out_storage_id` on the rows (under a top-level "ops" or
+        "nodes"/"invocations" list). edges_inferred = False.
+
+    (B) NODE list (trace-derived stand-in) -- nodes already carry `src` as node indices
+        (edges may be inferred). Detected by `src` holding small node-index ints and no
+        storage ids. edges_inferred defaults from the file.
+
+    Node shape passed to the frontend: {i, name, op, L, ne, type, us_in, src:[i,...],
+    chain}. `L` is the GGUF block index from the `blk.<N>.` name prefix (-1 otherwise);
+    `by_layer` maps L -> [node i, ...] (the join key to the overlay's layer swim-lane)."""
+    with open(path) as fh:
+        g = json.load(fh)
+    # A roofline artifact keys its per-op list under "ops" (or reuses "nodes"); detect
+    # the topology schema by whether any row has storage-id edges.
+    rows = g.get("rows") or g.get("ops") or g.get("invocations") or g.get("nodes") or []
+    is_roofline = any(isinstance(r, dict) and
+                      ("in_storage_ids" in r or "out_storage_id" in r) for r in rows)
+    if is_roofline:
+        nodes = _reconstruct_from_roofline(rows)
+        edges_inferred = False
+        provenance = ("FAITHFUL: edges reconstructed from ggml-roofline per-invocation "
+                      "storage-id topology (PR #66), last-writer-wins over execution "
+                      "order -- exact node->src[] dependencies, architecture-agnostic.")
+        step = g.get("step", "roofline")
+    else:
+        nodes = rows
+        edges_inferred = bool(g.get("edges_inferred", False))
+        provenance = g.get("provenance", "")
+        step = g.get("step", "")
+
+    by_layer = defaultdict(list)
+    for nd in nodes:
+        if nd.get("L") is not None:
+            L = int(nd["L"])
+        else:
+            L = _layer_of_name(nd.get("name", "") or "")
+        nd["L"] = L
+        by_layer[L].append(nd.get("i"))
+    return {"step": step, "n_nodes": g.get("n_nodes", len(nodes)),
+            "nodes": nodes, "by_layer": dict(by_layer),
+            "edges_inferred": edges_inferred, "provenance": provenance}
 
 
 def load_att_stats(att_dir):
@@ -1512,6 +1747,12 @@ def add_common_args(ap):
                     help="JSON of per-family memory-load instruction widths from "
                          "device disassembly (optional): shows per-lane load width "
                          "(b32=4B, d16=2B, ...) in the selected-kernel detail panel")
+    ap.add_argument("--graph-json",
+                    help="JSON dump of the ggml compute graph for one step "
+                         "(optional): nodes = ops/tensors, edges = tensor deps "
+                         "(node.src). Enables the per-layer graph popup -- click a "
+                         "layer segment to see its actual dataflow DAG. Produced by "
+                         "a llama.cpp cgraph dump; see load_graph_json for schema.")
     ap.add_argument("--att-dir",
                     help="directory of DECODED rocprofv3 --att output (the "
                          "stats_ui_output_*_dispatch_*.csv files, e.g. produced by "
@@ -1696,6 +1937,7 @@ def build_payload(args):
     fetch_bytes, fetch_bytes_n = (load_fetch_bytes(args.fetch_csv)
                                   if args.fetch_csv else ({}, {}))
     loadwidth = load_loadwidth(args.loadwidth_json) if args.loadwidth_json else {}
+    layer_graph = load_graph_json(args.graph_json) if args.graph_json else None
     att_by_fam = load_att_stats(args.att_dir) if args.att_dir else {}
     att_code_by_fam = load_att_code(args.att_dir) if args.att_dir else {}
     # Occupancy is dispatch-wide: many families share the SAME occ object (identical
@@ -1770,6 +2012,22 @@ def build_payload(args):
                 best = (score, cand, drop, hits, m)
         if best:
             expected_seq = best[1]
+
+        # Auto-attach the checked-in structural topology for this architecture when the
+        # user did not pass an explicit --graph-json. The key is derived from the gguf's
+        # tensor-role fingerprint (no model name/size), so every size of an architecture
+        # resolves to the same checked-in skeleton; we expand it across the model's real
+        # block count. This gives a faithful per-layer graph for any covered arch with
+        # ZERO per-model data -- topologies/ is ~kilobytes, keyed by architecture.
+        if layer_graph is None and gguf_tensors:
+            _key = topology_key_for_gguf(gguf_tensors, gguf_meta)
+            _skel = load_checked_in_topology(_key)
+            if _skel is not None:
+                _arch = gguf_meta.get("general.architecture", "")
+                _nl = gguf_meta.get("%s.block_count" % _arch, 0) or 0
+                if not _nl and expected_seq:
+                    _nl = 1 + max((e["L"] for e in expected_seq), default=-1)
+                layer_graph = expand_topology_to_layers(_skel, _nl)
 
     # KV-cache DRAM traffic per decode step, for the "eff token BW%" roofline: a
     # decode step re-reads the FULL K/V cache accumulated over the context. Sizes
@@ -1965,6 +2223,37 @@ def build_payload(args):
                     lay_L[i] = fill
                 else:
                     fill = lay_L[i]
+            # Boundary correction to match the ggml compute graph (tensor-name layer
+            # index): pure backward-fill pulls a layer's TRAILING residual binops (the
+            # expert weighted-sum + residual adds, e.g. ffn_moe_weighted/l_out) into the
+            # NEXT layer, because they physically precede that layer's first matvec. But
+            # by the graph those belong to the layer that just finished. So at each
+            # inter-layer gap, keep the trailing non-matvec slices with the PREVIOUS
+            # layer; the new layer starts at its attention-input norm (the rms_norm that
+            # feeds the next matvec). Scan each boundary where the mapped layer increases.
+            for i in range(st + 1, en):
+                prevL, curL = lay_L[i - 1], lay_L[i]
+                if prevL is None or curL is None or curL <= prevL:
+                    continue
+                # find the first mapped matvec of the new layer curL
+                fm = None
+                for k in range(i, en):
+                    mp = gpu_slices[k].get("map")
+                    if mp is not None and mp["L"] == curL:
+                        fm = k
+                        break
+                if fm is None:
+                    continue
+                # the new layer starts at the last norm before that matvec; everything
+                # before it in this gap stays with the previous layer.
+                norm_at = None
+                for k in range(fm - 1, i - 1, -1):
+                    if "norm" in gpu_slices[k].get("fam", "").lower():
+                        norm_at = k
+                        break
+                edge = norm_at if norm_at is not None else fm
+                for k in range(i, edge):
+                    lay_L[k] = prevL
             # coalesce consecutive equal-layer runs into one segment.
             j = st
             while j < en:
@@ -1975,7 +2264,7 @@ def build_payload(args):
                 kind = "head" if L == -1 else block_kind.get(L, "?")
                 name = "head" if L == -1 else ("L%d %s" % (L, kind))
                 layers.append({"s": gpu_slices[j]["s"], "e": gpu_slices[k - 1]["e"],
-                               "kind": kind, "name": name})
+                               "kind": kind, "name": name, "L": L})
                 j = k
 
     # Phase sub-lane: one level below the layer lane -- group each layer's kernels
@@ -2142,6 +2431,8 @@ def build_payload(args):
         regen_parts.append("--fetch-csv " + os.path.abspath(args.fetch_csv))
     if args.loadwidth_json:
         regen_parts.append("--loadwidth-json " + os.path.abspath(args.loadwidth_json))
+    if args.graph_json:
+        regen_parts.append("--graph-json " + os.path.abspath(args.graph_json))
     if args.gguf:
         regen_parts.append("--gguf " + os.path.abspath(args.gguf))
     if args.arch != DEFAULT_ARCH:
@@ -2213,6 +2504,7 @@ def build_payload(args):
         "att_occ_pool": att_occ_pool,
         "att_util_pool": att_util_pool,
         "dbg_shortcuts": _DEBUG_SHORTCUTS_HTML,
+        "graph_shortcuts": _GRAPH_SHORTCUTS_HTML,
         "has_att_code": bool(att_code_by_fam),
         # RDNA3.5 ISA one-line opcode glossary (mnemonic -> description), embedded
         # only when the debug view exists, so the view can show a hover tooltip
@@ -2236,6 +2528,8 @@ def build_payload(args):
         "has_layers": bool(layers),
         "phases": phases,
         "has_phases": bool(phases),
+        "layer_graph": layer_graph,
+        "has_layer_graph": bool(layer_graph),
         "kstats": kstats,
         "has_kstats": bool(kstats),
         "kstats_ntok": kstats_ntok,
@@ -2395,6 +2689,25 @@ _DEBUG_SHORTCUTS_HTML = shortcuts_help_html("dbgKeys", "Shortcuts -- trace view"
         ("Esc", "close the Occupancy view"),
     ]),
     ("General", [
+        ("?", "open this help"),
+    ]),
+])
+
+# Mouse/keyboard help for the per-layer compute-graph popup. Embedded into the graph
+# window's bar so it matches the "?" affordance on the other windows.
+_GRAPH_SHORTCUTS_HTML = shortcuts_help_html("graphKeys", "Shortcuts -- layer graph", [
+    ("Selection sync", [
+        ("click a node", "select + frame its kernel in the timeline (two-way sync)"),
+        ("(select in timeline)", "highlights + centers the matching node here"),
+    ]),
+    ("Zoom / pan", [
+        ("drag", "pan the graph"),
+        ("ctrl/alt + wheel", "zoom at the cursor"),
+        ("Zoom + / -", "zoom in / out"),
+        ("Fit", "fit the whole layer graph in view"),
+    ]),
+    ("General", [
+        ("Esc", "close this window"),
         ("?", "open this help"),
     ]),
 ])
@@ -2917,8 +3230,29 @@ function selectSlice(sl){        // sl is a slice object from D.gpu (or null)
   rows.forEach(tr=>tr.classList.toggle('sel', sl && tr.dataset.fam===sl.fam));
   if(sl){ const el=[...rows].find(tr=>tr.dataset.fam===sl.fam);
           if(el) el.scrollIntoView({block:'nearest'}); }
+  syncGraphWindows(sl);
   updateDetail(); draw();
 }
+// Two-way selection sync with any open layer-graph popups. We keep a live registry
+// of graph windows keyed by layer L; on a swim-lane selection we push the selected
+// dispatch's exact [s,e] span to each open window so it can highlight the matching
+// node. A graph node click calls back into applyFindResult (via window.opener) to
+// frame + select the dispatch here -- closing the loop.
+// Two-way selection sync between the main timeline and open layer-graph popups uses
+// postMessage (robust to cross-window quirks -- stale named windows, opener nulling,
+// document.write -- that break direct cross-window function calls).
+var graphWindows = {};   // L -> window handle (so the parent can postMessage each popup)
+function syncGraphWindows(sl){
+  const sel = sl ? {s:sl.s, e:sl.e, fam:sl.fam} : null;
+  for(const L in graphWindows){ const gw=graphWindows[L];
+    if(!gw || gw.closed){ delete graphWindows[L]; continue; }
+    try{ gw.postMessage({ruv:'select', sel:sel}, '*'); }catch(e){}
+  }
+}
+// (Graph -> swim-lane selection removed: a roofline node has no absolute timestamp, so
+// it could only be matched to a dispatch by kernel family, which is ambiguous when a
+// layer runs several dispatches of the same family. Only swim-lane -> graph highlighting
+// is kept; see syncGraphWindows above.)
 // box multi-select: gather every GPU slice overlapping the dragged time range.
 // add=true (Ctrl/Cmd+drag) unions into the current selection instead of replacing.
 function selectBox(t0,t1,add){
@@ -3686,6 +4020,310 @@ function renderSelectedKernel(){
 // the K/32-block Q8_1 activation (staged in LDS once per workgroup); 16 waves = one
 // workgroup. Left strip = shared activation, center = weight rows (colored by
 // workgroup), right column = the N fp32 outputs. Self-contained (inline CSS/JS).
+// Shown when a layer is clicked but no compute graph is available for this model. The
+// faithful graph comes from a ggml-roofline run with per-invocation storage-id topology
+// (llama.cpp fork PR #66); reconstruction is architecture-agnostic, so any model is
+// supported ONCE such a dump exists -- there is no per-architecture allowlist. So the
+// only "unsupported" case is missing data, and the fix is to ask the RUV maintainer to
+// attach a topology dump for this model, not to add code.
+function layerGraphUnavailable(){
+  alert('No compute graph for this model.\n\n'+
+    'The layer graph needs a ggml-roofline run with per-launch topology edges '+
+    '(llama.cpp storage-id dump). Ask the rocprof-unified-viewer maintainer to add a '+
+    'graph for this model: regenerate the overlay with --graph-json pointing at that '+
+    'run.\n\nReconstruction is architecture-agnostic, so no per-model code is needed '+
+    '-- only the dump.');
+}
+// Per-layer compute-graph DAG. Opens a popup showing the ACTUAL compute graph for the
+// clicked layer (nodes = ops, edges = tensor deps). With a roofline topology dump the
+// edges are exact (node->src[] via storage-id last-writer-wins); with the trace-derived
+// stand-in they are inferred. Each node joins to its measured kernel time.
+function openLayerGraph(L){
+  if(!D.has_layer_graph){ layerGraphUnavailable(); return; }
+  const G=D.layer_graph, byL=G.by_layer||{};
+  const ids=byL[L]!=null?byL[L]:(byL[''+L]||[]);
+  if(!ids.length){ layerGraphUnavailable(); return; }
+  const idset=new Set(ids);
+  // Include out-of-layer src nodes as faded "external input" stubs so edges resolve.
+  const ext=new Set();
+  const nById={}; for(const nd of G.nodes){ nById[nd.i]=nd; }
+  for(const id of ids){ const nd=nById[id]; if(!nd) continue;
+    for(const s of (nd.src||[])){ if(!idset.has(s)) ext.add(s); } }
+  // Join each graph node to a measured kernel time by tensor name (mapped dispatches
+  // carry s.map.nm). Sum repeats across baked tokens -> mean per dispatch.
+  const timeByName={}; const cntByName={};
+  for(const s of D.gpu){ if(s.map && s.map.nm){
+    timeByName[s.map.nm]=(timeByName[s.map.nm]||0)+(s.e-s.s); cntByName[s.map.nm]=(cntByName[s.map.nm]||0)+1; } }
+  // Fallback join for UNMAPPED ops (norms, adds, elementwise): these dispatches carry
+  // no tensor name in the trace, so name-join misses them. Instead bucket every
+  // unmapped dispatch into its layer (by time span) and, within a layer, collect its
+  // per-family dispatch times in execution order. A graph node then joins by
+  // op->family + order (the cgraph nodes are topologically sorted == execution order).
+  const OP2FAM={RMS_NORM:/rms_norm/i, L2_NORM:/l2_norm/i, ADD:/bin_bcast|_add|^add/i,
+    MUL:/bin_bcast|_mul|^mul(?!_mat)/i, GET_ROWS:/get_rows/i, ROPE:/rope/i,
+    SOFT_MAX:/soft_max/i, SCALE:/scale/i, CPY:/cpy|dup|cont/i, CONT:/cpy|cont/i,
+    UNARY:/unary|silu|gelu|relu/i, CONV:/conv/i, SSM_CONV:/conv/i};
+  const layerOfSlice=(t)=>{ for(const Lo of (D.layers||[])){ if(t>=Lo.s&&t<=Lo.e) return Lo.L; } return null; };
+  const famSeq={};  // L -> fam -> [dispatch times in execution order]
+  const _sl=D.gpu.slice().sort((a,b)=>a.s-b.s);
+  for(const s of _sl){ if(s.map && s.map.nm) continue; const Ls=layerOfSlice(s.s); if(Ls==null) continue;
+    (famSeq[Ls]=famSeq[Ls]||{}); (famSeq[Ls][s.fam]=famSeq[Ls][s.fam]||[]).push(s.e-s.s); }
+  const famCtr={};  // L|fam -> next unconsumed index
+  const nodes=[];
+  const push=(nd,isext)=>{
+    // A trace-derived graph carries its own measured time on the node (node.us_in,
+    // nanoseconds) -- it IS a real dispatch, so trust it directly as an exact match.
+    let t=(nd.us_in!=null)?nd.us_in:((timeByName[nd.name]!=null)?timeByName[nd.name]/cntByName[nd.name]:null);
+    let tsrc=(t!=null)?'name':null;
+    if(t==null && !isext){
+      const rx=OP2FAM[nd.op]; const Ln=nd.L;
+      if(rx!=null && famSeq[Ln]){
+        for(const fam in famSeq[Ln]){ if(rx.test(fam)){
+          const key=Ln+'|'+fam, c=famCtr[key]||0;
+          if(c<famSeq[Ln][fam].length){ t=famSeq[Ln][fam][c]; famCtr[key]=c+1; tsrc='fam'; break; }
+        } }
+      }
+    }
+    nodes.push({i:nd.i, name:nd.name||('#'+nd.i), op:nd.op||'?', ne:nd.ne||[], type:nd.type||'',
+      // fam = kernel family (matches the swim-lane label); the join key for selection sync
+      fam:(nd.fam||nd.op||''),
+      // kernels = the GPU kernels this op launched (a quantized matmul folds a
+      // quantize_q8_1 prep + the matvec); surfaced on hover so nothing is hidden.
+      kernels:(nd.kernels||[]),
+      // label = display name (fam, or the ggml op for generic kernels like k_bin_bcast)
+      label:(nd.label||nd.fam||nd.op||''),
+      src:(nd.src||[]).filter(x=>idset.has(x)||ext.has(x)), ext:!!isext,
+      us:t!=null?t/1000:null, tsrc:tsrc, chain:!!nd.chain,
+      // dispatch span (overlay-relative ns) for span-based sync when available (older
+      // trace-derived graphs); roofline graphs sync by fam+order instead.
+      s:(nd.s!=null?nd.s:null), e:(nd.e!=null?nd.e:null)}); };
+  for(const id of ids){ const nd=nById[id]; if(nd) push(nd,false); }
+  for(const id of ext){ const nd=nById[id]; if(nd) push(nd,true); }
+  const kindName=(D.layers||[]).filter(x=>x.L===L).map(x=>x.name)[0]||('L'+L);
+  const w=window.open('','ruv_graph_L'+L);
+  if(!w){ alert('Popup blocked -- allow popups to open the layer graph.'); return; }
+  graphWindows[L]=w;   // register for two-way selection sync
+  const payload={L:L, kind:kindName, step:G.step||'', nodes:nodes,
+    edges_inferred:!!G.edges_inferred, provenance:G.provenance||'',
+    // seed the popup with the current lane selection so it opens already in sync
+    sel:(selectedSlice?{s:selectedSlice.s,e:selectedSlice.e,fam:selectedSlice.fam}:null)};
+  const doc=`<!doctype html><html><head><meta charset="utf-8">`+
+    `<title>layer graph -- `+esc(kindName)+`</title><style>`+
+    `*{box-sizing:border-box}body{margin:0;background:#0d1117;color:#d7dde5;`+
+    `display:flex;flex-direction:column;height:100vh;font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif}`+
+    `#bar{flex:0 0 auto;display:flex;align-items:center;gap:12px;padding:10px 16px;`+
+    `background:#161b22;border-bottom:1px solid #2a3340;flex-wrap:wrap}`+
+    `#bar h2{margin:0;font-size:16px;color:#dbe6f5}`+
+    `#bar .zb{background:#1f2733;color:#d7dde5;border:1px solid #3a4553;border-radius:3px;`+
+    `padding:3px 9px;font-size:12px;cursor:pointer}#bar .zb:hover{background:#2a3340}`+
+    `#bar .info{font-size:12px;color:#9fb0c4}`+
+    `#bar .warn{font-size:12px;color:#e0b341;font-weight:600}`+
+    `#wrap{flex:1 1 auto;overflow:hidden;min-height:0;position:relative}`+
+    `#cv{display:block;cursor:grab}`+
+    `#foot{flex:0 0 auto;padding:8px 16px;background:#12161c;border-top:1px solid #2a3340;`+
+    `font-size:12px;color:#9fb0c4}#foot b{color:#c8d0da}`+
+    `</style></head><body>`+
+    `<div id="bar"><h2>Layer graph</h2>`+
+    `<button class="zb" id="zout">Zoom &minus;</button>`+
+    `<button class="zb" id="zin">Zoom +</button>`+
+    `<button class="zb" id="fit">Fit</button>`+
+    `<button class="zb" id="esc" title="close (Esc)">Esc</button>`+
+    (D.graph_shortcuts||'')+
+    `<span class="info" id="info"></span>`+
+    (payload.edges_inferred?`<span class="warn" id="warn">inferred edges</span>`:``)+`</div>`+
+    `<div id="wrap"><canvas id="cv"></canvas>`+
+    `<div id="ktip" style="position:absolute;display:none;pointer-events:none;z-index:9;`+
+    `background:#0d1117;border:1px solid #2a3340;border-radius:5px;padding:6px 9px;`+
+    `font-size:11px;color:#c8d0da;max-width:320px;box-shadow:0 3px 12px rgba(0,0,0,.5)"></div>`+
+    `</div>`+
+    `<div id="foot">Nodes = real GPU dispatches (names + <b>us</b> times match the `+
+    `kernel swim lane exactly). `+
+    (payload.edges_inferred
+      ?`<b style="color:#e0b341">Edges are INFERRED</b> from dataflow semantics + `+
+       `execution order (dashed = chain-only, where the block topology is not `+
+       `modeled), NOT a real ggml cgraph -- so the wiring is a best-effort skeleton, `+
+       `correct for standard transformer blocks but approximate for `+
+       `recurrent/GDN/vision layers. `
+      :`Edges are exact tensor dependencies (node.src) from the ggml compute graph. `)+
+    `<b>us</b>: weight matmuls join by tensor name (exact); other ops by op-family `+
+    `+ execution order (<b>~</b>). Drag to pan; Ctrl/Alt+wheel or the buttons to zoom.</div>`+
+    `<scr`+`ipt>`+
+    `var P=`+JSON.stringify(payload).replace(/</g,'\\u003c')+`;`+
+    `function esc(s){return(''+s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}`+
+    `var cv=document.getElementById('cv'),wrap=document.getElementById('wrap');`+
+    `var info=document.getElementById('info');`+
+    // --- layered layout: rank = longest path from any source (nodes with no in-layer
+    // src). Columns = rank; rows packed within a column. Left-to-right dataflow.
+    `var N=P.nodes,byId={};for(var a=0;a<N.length;a++)byId[N[a].i]=N[a];`+
+    `var rank={},indeg={};for(var a=0;a<N.length;a++){indeg[N[a].i]=0;}`+
+    `for(var a=0;a<N.length;a++){var nd=N[a];for(var b=0;b<nd.src.length;b++){if(byId[nd.src[b]]!=null)indeg[nd.i]++;}}`+
+    // Kahn topo order, assigning rank = max(src rank)+1.
+    `var q=[];for(var a=0;a<N.length;a++){if(indeg[N[a].i]===0){rank[N[a].i]=0;q.push(N[a].i);}}`+
+    `var ind2={};for(var a=0;a<N.length;a++)ind2[N[a].i]=indeg[N[a].i];`+
+    `var head=0;while(head<q.length){var u=q[head++];var ur=rank[u]||0;`+
+    `for(var a=0;a<N.length;a++){var nd=N[a];if(nd.src.indexOf(u)>=0){`+
+    `rank[nd.i]=Math.max(rank[nd.i]||0,ur+1);if(--ind2[nd.i]===0)q.push(nd.i);}}}`+
+    // Bucket by rank; assign a row within each column.
+    `var cols={},maxr=0;for(var a=0;a<N.length;a++){var r=rank[N[a].i]||0;maxr=Math.max(maxr,r);`+
+    `(cols[r]=cols[r]||[]).push(N[a]);}`+
+    `var CW=210,CH=66,PADX=40,PADY=30,RH=96,BW=CW-52,BH=CH-14;`+
+    // Untangle: barycenter ordering (Sugiyama step 3). Within each rank, order nodes by
+    // the mean slot of their neighbours in the adjacent rank so parents sit above their
+    // children and edges stay short. Barycenter can occasionally WORSEN an already-clean
+    // rank, so we count edge crossings and keep the better of {original, barycentered}.
+    `function slotmap(){var o={};for(var r=0;r<=maxr;r++){var c=cols[r]||[];for(var k=0;k<c.length;k++)o[c[k].i]=k;}return o;}`+
+    `function xings(o){var x=0;for(var r=1;r<=maxr;r++){var cur=cols[r]||[],E=[];`+
+    `for(var a=0;a<cur.length;a++){var nd=cur[a];for(var b=0;b<nd.src.length;b++){var s=nd.src[b];`+
+    `if(byId[s]&&(rank[s]||0)===r-1)E.push([o[s],o[nd.i]]);}}`+
+    `for(var a=0;a<E.length;a++)for(var b2=a+1;b2<E.length;b2++){`+
+    `var u1=E[a][0],l1=E[a][1],u2=E[b2][0],l2=E[b2][1];`+
+    `if((u1<u2&&l1>l2)||(u1>u2&&l1<l2))x++;}}return x;}`+
+    // snapshot the original array order + its crossing count
+    `var ord=slotmap();var baseX=xings(ord);var baseCols={};for(var r=0;r<=maxr;r++)baseCols[r]=(cols[r]||[]).slice();`+
+    `function bary(node,adjRank){var acc=0,cnt=0;`+
+    `for(var b=0;b<node.src.length;b++){var s=node.src[b];if(byId[s]&&(rank[s]||0)===adjRank){acc+=ord[s];cnt++;}}`+
+    `for(var a=0;a<N.length;a++){var o=N[a];if((rank[o.i]||0)===adjRank&&o.src.indexOf(node.i)>=0){acc+=ord[o.i];cnt++;}}`+
+    `return cnt?acc/cnt:ord[node.i];}`+
+    `for(var pass=0;pass<4;pass++){var down=(pass%2===0);`+
+    `for(var rr=1;rr<=maxr;rr++){var r=down?rr:(maxr-rr);var adj=down?r-1:r+1;`+
+    `var c=cols[r]||[];if(!c.length||adj<0||adj>maxr)continue;`+
+    `c.sort(function(p,q){return bary(p,adj)-bary(q,adj);});`+
+    `for(var k=0;k<c.length;k++)ord[c[k].i]=k;}}`+
+    // if barycenter did not reduce crossings, revert to the original order
+    `if(xings(ord)>=baseX){for(var r=0;r<=maxr;r++)cols[r]=baseCols[r];ord=slotmap();}`+
+    // Vertical dataflow: rank -> y (top to bottom). X is assigned by a median-alignment
+    // pass (Sugiyama coordinate assignment), NOT fixed slots: each node is pulled toward
+    // the median x of its neighbours (parents on down-sweeps, children on up-sweeps) so a
+    // node sits directly under its parent -- this is the "move the rank right so it lines
+    // up" fix. Order within a rank is preserved and a minimum gap (CW) is enforced left
+    // to right, so alignment never reorders or overlaps nodes.
+    `var maxRows=0;for(var r=0;r<=maxr;r++){maxRows=Math.max(maxRows,(cols[r]||[]).length);}`+
+    `var X={};`+                                          // node id -> x (continuous)
+    `for(var r=0;r<=maxr;r++){var row=cols[r]||[];for(var k=0;k<row.length;k++)X[row[k].i]=PADX+k*CW;}`+
+    `function neighAvg(nd,adj){var acc=0,c=0;`+
+    `for(var b=0;b<nd.src.length;b++){var s=nd.src[b];if(byId[s]&&(rank[s]||0)===adj){acc+=X[s];c++;}}`+
+    `for(var a=0;a<N.length;a++){var o=N[a];if((rank[o.i]||0)===adj&&o.src.indexOf(nd.i)>=0){acc+=X[o.i];c++;}}`+
+    `return c?acc/c:null;}`+
+    // sweep: propose each node's x = neighbour median, then de-overlap the rank in order.
+    `for(var pass=0;pass<8;pass++){var down=(pass%2===0);`+
+    `for(var rr=0;rr<=maxr;rr++){var r=down?rr:(maxr-rr);var adj=down?r-1:r+1;`+
+    `var row=cols[r]||[];if(adj>=0&&adj<=maxr){`+
+    `for(var k=0;k<row.length;k++){var want=neighAvg(row[k],adj);if(want!=null)X[row[k].i]=want;}}`+
+    // resolve overlaps left->right keeping order (min gap CW), then right->left
+    `for(var k=1;k<row.length;k++){if(X[row[k].i]<X[row[k-1].i]+CW)X[row[k].i]=X[row[k-1].i]+CW;}`+
+    `for(var k=row.length-2;k>=0;k--){if(X[row[k].i]>X[row[k+1].i]-CW)X[row[k].i]=X[row[k+1].i]-CW;}}}`+
+    // normalize to a positive origin and finalize positions
+    `var minX=1e9;for(var a=0;a<N.length;a++)minX=Math.min(minX,X[N[a].i]);`+
+    `var pos={},maxX=0;for(var r=0;r<=maxr;r++){var row=cols[r]||[];`+
+    `for(var k=0;k<row.length;k++){var x=PADX+(X[row[k].i]-minX);maxX=Math.max(maxX,x);`+
+    `pos[row[k].i]={x:x, y:PADY+r*RH, node:row[k]};}}`+
+    `var GW=PADX*2+maxX-PADX+BW, GH=PADY*2+(maxr+1)*RH;`+
+    `info.textContent=P.kind+'  |  '+N.length+' nodes  |  '+(maxr+1)+' ranks  |  step '+P.step;`+
+    `var Z=1,OX=0,OY=0,SEL=null;`+  // SEL = i of the node synced to the lane selection
+    `var OPCOL={MUL_MAT:'#7a4f6d',RMS_NORM:'#3d5a80',ADD:'#4a6a4a',GET_ROWS:'#5a5a3a',`+
+    `SOFT_MAX:'#6a4a6a',ROPE:'#4a5a6a',MUL:'#4a4a5a'};`+
+    `function opcol(op){return OPCOL[op]||'#3a4553';}`+
+    `function fit(){var dpr=window.devicePixelRatio||1;var W=wrap.clientWidth,H=wrap.clientHeight;`+
+    `Z=Math.min(W/GW,H/GH,1.5);Z=Math.max(Z,0.15);OX=(W-GW*Z)/2;OY=(H-GH*Z)/2;draw();}`+
+    `function draw(){var dpr=window.devicePixelRatio||1;var W=wrap.clientWidth,H=wrap.clientHeight;`+
+    `cv.width=W*dpr;cv.height=H*dpr;cv.style.width=W+'px';cv.style.height=H+'px';`+
+    `var g=cv.getContext('2d');g.setTransform(dpr,0,0,dpr,0,0);g.clearRect(0,0,W,H);`+
+    `g.save();g.translate(OX,OY);g.scale(Z,Z);`+
+    // edges first (behind nodes). Dashed when the target is a chain-only node
+    // (block topology not modeled -> the edge is a pure execution-order fallback).
+    `g.lineWidth=1.2;`+
+    `for(var a=0;a<N.length;a++){var nd=N[a];var pd=pos[nd.i];if(!pd)continue;`+
+    `for(var b=0;b<nd.src.length;b++){var ps=pos[nd.src[b]];if(!ps)continue;`+
+    // edge: source bottom-center -> target top-center, vertical bezier + down arrow
+    `var x1=ps.x+BW/2,y1=ps.y+BH,x2=pd.x+BW/2,y2=pd.y;`+
+    `g.strokeStyle=nd.chain?'#5a5040':'#3a4657';g.setLineDash(nd.chain?[4,3]:[]);`+
+    `g.beginPath();g.moveTo(x1,y1);g.bezierCurveTo(x1,y1+30,x2,y2-30,x2,y2);g.stroke();`+
+    `g.setLineDash([]);`+
+    `g.beginPath();g.moveTo(x2,y2);g.lineTo(x2-3,y2-6);g.lineTo(x2+3,y2-6);g.closePath();`+
+    `g.fillStyle=nd.chain?'#5a5040':'#3a4657';g.fill();}}`+
+    // nodes
+    `g.font='12px -apple-system,Segoe UI,sans-serif';g.textBaseline='middle';`+
+    `for(var a=0;a<N.length;a++){var nd=N[a];var pd=pos[nd.i];if(!pd)continue;`+
+    `g.fillStyle=nd.ext?'#1a1f27':opcol(nd.op);g.globalAlpha=nd.ext?0.55:1;`+
+    `var issel=(SEL!=null&&nd.i===SEL);`+
+    `g.strokeStyle=issel?'#4d90fe':(nd.ext?'#2a3340':'#0b0d12');g.lineWidth=issel?2.5:1;`+
+    `g.beginPath();g.rect(pd.x,pd.y,BW,BH);g.fill();g.stroke();g.globalAlpha=1;`+
+    // line 1 = kernel family (matches the swim-lane label so nodes are recognizable);
+    // line 2 = the ggml tensor name (Qcur, ffn_moe_gate) for dataflow context.
+    `var flabel=nd.label||nd.fam||nd.op;flabel=flabel.length>26?flabel.slice(0,25)+'\\u2026':flabel;`+
+    `g.fillStyle='#e8eef5';g.fillText(flabel,pd.x+8,pd.y+14);`+
+    `g.fillStyle='#aeb9c7';var nm=nd.name.length>26?nd.name.slice(0,25)+'\\u2026':nd.name;`+
+    `g.fillText(nm,pd.x+8,pd.y+29);`+
+    `if(nd.us!=null){g.fillStyle=nd.tsrc==='fam'?'#c8d98a':'#8fe388';`+
+    `g.fillText(nd.us.toFixed(1)+' \\u00b5s'+(nd.tsrc==='fam'?' ~':''),pd.x+8,pd.y+44);}`+
+    // badge: a "+N" chip when this op folds >1 GPU kernel (e.g. quantize + matmul)
+    `if(nd.kernels&&nd.kernels.length>1){var bt='+'+(nd.kernels.length-1)+'k';`+
+    `g.fillStyle='#3a4553';g.fillRect(pd.x+BW-30,pd.y+4,26,13);`+
+    `g.fillStyle='#c8d98a';g.font='10px sans-serif';g.fillText(bt,pd.x+BW-27,pd.y+11);`+
+    `g.font='12px -apple-system,Segoe UI,sans-serif';}`+
+    `else if(!nd.ext){g.fillStyle='#6f7d8f';g.fillText('--',pd.x+8,pd.y+44);}}`+
+    `g.restore();}`+
+    // Wheel = zoom only with Ctrl/Alt held (matches the timeline + tiling/CC/util
+    // popups); plain wheel is left to the browser. Zoom is anchored at the cursor.
+    `wrap.addEventListener('wheel',function(e){if(!(e.ctrlKey||e.altKey))return;`+
+    `e.preventDefault();var d=e.deltaY<0?1.15:1/1.15;`+
+    `var r=cv.getBoundingClientRect();var mx=e.clientX-r.left,my=e.clientY-r.top;`+
+    `OX=mx-(mx-OX)*d;OY=my-(my-OY)*d;Z*=d;draw();},{passive:false});`+
+    `var pan=false,px=0,py=0,downX=0,downY=0,moved=false;`+
+    // map screen (mx,my) -> a node at that point (accounting for pan/zoom)
+    `function nodeAt(mx,my){var wx=(mx-OX)/Z,wy=(my-OY)/Z;`+
+    `for(var a=0;a<N.length;a++){var nd=N[a],pd=pos[nd.i];if(!pd)continue;`+
+    `if(wx>=pd.x&&wx<=pd.x+BW&&wy>=pd.y&&wy<=pd.y+BH)return nd;}return null;}`+
+    `cv.addEventListener('mousedown',function(e){pan=true;moved=false;px=e.clientX;py=e.clientY;`+
+    `downX=e.clientX;downY=e.clientY;cv.style.cursor='grabbing';});`+
+    `window.addEventListener('mousemove',function(e){if(!pan)return;`+
+    `if(Math.abs(e.clientX-downX)>3||Math.abs(e.clientY-downY)>3)moved=true;`+
+    `OX+=e.clientX-px;OY+=e.clientY-py;px=e.clientX;py=e.clientY;draw();});`+
+    `window.addEventListener('mouseup',function(e){pan=false;cv.style.cursor='grab';});`+
+    // hover a node -> tooltip listing the GPU kernels this op launched (with times), so
+    // folded prep kernels like quantize_q8_1 are visible without cluttering the graph.
+    `var ktip=document.getElementById('ktip');`+
+    `cv.addEventListener('mousemove',function(e){if(pan){ktip.style.display='none';return;}`+
+    `var r=cv.getBoundingClientRect();var nd=nodeAt(e.clientX-r.left,e.clientY-r.top);`+
+    `if(!nd||!nd.kernels||!nd.kernels.length){ktip.style.display='none';return;}`+
+    `var h='<b>'+esc(nd.op)+'</b> &middot; '+esc(nd.name)+'<br>';`+
+    `for(var k=0;k<nd.kernels.length;k++){var kk=nd.kernels[k];`+
+    `h+='<span style=\"color:#8fe388\">'+kk.us.toFixed(1)+' us</span>  '+esc(kk.fam)+'<br>';}`+
+    `ktip.innerHTML=h;ktip.style.display='block';`+
+    `ktip.style.left=Math.min(e.clientX-r.left+14,r.width-330)+'px';`+
+    `ktip.style.top=(e.clientY-r.top+14)+'px';});`+
+    `cv.addEventListener('mouseleave',function(){ktip.style.display='none';});`+
+    // a click (no drag) on a node: highlight it locally. (Graph->swim-lane selection was
+    // removed -- fam-only matching couldn't reliably pick the exact dispatch, so it was
+    // more confusing than useful. Swim-lane -> graph highlighting is kept below.)
+    `cv.addEventListener('click',function(e){if(moved)return;`+
+    `var r=cv.getBoundingClientRect();var nd=nodeAt(e.clientX-r.left,e.clientY-r.top);`+
+    `if(!nd)return;SEL=nd.i;draw();});`+
+    // apply a selection posted BY the parent: highlight + center the matching node. Match
+    // by exact span first (trace-derived), else by kernel family (roofline).
+    `function ruvApply(sel){if(!sel){SEL=null;draw();return;}`+
+    `var found=null;`+
+    `if(sel.s!=null&&sel.e!=null){for(var a=0;a<N.length;a++){if(N[a].s===sel.s&&N[a].e===sel.e){found=N[a];break;}}}`+
+    `if(!found&&sel.fam){for(var a=0;a<N.length;a++){if(N[a].fam===sel.fam){found=N[a];break;}}}`+
+    `if(!found){SEL=null;draw();return;}SEL=found.i;`+
+    `var pd=pos[found.i];if(pd){var W=wrap.clientWidth,H=wrap.clientHeight;`+
+    `OX=W/2-(pd.x+BW/2)*Z;OY=H/2-(pd.y+BH/2)*Z;}draw();}`+
+    `window.addEventListener('message',function(ev){var m=ev&&ev.data;if(m&&m.ruv==='select')ruvApply(m.sel);});`+
+    `document.getElementById('zin').onclick=function(){Z*=1.25;draw();};`+
+    `document.getElementById('zout').onclick=function(){Z/=1.25;draw();};`+
+    `document.getElementById('fit').onclick=fit;`+
+    `document.getElementById('esc').onclick=function(){window.close();};`+
+    `window.addEventListener('resize',draw);`+
+    `window.addEventListener('keydown',function(e){if(e.key==='Escape')window.close();});`+
+    // clean up the parent's registry when this window closes
+    `window.addEventListener('beforeunload',function(){try{if(window.opener&&!window.opener.closed`+
+    `&&window.opener.graphWindows)delete window.opener.graphWindows[P.L];}catch(_){}});`+
+    `fit();`+
+    // apply any seeded selection from the parent (lane selection at open time)
+    `if(P.sel)ruvApply(P.sel);`+
+    `<\/scr`+`ipt></body></html>`;
+  w.document.open(); w.document.write(doc); w.document.close();
+}
 function openTilingView(shape){
   if(!shape||!shape.K||!shape.N){ alert('No mapped shape for this kernel (run with --gguf).'); return; }
   const w=window.open('','_blank');
@@ -3730,6 +4368,7 @@ function openTilingView(shape){
     `<button class="zb" id="zout">Zoom &minus;</button>`+
     `<button class="zb" id="zin">Zoom +</button>`+
     `<button class="zb" id="fit">Fit</button>`+
+    `<button class="zb" id="esc" title="close (Esc)">Esc</button>`+
     `<button class="zb" id="ccopen" style="display:none">Open concurrency view</button>`+
     `<span class="lg"><span class="sw" style="background:#e8912a"></span><span id="lgW">W</span></span>`+
     `<span class="lg"><span class="sw" style="background:#2d3f2f;border:1px solid #3fb950"></span><span id="lgX">X</span></span>`+
@@ -4043,6 +4682,7 @@ function openTilingView(shape){
     `document.getElementById('zin').onclick=function(){zoom(1.4);};`+
     `document.getElementById('zout').onclick=function(){zoom(1/1.4);};`+
     `document.getElementById('fit').onclick=function(){TZ=1;draw();};`+
+    `document.getElementById('esc').onclick=function(){window.close();};`+
     `cv.addEventListener('wheel',function(e){if(e.ctrlKey||e.altKey){zoom(e.deltaY<0?1.15:1/1.15);e.preventDefault();return;}`+
     `wrap.scrollTop+=e.deltaY;e.preventDefault();},{passive:false});`+
     // ---- CONCURRENCY VIEW (opens in its OWN full window) ----
@@ -4070,6 +4710,7 @@ function openTilingView(shape){
     `'</style></head><body><div id=\"b\"><h2>Concurrency: workgroups by scheduling round</h2>'+`+
     `'<button id=\"pv\">&lt; prev</button><button id=\"nx\">next &gt;</button><button id=\"al\">show all</button>'+`+
     `'<button id=\"zo\">Zoom &minus;</button><button id=\"zi\">Zoom +</button><button id=\"zf\">Fit</button>'+`+
+    `'<button id=\"esc\" title=\"close (Esc)\">Esc</button>'+`+
     `'<span id=\"i\"></span></div><div id=\"w\"><canvas id=\"c\"></canvas></div><scr'+'ipt>'+`+
     `'var P='+JSON.stringify(P)+';var R=0,ZM=1;'+`+
     `'var FN=\"ui-monospace,Menlo,Consolas,monospace\";'+`+
@@ -4133,6 +4774,7 @@ function openTilingView(shape){
     `'document.getElementById(\"zi\").onclick=function(){zoom(1.3);};'+`+
     `'document.getElementById(\"zo\").onclick=function(){zoom(1/1.3);};'+`+
     `'document.getElementById(\"zf\").onclick=function(){ZM=1;draw();};'+`+
+    `'document.getElementById(\"esc\").onclick=function(){window.close();};'+`+
     `'cv.addEventListener(\"wheel\",function(e){if(e.ctrlKey||e.altKey){zoom(e.deltaY<0?1.15:1/1.15);e.preventDefault();}},{passive:false});'+`+
     `'window.addEventListener(\"resize\",draw);'+`+
     `'window.addEventListener(\"keydown\",function(e){if(e.key===\"Escape\")window.close();'+`+
@@ -4267,7 +4909,10 @@ function openDebugView(fam){
     `</style></head><body>`+
     `<header><h1 style="display:flex;align-items:center;gap:10px">`+
     `<span>ISA debug view`+(split?` -- source-linked`:``)+`</span>`+
-    (payload.dbgHelp||'')+`</h1>`+
+    (payload.dbgHelp||'')+
+    `<button id="esc" title="close (Esc)" style="margin-left:auto;background:#1f2733;`+
+    `color:#d7dde5;border:1px solid #3a4553;border-radius:3px;padding:3px 9px;`+
+    `font-size:12px;cursor:pointer">Esc</button></h1>`+
     `<div class="sym">`+esc(payload.sym||fam)+`</div>`+
     `<div class="tot">`+payload.rows.length+` instructions &middot; `+
     payload.n_disp+` dispatch(es), ~1 SIMD &middot; `+
@@ -4639,6 +5284,10 @@ function openDebugView(fam){
     // cycles; each bucket shaded by how busy that unit was there (RCV colored cells).
     `var UT=D.util,UTWIN=null;`+
     `if(UT){var utb=document.getElementById('utbtn');if(utb)utb.onclick=openUtil;}`+
+    `var _esc=document.getElementById('esc');if(_esc)_esc.onclick=function(){window.close();};`+
+    `window.addEventListener('keydown',function(e){if(e.key==='Escape'){var t=e.target;`+
+    `if(t&&(t.id==='f'||t.tagName==='SELECT'||t.tagName==='INPUT'))return;`+
+    `if(typeof WOPEN!=='undefined'&&WOPEN)return;window.close();}});`+
     `function openUtil(){`+
     `var UC={VALU:'#3fb950',WMMA:'#c678dd',LDS:'#e8912a',VMEM:'#e0b341',SMEM:'#56b6c2',`+
     `SALU:'#7f9cc0',WAIT:'#8a94a6',BRANCH:'#e06c75',MSG:'#b5651d'};`+
@@ -4662,6 +5311,7 @@ function openDebugView(fam){
     `'</style></head><body><div id=\"b\"><h2>Utilization: HW units over cycles (1 SIMD)</h2>'+`+
     `'<label style=\"color:#9fb0c4;font-size:12px\">scope <select id=\"ws\"></select></label>'+`+
     `'<button id=\"zi\">Zoom +</button><button id=\"zo\">Zoom &minus;</button><button id=\"zf\">Fit</button>'+`+
+    `'<button id=\"esc\" title=\"close (Esc)\">Esc</button>'+`+
     `'<span id=\"i\"></span></div><div id=\"w\"><canvas id=\"c\"></canvas></div><scr'+'ipt>'+`+
     `'var P='+JSON.stringify(P)+';var ZX=1,PH=null;'+`+
     `'var FN=\"ui-monospace,Menlo,Consolas,monospace\";'+`+
@@ -4706,6 +5356,7 @@ function openDebugView(fam){
     `'document.getElementById(\"zi\").onclick=function(){ZX=Math.min(20,ZX*1.4);draw();};'+`+
     `'document.getElementById(\"zo\").onclick=function(){ZX=Math.max(1,ZX/1.4);draw();};'+`+
     `'document.getElementById(\"zf\").onclick=function(){ZX=1;draw();};'+`+
+    `'document.getElementById(\"esc\").onclick=function(){window.close();};'+`+
     `'cv.addEventListener(\"wheel\",function(e){if(e.ctrlKey||e.altKey){ZX=Math.max(1,Math.min(20,ZX*(e.deltaY<0?1.15:1/1.15)));draw();e.preventDefault();}},{passive:false});'+`+
     `'window.setPlayhead=function(c){PH=c;draw();};'+`+
     `'window.addEventListener(\"resize\",draw);'+`+
@@ -4909,6 +5560,9 @@ cv.addEventListener('mousemove', e=>{
   const wC=cv.clientWidth;
   cv.style.cursor = Math.min(Math.abs(mx-xOf(markA,wC)),Math.abs(mx-xOf(markB,wC)))<=6 ? 'ew-resize' : '';
   let hit=hitTest(mx,my);
+  // a layer segment is always clickable: opens its graph DAG when a graph is loaded,
+  // otherwise shows the "ask the maintainer" message.
+  if(hit && hit.type==='layer' && cv.style.cursor==='') cv.style.cursor='pointer';
   if(!hit){hv.style.display='none';return;}
   let html='';
   if(hit.type==='gpu'){
@@ -4932,7 +5586,9 @@ cv.addEventListener('mousemove', e=>{
         :`<div class="r">(no PMC data)</div>`);
   } else if(hit.type==='layer'){
     const L=hit.p;
-    html=`<div class="k">${L.name}</div><div class="r">layer span ${fmtus(L.e-L.s)}</div>`;
+    html=`<div class="k">${L.name}</div><div class="r">layer span ${fmtus(L.e-L.s)}</div>`+
+      (D.has_layer_graph?`<div class="r" style="color:#7fd1ff">click: show compute graph</div>`
+        :`<div class="r" style="color:#7a8290">click: compute graph (none loaded)</div>`);
   } else if(hit.type==='phase'){
     const P=hit.p;
     html=`<div class="k">${P.name}</div><div class="r">phase span ${fmtus(P.e-P.s)}</div>`;
@@ -5051,6 +5707,14 @@ function clickSelect(mx,my,toggle){
   if(q && q.type==='gpu'){
     if(toggle) toggleSlice(q.p);
     else selectSlice(selectedSlice===q.p ? null : q.p);
+    return;
+  }
+  // Click a layer swim-lane segment to open its actual compute-graph DAG (from the
+  // ggml-roofline topology dump, --graph-json). When no graph is loaded, tell the user
+  // how to get one (ask the RUV maintainer) instead of silently doing nothing.
+  if(q && q.type==='layer'){
+    if(D.has_layer_graph) openLayerGraph(q.p.L);
+    else layerGraphUnavailable();
     return;
   }
   if(!toggle) selectSlice(null);   // plain click on empty clears; modifier-click keeps selection
