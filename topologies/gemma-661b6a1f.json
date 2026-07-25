@@ -1,0 +1,163 @@
+{
+ "topology_key": "gemma-661b6a1f",
+ "architecture": "gemma",
+ "source": "ggml-roofline (PR#66) storage-id topology, last-writer-wins; layer/token-deduped, timing-free. Faithful node->src[] edges. Keyed by architecture + block tensor-role fingerprint.",
+ "n_variants": 1,
+ "nodes": [
+  {
+   "name": "inp_scaled",
+   "op": "SCALE",
+   "src": []
+  },
+  {
+   "name": "norm",
+   "op": "RMS_NORM",
+   "src": [
+    "inp_scaled"
+   ]
+  },
+  {
+   "name": "Qcur",
+   "op": "MUL_MAT",
+   "src": [
+    "norm"
+   ]
+  },
+  {
+   "name": "Qcur",
+   "op": "ROPE",
+   "src": []
+  },
+  {
+   "name": "Qcur_scaled",
+   "op": "SCALE",
+   "src": [
+    "Qcur"
+   ]
+  },
+  {
+   "name": "Vcur",
+   "op": "MUL_MAT",
+   "src": [
+    "norm"
+   ]
+  },
+  {
+   "name": "Kcur",
+   "op": "MUL_MAT",
+   "src": [
+    "norm"
+   ]
+  },
+  {
+   "name": "Kcur",
+   "op": "ROPE",
+   "src": []
+  },
+  {
+   "name": "cache_v (view)",
+   "op": "SET_ROWS",
+   "src": [
+    "Vcur"
+   ]
+  },
+  {
+   "name": "node",
+   "op": "FLASH_ATTN_EXT",
+   "src": [
+    "Kcur",
+    "Qcur_scaled",
+    "cache_v (view)"
+   ]
+  },
+  {
+   "name": "node",
+   "op": "MUL_MAT",
+   "src": [
+    "inp_scaled"
+   ]
+  },
+  {
+   "name": "norm",
+   "op": "RMS_NORM",
+   "src": [
+    "node"
+   ]
+  },
+  {
+   "name": "ffn_gate",
+   "op": "MUL_MAT",
+   "src": [
+    "norm"
+   ]
+  },
+  {
+   "name": "ffn_out",
+   "op": "MUL_MAT",
+   "src": [
+    "ffn_gate",
+    "node"
+   ]
+  },
+  {
+   "name": "norm",
+   "op": "RMS_NORM",
+   "src": [
+    "ffn_out"
+   ]
+  },
+  {
+   "name": "node",
+   "op": "MUL_MAT",
+   "src": [
+    "ffn_out"
+   ]
+  },
+  {
+   "name": "node",
+   "op": "MUL_MAT",
+   "src": []
+  },
+  {
+   "name": "node",
+   "op": "GET_ROWS",
+   "src": []
+  },
+  {
+   "name": "node",
+   "op": "GET_ROWS",
+   "src": [
+    "ffn_out"
+   ]
+  },
+  {
+   "name": "sa_out",
+   "op": "ADD",
+   "src": [
+    "node"
+   ]
+  },
+  {
+   "name": "norm",
+   "op": "RMS_NORM",
+   "src": [
+    "sa_out"
+   ]
+  },
+  {
+   "name": "ffn_out",
+   "op": "MUL_MAT",
+   "src": [
+    "ffn_gate",
+    "sa_out"
+   ]
+  },
+  {
+   "name": "result_output",
+   "op": "MUL_MAT",
+   "src": [
+    "norm"
+   ]
+  }
+ ]
+}
