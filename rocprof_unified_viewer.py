@@ -2477,6 +2477,7 @@ def build_payload(args):
 
     payload = {
         "title": title,
+        "model_name": os.path.basename(args.gguf) if args.gguf else "",
         "provenance": _provenance(),
         "mode": args.mode,
         "ttft_est_ms": ttft_est_ms,
@@ -2945,6 +2946,7 @@ if (IS_MULTI){
 document.getElementById('titletext').textContent =
   D.title + (IS_PREFILL ? '  -- PREFILL' : '  -- DECODE');
 document.getElementById('sub').textContent =
+  (D.model_name ? `${D.model_name} | ` : ``)+
   (IS_PREFILL ? `prefill: 1 forward pass` : `baked ${D.n_tokens_baked} tokens`)+
   ` | ${D.gpu.length} GPU slices | `+
   `${D.cpu.length} HIP calls | window GPU-busy ${fmtms(D.busy_ns)} / span `+
@@ -3620,9 +3622,43 @@ function renderFamilyMembers(){
     `<div style="color:#7fd1ff;word-break:break-all;margin-bottom:6px">${fam}`+
     `<span class="r"> (${rows.length} dispatch${rows.length===1?'':'es'})</span></div>`;
   if(!rows.length){
-    h+=`<div class="sub">No order-mapped dispatches in this family`+
-       (D.has_map?`.`:` -- run with --gguf to attach shape / packed footprint / effective BW.`)+`</div>`;
-    dp.innerHTML=h; dp.style.display='block'; return;
+    // No GGUF order-map for this family (e.g. binary/broadcast, norm, copy ops that
+    // don't stream a weight): no per-weight shape / packed footprint / effective BW.
+    // Still list every dispatch with its raw kernel time + block count so the
+    // family's per-dispatch timing and count stay inspectable.
+    const famAll=[]; for(const s of D.gpu){ if(s.fam===fam) famAll.push(s); }
+    const fw = win ? famAll.filter(s=> s.s>=win.t0 && s.s<win.t1) : famAll.slice();
+    const frows = fw.length ? fw : famAll;
+    frows.sort((a,b)=> a.s-b.s);
+    if(!frows.length){
+      h+=`<div class="sub">No dispatches in this family`+
+         (D.has_map?`.`:` -- run with --gguf to attach shape / packed footprint / effective BW.`)+`</div>`;
+      dp.innerHTML=h; dp.style.display='block'; return;
+    }
+    h=`<h2>Kernel family/${IS_PREFILL?'Forward':'Token'}</h2>`+
+      `<div style="color:#7fd1ff;word-break:break-all;margin-bottom:6px">${fam}`+
+      `<span class="r"> (${frows.length} dispatch${frows.length===1?'':'es'}, unmapped)</span></div>`+
+      `<table><thead><tr><th style="text-align:left">#</th>`+
+      `<th style="text-align:left">kernel time</th>`+
+      `<th style="text-align:left">blocks</th></tr></thead><tbody>`;
+    frows.forEach((s,i)=>{
+      h+=`<tr class="shrow" data-idx="${i}" title="frame this dispatch in the timeline">`+
+         `<td>${i+1}</td><td>${fmtus(s.e-s.s)}</td>`+
+         `<td>${s.blocks!=null?s.blocks:'<span class="r">-</span>'}</td></tr>`;
+    });
+    h+=`</tbody></table>`+
+       `<div class="sub" style="margin-top:6px">${frows.length} dispatch`+
+       `${frows.length===1?'':'es'} of <b>${fam}</b>`+
+       (win?` in one complete decode token`:``)+`, one row per dispatch (no averaging). `+
+       `This family does not stream a GGUF weight, so there is no shape / packed `+
+       `footprint / effective BW. <b>kernel time</b> = this dispatch's measured `+
+       `Start-&gt;End (raw). Click a row to frame that dispatch in the timeline.</div>`;
+    dp.innerHTML=h; dp.style.display='block';
+    dp.querySelectorAll('tr.shrow').forEach(tr=>{
+      tr.onclick=()=>{ const s=frows[+tr.dataset.idx];
+        if(s) applyFindResult({t0:s.s, t1:s.e, select:s}); };
+    });
+    return;
   }
   // Per-shape modes -> per-LAYER lookup, rendered as a table column (below) so
   // each dispatch row shows which mode its layer belongs to. Within each

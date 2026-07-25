@@ -135,3 +135,26 @@ def test_checked_in_topologies_are_valid():
         for nd in lg["nodes"]:
             for s in nd["src"]:
                 assert isinstance(s, int) and 0 <= s < lg["n_nodes"], "bad edge index"
+
+
+def test_model_name_field(tmp_path):
+    # No --gguf fixture (real model is multi-GB), so we can only assert the key exists
+    # and is empty here; the frontend guard must gate the sub-line on it either way.
+    html = _gen(tmp_path)
+    raw = _raw(html)
+    assert "model_name" in raw, "payload missing model_name field"
+    assert raw["model_name"] == "", "model_name should be empty without --gguf"
+    assert "D.model_name ?" in html, "frontend sub-line must guard on D.model_name"
+
+
+def test_unmapped_family_lists_dispatches(tmp_path):
+    # A family that does not stream a GGUF weight (e.g. k_bin_bcast) has no order-map,
+    # but the family panel must still list its dispatches instead of dead-ending. The
+    # fixtures contain such families; assert the "unmapped" fallback branch is present
+    # and a non-weight family (k_bin_bcast, now op-tagged e.g. k_bin_bcast[add]) appears.
+    html = _gen(tmp_path)
+    raw = _raw(html)
+    fams = {s["fam"] for s in raw["gpu"]}
+    assert any(f.startswith("k_bin_bcast") for f in fams), \
+        "fixture should contain the unmapped k_bin_bcast family"
+    assert ", unmapped)</" in html, "frontend must render an unmapped-dispatch table branch"
