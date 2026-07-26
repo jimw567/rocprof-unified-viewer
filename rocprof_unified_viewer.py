@@ -3442,14 +3442,14 @@ function renderMultiSelect(){
        `<td>${(g.dur/totDur*100).toFixed(1)}%</td></tr>`;
   }
   left+=`</tbody></table>`;
-  // Two columns: family breakdown on the left, fusion analysis in the wide space
-  // on the right (falls back to stacking on narrow panes via flex-wrap).
-  let h=`<div style="display:flex;gap:28px;align-items:flex-start;flex-wrap:wrap">`+
-     `<div style="flex:0 1 auto">${left}</div>`+
-     `<div style="flex:1 1 340px;min-width:300px">${fusionSection(sl, gs, totDur)}</div>`+
-     `</div>`+
-     `<div class="sub" style="margin-top:6px">Drag again to reselect; click one kernel for its `+
-     `full detail; Esc clears.</div>`;
+  // Family breakdown of the lasso selection. Fusion analysis moved to the layer graph
+  // view (it is dataflow-driven there -- ctrl-click connected nodes -- instead of the
+  // time-adjacency heuristic this lasso used).
+  let h=left+
+     `<div class="sub" style="margin-top:6px">Drag again to reselect; click one kernel for `+
+     `its full detail; Esc clears.`+
+     (D.has_layer_graph?` &mdash; for fusion analysis, open a layer's compute graph and `+
+       `ctrl/cmd-click connected nodes.`:``)+`</div>`;
   dp.innerHTML=h; dp.style.display='block';
 }
 // Fusion-opportunity analysis for a lasso selection of (usually small) kernels.
@@ -4136,11 +4136,21 @@ function openLayerGraph(L){
   for(const id of ids){ const nd=nById[id]; if(nd) push(nd,false); }
   for(const id of ext){ const nd=nById[id]; if(nd) push(nd,true); }
   const kindName=(D.layers||[]).filter(x=>x.L===L).map(x=>x.name)[0]||('L'+L);
-  const w=window.open('','ruv_graph_L'+L);
+  // Open as a standalone popup WINDOW (not a tab) so it can be dragged to another
+  // monitor. Size it to fill the current screen (browsers cannot request a true OS
+  // "maximized" state via window.open, but a full-availWidth/Height window looks the
+  // same and is still resizable). Some browsers honor the user's tab preference; that
+  // is fine -- the window is fully functional either way.
+  const gw=screen.availWidth||1600, gh=screen.availHeight||1000;
+  const w=window.open('','ruv_graph_L'+L,
+    'popup=1,width='+gw+',height='+gh+',left=0,top=0,resizable=1,scrollbars=1');
   if(!w){ alert('Popup blocked -- allow popups to open the layer graph.'); return; }
   graphWindows[L]=w;   // register for two-way selection sync
   const payload={L:L, kind:kindName, step:G.step||'', nodes:nodes,
     edges_inferred:!!G.edges_inferred, provenance:G.provenance||'',
+    // per-family PMC/register counters + hw model + stall colors, so the popup can run
+    // the fusion analysis (register pressure / occupancy) locally without the parent.
+    fam_counters:D.fam_counters||{}, hw:D.hw||null, colors:D.colors||{},
     // seed the popup with the current lane selection so it opens already in sync
     sel:(selectedSlice?{s:selectedSlice.s,e:selectedSlice.e,fam:selectedSlice.fam}:null)};
   const doc=`<!doctype html><html><head><meta charset="utf-8">`+
@@ -4171,8 +4181,14 @@ function openLayerGraph(L){
     `<div id="ktip" style="position:absolute;display:none;pointer-events:none;z-index:9;`+
     `background:#0d1117;border:1px solid #2a3340;border-radius:5px;padding:6px 9px;`+
     `font-size:11px;color:#c8d0da;max-width:320px;box-shadow:0 3px 12px rgba(0,0,0,.5)"></div>`+
+    // Fusion-analysis side panel: appears when a manual fusion set (ctrl-click) is built.
+    `<div id="fusion" style="position:absolute;display:none;top:8px;right:8px;z-index:8;`+
+    `width:340px;max-height:calc(100% - 16px);overflow:auto;background:#0d1117;`+
+    `border:1px solid #2a3340;border-radius:6px;padding:10px 12px;font-size:12px;`+
+    `box-shadow:0 4px 16px rgba(0,0,0,.55)"></div>`+
     `</div>`+
-    `<div id="foot">Nodes = real GPU dispatches (names + <b>us</b> times match the `+
+    `<div id="foot"><b style="color:#e0a341">Ctrl/Cmd-click</b> nodes to build a fusion `+
+    `set for analysis. Nodes = real GPU dispatches (names + <b>us</b> times match the `+
     `kernel swim lane exactly). `+
     (payload.edges_inferred
       ?`<b style="color:#e0b341">Edges are INFERRED</b> from dataflow semantics + `+
@@ -4256,6 +4272,7 @@ function openLayerGraph(L){
     `var GW=PADX*2+maxX-PADX+BW, GH=PADY*2+(maxr+1)*RH;`+
     `info.textContent=P.kind+'  |  '+N.length+' nodes  |  '+(maxr+1)+' ranks  |  step '+P.step;`+
     `var Z=1,OX=0,OY=0,SEL=null;`+  // SEL = i of the node synced to the lane selection
+    `var SELSET={};`+               // manual fusion set: node i -> true (ctrl/cmd-click)
     `var OPCOL={MUL_MAT:'#7a4f6d',RMS_NORM:'#3d5a80',ADD:'#4a6a4a',GET_ROWS:'#5a5a3a',`+
     `SOFT_MAX:'#6a4a6a',ROPE:'#4a5a6a',MUL:'#4a4a5a'};`+
     `function opcol(op){return OPCOL[op]||'#3a4553';}`+
@@ -4281,8 +4298,10 @@ function openLayerGraph(L){
     `g.font='12px -apple-system,Segoe UI,sans-serif';g.textBaseline='middle';`+
     `for(var a=0;a<N.length;a++){var nd=N[a];var pd=pos[nd.i];if(!pd)continue;`+
     `g.fillStyle=nd.ext?'#1a1f27':opcol(nd.op);g.globalAlpha=nd.ext?0.55:1;`+
-    `var issel=(SEL!=null&&nd.i===SEL);`+
-    `g.strokeStyle=issel?'#4d90fe':(nd.ext?'#2a3340':'#0b0d12');g.lineWidth=issel?2.5:1;`+
+    `var issel=(SEL!=null&&nd.i===SEL);var infuse=!!SELSET[nd.i];`+
+    // fusion-set member = amber ring; lane-synced node = blue ring; amber wins when both
+    `g.strokeStyle=infuse?'#e0a341':(issel?'#4d90fe':(nd.ext?'#2a3340':'#0b0d12'));`+
+    `g.lineWidth=(infuse||issel)?2.5:1;`+
     `g.beginPath();g.rect(pd.x,pd.y,BW,BH);g.fill();g.stroke();g.globalAlpha=1;`+
     // line 1 = kernel family (matches the swim-lane label so nodes are recognizable);
     // line 2 = the ggml tensor name (Qcur, ffn_moe_gate) for dataflow context.
@@ -4334,7 +4353,11 @@ function openLayerGraph(L){
     // more confusing than useful. Swim-lane -> graph highlighting is kept below.)
     `cv.addEventListener('click',function(e){if(moved)return;`+
     `var r=cv.getBoundingClientRect();var nd=nodeAt(e.clientX-r.left,e.clientY-r.top);`+
-    `if(!nd)return;SEL=nd.i;draw();});`+
+    // ctrl/cmd-click builds the manual fusion set; plain click inspects one node + clears
+    // the fusion set. Clicking empty space with a modifier does nothing; plain clears all.
+    `if(e.ctrlKey||e.metaKey){if(nd){if(SELSET[nd.i])delete SELSET[nd.i];else SELSET[nd.i]=true;renderFusion();draw();}return;}`+
+    `SELSET={};renderFusion();`+
+    `if(!nd){SEL=null;draw();return;}SEL=nd.i;draw();});`+
     // apply a selection posted BY the parent: highlight + center the matching node. Match
     // by exact span first (trace-derived), else by kernel family (roofline).
     `function ruvApply(sel){if(!sel){SEL=null;draw();return;}`+
@@ -4345,6 +4368,70 @@ function openLayerGraph(L){
     `var pd=pos[found.i];if(pd){var W=wrap.clientWidth,H=wrap.clientHeight;`+
     `OX=W/2-(pd.x+BW/2)*Z;OY=H/2-(pd.y+BH/2)*Z;}draw();}`+
     `window.addEventListener('message',function(ev){var m=ev&&ev.data;if(m&&m.ruv==='select')ruvApply(m.sel);});`+
+    // --- Fusion analysis (dataflow-driven, unlike the old swim-lane adjacency version) ---
+    // FC/HW/COL come from the parent payload. The occupancy math mirrors fusionSection()
+    // in the main overlay: a fused kernel allocates ONE register file for its whole body,
+    // so it inherits at least the largest member's VGPR/wave (reuse) up to the sum
+    // (no reuse); past ~96 VGPR/wave on gfx1151 it drops below 16 resident waves.
+    `var FC=P.fam_counters||{},HW=P.hw||null,COL=P.colors||{};`+
+    `var VMAX_THREAD=256,VGPR_FULL=HW?Math.floor(HW.vgpr_per_simd/HW.slots_per_simd):96;`+
+    `function occFor(V,L,Wf){if(!HW||!Wf)return null;`+
+    `var slotsWGP=HW.simd_per_wgp*HW.slots_per_simd,vgprWGP=HW.simd_per_wgp*HW.vgpr_per_simd;`+
+    `var bSlots=Math.floor(slotsWGP/Wf);var bVgpr=V>0?Math.floor(vgprWGP/(Wf*V)):bSlots;`+
+    `var bLds=L>0?Math.floor(HW.lds_per_wgp/L):Infinity;var lim='slots',resid=bSlots;`+
+    `if(bVgpr<resid){lim='VGPR';resid=bVgpr;}if(bLds<resid){lim='LDS';resid=bLds;}`+
+    `return {occ:resid>0?Math.round(resid*Wf/slotsWGP*100):0,lim:lim};}`+
+    // connectivity: is the selected node set a single connected component over src edges?
+    `function connected(ids){if(ids.length<2)return true;var inset={};for(var a=0;a<ids.length;a++)inset[ids[a]]=1;`+
+    `var byId={};for(var a=0;a<N.length;a++)byId[N[a].i]=N[a];`+
+    `var seen={},stack=[ids[0]];seen[ids[0]]=1;var cnt=1;`+
+    `while(stack.length){var u=stack.pop();var nu=byId[u];`+
+    `for(var b=0;b<nu.src.length;b++){var s=nu.src[b];if(inset[s]&&!seen[s]){seen[s]=1;cnt++;stack.push(s);}}`+
+    `for(var a=0;a<N.length;a++){var nd=N[a];if(inset[nd.i]&&!seen[nd.i]&&nd.src.indexOf(u)>=0){seen[nd.i]=1;cnt++;stack.push(nd.i);}}}`+
+    `return cnt===ids.length;}`+
+    `function KB(b){return b>=1024?(b/1024).toFixed(1)+' KB':b+' B';}`+
+    `function analyzeFusion(ids){`+
+    `var nodes=ids.map(function(i){for(var a=0;a<N.length;a++)if(N[a].i===i)return N[a];}).filter(Boolean);`+
+    `var conn=connected(ids);`+
+    // group by family for the register/occupancy model
+    `var byFam={};for(var a=0;a<nodes.length;a++){var f=nodes[a].fam;if(!byFam[f])byFam[f]={fam:f,n:0,us:0};byFam[f].n++;byFam[f].us+=(nodes[a].us||0);}`+
+    `var fams=Object.keys(byFam).map(function(k){return byFam[k];});`+
+    `var vg=[],ld=[],sc=[],Ws=[];for(var a=0;a<fams.length;a++){var fc=FC[fams[a].fam]||{};`+
+    `vg.push(fc.vgpr||0);ld.push(fc.lds_static||0);sc.push(fc.scratch||0);Ws.push(fc.wave?Math.round(fc.wg/fc.wave):0);}`+
+    `var vMax=Math.max(0,Math.max.apply(0,vg)),vSum=vg.reduce(function(a,b){return a+b;},0);`+
+    `var lMax=Math.max(0,Math.max.apply(0,ld)),lSum=ld.reduce(function(a,b){return a+b;},0);`+
+    `var Wf=Math.max(0,Math.max.apply(0,Ws)),anyScr=sc.some(function(x){return x>0;});`+
+    `var busyUs=nodes.reduce(function(a,n){return a+(n.us||0);},0);`+
+    `var oBest=occFor(vMax,lMax,Wf),oWorst=occFor(vSum,lSum,Wf);`+
+    `return {nodes:nodes,fams:fams,conn:conn,vMax:vMax,vSum:vSum,lMax:lMax,lSum:lSum,`+
+    `anyScr:anyScr,busyUs:busyUs,oBest:oBest,oWorst:oWorst};}`+
+    `function renderFusion(){var fp=document.getElementById('fusion');`+
+    `var ids=Object.keys(SELSET).map(Number);`+
+    `if(!ids.length){fp.style.display='none';return;}`+
+    `var A=analyzeFusion(ids);var h='<b style=\"color:#e0a341\">Fusion set</b> ('+A.nodes.length+' nodes)';`+
+    // connectivity verdict
+    `h+=A.conn?'<div style=\"color:#8fe388;margin:4px 0\">connected -- shares dataflow</div>'`+
+    `:'<div style=\"color:#ff6b6b;margin:4px 0\">NOT connected -- these ops do not share data, cannot fuse</div>';`+
+    // family table
+    `h+='<table style=\"width:100%;border-collapse:collapse;margin-top:4px\">';`+
+    `h+='<tr style=\"color:#9fb0c4\"><td>family</td><td>x</td><td>VGPR</td><td>LDS</td><td>occ</td></tr>';`+
+    `for(var a=0;a<A.fams.length;a++){var f=A.fams[a],fc=FC[f.fam]||{};`+
+    `h+='<tr><td>'+esc(f.fam)+'</td><td>'+f.n+'</td><td>'+(fc.vgpr||'-')+'</td><td>'+(fc.lds_static?KB(fc.lds_static):'0')+'</td><td>'+(fc.occ?fc.occ+'%':'-')+'</td></tr>';}`+
+    `h+='</table>';`+
+    // fused model + verdict
+    `if(HW&&Wf){h+='<div style=\"margin-top:6px;color:#c8d0da\">fused VGPR/wave: <b>'+A.vMax+' .. '+A.vSum+'</b> <span style=\"color:#9fb0c4\">(reuse..no-reuse; '+VGPR_FULL+'=full occ, '+VMAX_THREAD+'=spill)</span></div>';`+
+    `if(A.oBest&&A.oWorst)h+='<div style=\"color:#c8d0da\">modeled occupancy: <b>~'+A.oWorst.occ+'% .. '+A.oBest.occ+'%</b> <span style=\"color:#9fb0c4\">('+A.oWorst.lim+'..'+A.oBest.lim+'-bound)</span></div>';}`+
+    `h+='<div style=\"color:#c8d0da\">busy (sum kernels): <b>'+A.busyUs.toFixed(1)+' us</b></div>';`+
+    // verdict
+    `var risks=[];if(A.anyScr)risks.push('a selected kernel already spills to scratch');`+
+    `if(A.vSum>VMAX_THREAD)risks.push('no-reuse VGPR '+A.vSum+' exceeds the '+VMAX_THREAD+'/wave max -> scratch spill unless the compiler reuses registers');`+
+    `else if(A.oBest&&A.oBest.occ<50)risks.push('largest kernel uses '+A.vMax+' VGPR/wave (>'+VGPR_FULL+' for full occ); even perfect reuse caps the fused kernel at ~'+A.oBest.occ+'% occupancy');`+
+    `if(HW&&A.lSum>HW.lds_per_wgp)risks.push('combined LDS '+KB(A.lSum)+' exceeds the '+KB(HW.lds_per_wgp)+' per-WGP budget');`+
+    `var vc,vt;if(!A.conn){vc='#ff6b6b';vt='Not fusable -- the selected ops are not connected in the dataflow graph.';}`+
+    `else if(risks.length){vc='#ffb454';vt='Fusable but risky -- '+risks.join('; ')+'.';}`+
+    `else{vc='#8fe388';vt='Good candidate -- connected'+(A.oWorst?', modeled occ >='+A.oWorst.occ+'%':'')+', combined VGPR/LDS within budget.';}`+
+    `h+='<div style=\"margin-top:8px;padding:6px 8px;border-left:3px solid '+vc+';background:rgba(255,255,255,.05);border-radius:3px;line-height:1.35\"><b style=\"color:'+vc+'\">FUSION</b> <span style=\"color:#c8d0da\">'+vt+'</span></div>';`+
+    `fp.innerHTML=h;fp.style.display='block';}`+
     `document.getElementById('zin').onclick=function(){Z*=1.25;draw();};`+
     `document.getElementById('zout').onclick=function(){Z/=1.25;draw();};`+
     `document.getElementById('fit').onclick=fit;`+
