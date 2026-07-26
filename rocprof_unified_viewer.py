@@ -4135,8 +4135,15 @@ function renderFamilyMembers(){
   let prevKey=null, band=0;
   rows.forEach((s,i)=>{
     const m=s.map, dur=s.e-s.s;
-    const eb=dur?(m.packed/dur):0;
-    const ep=D.peak_bw_gbs?(eb/D.peak_bw_gbs*100):0;
+    // eff BW uses the CORRECTED per-shape value (m.effbw: dump-authoritative exact
+    // shape time when a roofline dump is present, else the nmatch-gated trace median),
+    // NOT packed/(this raw dispatch dur). The raw per-dispatch time is kept in the
+    // "kernel time" column on purpose -- that column EXPOSES the gfx1151 trimodal
+    // timestamp artifact (7/16.8/31.2us for the same op) -- but dividing packed by a
+    // single artifact-smeared dispatch produced impossible >roofline BW (1079, 1242
+    // GB/s). Fall back to packed/dur only when no corrected value exists.
+    const eb=(m.effbw!=null && m.effbw>0)?m.effbw:(dur?(m.packed/dur):0);
+    const ep=(m.effbw_pct!=null && m.effbw>0)?m.effbw_pct:(D.peak_bw_gbs?(eb/D.peak_bw_gbs*100):0);
     // eff BW is INFORMATIONAL only for prefill (compute-bound) -> neutral color, no
     // flag. In decode (BW-bound) keep the low-BW red flag as before.
     const lowBW=(!IS_PREFILL)&&memBound && ep>0 && ep<80;
@@ -4180,8 +4187,9 @@ function renderFamilyMembers(){
      (IS_PREFILL?`<b>TOPS</b> = 2*N*K*B / kernel time (B=${D.compute_batch}, algorithmic `+
        `work; over-fetch/pad-immune) vs peak ${D.peak_tops} TOPS -- prefill's primary `+
        `(compute) roofline; <b>eff BW</b> is secondary. `
-       :`<b>eff BW</b> = packed / kernel time (over-fetch-immune, vs peak `+
-        `${D.peak_bw_gbs} GB/s). `)+
+       :`<b>eff BW</b> = packed / CORRECTED shape time (roofline-dump exact time when `+
+        `available, else nmatch-gated trace median; NOT this row's raw kernel time, which `+
+        `carries the trimodal artifact -- vs peak ${D.peak_bw_gbs} GB/s). `)+
      `Click a row to frame that dispatch in the timeline.</div>`;
   dp.innerHTML=h; dp.style.display='block';
   // Row click frames + selects that exact dispatch, reusing find's framing.
