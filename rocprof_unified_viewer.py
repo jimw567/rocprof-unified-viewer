@@ -418,7 +418,29 @@ def load_fetch_bytes(path):
                 agg_n[(fam, n)].append(v)
     by_fam = {fam: statistics.mean(v) * 1024.0 for fam, v in agg.items() if v}
     by_fam_n = {k: statistics.mean(v) * 1024.0 for k, v in agg_n.items() if v}
-    return by_fam, by_fam_n
+    # Per-(fam,N) fetch-size CLUSTERS. Two different-K weights can share an N (e.g.
+    # ffn_down_shexp K=512 and attn_output K=4096 both dispatch N=2048), so the
+    # (fam,N) mean blends their very different DRAM reads (1.1MB vs 8.9MB) -> a
+    # physically-impossible over-fetch (4.5x on the small weight). But each weight's
+    # own fetch is tightly clustered, so 1-D clustering the per-dispatch fetch values
+    # recovers the distinct K reads without needing a complete order-map. The consumer
+    # then picks the cluster whose center is nearest a weight's packed footprint.
+    by_fam_n_clusters = {}
+    for (fam, n), vals in agg_n.items():
+        vb = sorted(v * 1024.0 for v in vals)     # bytes
+        if not vb:
+            continue
+        # split where a gap exceeds max(64KB, 25% of the running center) -> tight modes
+        clusters = [[vb[0]]]
+        for x in vb[1:]:
+            c = clusters[-1]
+            center = c[len(c) // 2]
+            if x - c[-1] > max(65536.0, 0.25 * center):
+                clusters.append([x])
+            else:
+                c.append(x)
+        by_fam_n_clusters[(fam, n)] = [statistics.mean(c) for c in clusters]
+    return by_fam, by_fam_n, by_fam_n_clusters
 
 
 def load_fetch_bytes_mapped(path, expected_seq):
@@ -2148,8 +2170,8 @@ def build_payload(args):
     # estimate -- measured attributes bytes to the exact kernel that moved them
     # (so it also fixes the Q5_K shared-quant-type over-attribution the analytic
     # method had), and covers every family, not just mul_mat_vec.
-    fetch_bytes, fetch_bytes_n = (load_fetch_bytes(args.fetch_csv)
-                                  if args.fetch_csv else ({}, {}))
+    fetch_bytes, fetch_bytes_n, fetch_bytes_nk = (load_fetch_bytes(args.fetch_csv)
+                                                  if args.fetch_csv else ({}, {}, {}))
     loadwidth = load_loadwidth(args.loadwidth_json) if args.loadwidth_json else {}
     layer_graph = load_graph_json(args.graph_json) if args.graph_json else None
     att_by_fam = load_att_stats(args.att_dir) if args.att_dir else {}
@@ -2371,13 +2393,25 @@ def build_payload(args):
                 true_n = ent["N"]
                 k = ent["K"]
                 packed = ent["bytes"]
-                # Prefer per-weight order-mapped bytes (over-fetch-honest even for
-                # weights sharing an N); fall back to the (family, N) blend, then
-                # the family mean.
+                # Measured DRAM bytes, best source first:
+                #  1. per-weight order-mapped bytes (exact, when the order-map segmented);
+                #  2. NEAREST fetch-size CLUSTER for (fam, launched-N): two different-K
+                #     weights that share an N have distinct, tightly-clustered fetch sizes,
+                #     so pick the cluster whose center is closest to THIS weight's packed
+                #     footprint -- this separates e.g. ffn_down_shexp (K=512, ~1.1MB) from
+                #     attn_output (K=4096, ~8.9MB) that both launch N=2048, instead of the
+                #     (fam,N) mean that blended them into a bogus 4.5x over-fetch;
+                #  3. the (fam,N) blend; 4. the family mean.
                 mexact = ent["nm"] in fetch_by_name
-                measured = (fetch_by_name.get(ent["nm"])
-                            or fetch_bytes_n.get((fam, ncol))
-                            or fetch_bytes.get(fam, 0))
+                measured = fetch_by_name.get(ent["nm"])
+                mnearest = False
+                if not measured:
+                    clusters = fetch_bytes_nk.get((fam, ncol))
+                    if clusters and packed:
+                        measured = min(clusters, key=lambda c: abs(c - packed))
+                        mnearest = True
+                if not measured:
+                    measured = fetch_bytes_n.get((fam, ncol)) or fetch_bytes.get(fam, 0)
                 sl["map"] = {
                     "nm": ent["nm"], "role": ent["role"], "L": ent["L"],
                     "q": ent["q"], "K": k, "trueN": true_n, "launchN": ncol,
@@ -2390,7 +2424,7 @@ def build_payload(args):
                     "measured": round(measured) if measured else 0,
                     # True when `measured` is this weight's own order-mapped bytes
                     # (over-fetch-honest); False when it fell back to the (fam, N) blend.
-                    "mexact": mexact,
+                    "mexact": mexact or mnearest,
                     # Over-fetch: measured DRAM bytes / theoretical packed footprint.
                     "overfetch": (round(measured / packed, 2)
                                   if (measured and packed) else 0),
@@ -4139,7 +4173,8 @@ function renderFamilyMembers(){
   // then keeps eff BW as a secondary column; decode leads with eff BW.
   const compCols = IS_PREFILL
     ? `<th style="text-align:left">TOPS</th><th style="text-align:left">TOPS %</th>` : ``;
-  h+=`<table><thead><tr><th style="text-align:left">role</th>`+
+  h+=`<table><thead><tr><th style="text-align:left">#</th>`+
+     `<th style="text-align:left">role</th>`+
      `<th style="text-align:left">layer</th>`+
      `<th style="text-align:left">shape [K x N]</th><th style="text-align:left">packed</th>`+
      `<th style="text-align:left">kernel time</th>`+
@@ -4181,6 +4216,7 @@ function renderFamilyMembers(){
     if(key!==prevKey){ band^=1; prevKey=key; }
     h+=`<tr class="shrow" data-idx="${i}" title="frame this dispatch in the timeline"`+
        (band?` style="background:rgba(255,255,255,.04)"`:``)+`>`+
+       `<td class="r">${i+1}</td>`+
        `<td style="color:#ffd479">${m.role}</td>`+
        `<td>${m.L<0?'out':('L'+m.L)}</td>`+
        `<td>${m.K} x ${m.trueN} <span class="r">${m.q}</span></td>`+
@@ -4199,7 +4235,10 @@ function renderFamilyMembers(){
   h+=`</tbody></table>`+
      `<div class="sub" style="margin-top:6px">Every order-mapped dispatch of `+
      `<b>${fam}</b> in one complete decode token, one row per dispatch `+
-     `(no averaging), ordered so same shape [K x N] sit together. <b>packed</b> = theoretical `+
+     `(no averaging), ordered so same shape [K x N] sit together. <b>#</b> is the row `+
+     `number (1..${rows.length} = this family's ORDER-MAPPED dispatches this token; note `+
+     `this is &le; <b>cnt/tok</b> in the summary, which counts ALL ${fam} dispatches -- the `+
+     `unmapped ones aren't shown here). <b>packed</b> = theoretical `+
      `on-disk weight bytes (gate+up folded when fused); <b>kernel time</b> = this dispatch's `+
      `measured Start->End (raw; ~5% of gfx1151 dispatches carry a ~+24us interrupt-latency `+
      `timestamp artifact -- visible as a lone inflated row); <b>modes</b> = this shape's `+
