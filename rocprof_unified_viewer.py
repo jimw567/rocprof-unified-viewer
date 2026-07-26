@@ -511,6 +511,34 @@ def parse_clean_tps(path, kind="tg"):
     return best
 
 
+def parse_clean_model_name(path):
+    """Best-effort model name from collect.sh's clean_tps.txt (llama-bench JSON).
+    Prefers the gguf basename (minus .gguf) from `model_filename`; falls back to the
+    `model_type` label llama-bench prints (e.g. "qwen35moe 35B.A3B Q4_K - Medium").
+    Returns "" if unavailable. Lets the overlay title carry the model even when the
+    caller did not pass --gguf (collect.sh always emits clean_tps.txt)."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            stripped = fh.read().lstrip()
+    except OSError:
+        return ""
+    if stripped[:1] not in "[{":
+        return ""
+    try:
+        rows = json.loads(stripped)
+    except ValueError:
+        return ""
+    row = (rows[0] if isinstance(rows, list) and rows else
+           rows if isinstance(rows, dict) else None)
+    if not row:
+        return ""
+    fn = row.get("model_filename") or ""
+    if fn:
+        base = os.path.basename(fn)
+        return base[:-5] if base.endswith(".gguf") else base
+    return row.get("model_type") or ""
+
+
 def load_hw_diagram():
     """Base64 data-URI of docs/rdna35-details.png (the RDNA 3.5 WGP diagram) so the
     overlay can show it inline WITHOUT breaking the self-contained-single-file
@@ -1641,11 +1669,15 @@ _MATVEC_ROLE_ORDER = [
     # then the fused expert gate+up and the expert down projection dispatch. These
     # sit where the dense ffn_gate/up/down would in a non-MoE model.
     "ffn_gate_inp", "ffn_gate_exps", "ffn_up_exps", "ffn_down_exps",
+    # Shared expert (qwen3.6/qwen3next MoE): after the routed experts, a dense FFN
+    # runs every token -- fused gate+up (Q8_0) then down -- plus its own 1D sigmoid
+    # gate (ffn_gate_inp_shexp, excluded: 1D output, not a real matvec dispatch).
+    "ffn_gate_inp_shexp", "ffn_gate_shexp", "ffn_up_shexp", "ffn_down_shexp",
     "ffn_gate", "ffn_up", "ffn_down",
 ]
 # Roles whose weight is a router/gating projection dispatched as F32 mul_mat_vec_f
 # (not a quantized mul_mat_vec_q), so they are matvec-eligible regardless of quant.
-_ROUTER_ROLES = {"ffn_gate_inp"}
+_ROUTER_ROLES = {"ffn_gate_inp", "ffn_gate_inp_shexp"}
 # ne-dim quant/dense types dispatched as a matvec at decode (K-quants, legacy
 # quants, Q8_0 which carries the ssm alpha/beta scale projections, and MXFP4 which
 # carries gpt-oss MoE expert weights -> mul_mat_vec_q<(ggml_type)39>).
@@ -1682,7 +1714,7 @@ def build_expected_sequence(tensors, drop_ffn_up):
             # Fused SwiGLU: the single gate dispatch also streams the up weight, so
             # its up sibling is not a separate dispatch. This holds for the dense
             # ffn_up and the MoE ffn_up_exps alike.
-            if role in ("ffn_up", "ffn_up_exps") and drop_ffn_up:
+            if role in ("ffn_up", "ffn_up_exps", "ffn_up_shexp") and drop_ffn_up:
                 continue
             t = roles.get(role)
             if t is None or len(t["ne"]) < 2:
@@ -1695,8 +1727,10 @@ def build_expected_sequence(tensors, drop_ffn_up):
             # Fold the up weight's bytes into the fused gate dispatch (dense or MoE),
             # else the theoretical denominator is ~2x too small and the dispatch looks
             # like it over-fetches ~2x when it does not.
-            if role in ("ffn_gate", "ffn_gate_exps") and drop_ffn_up:
-                up = roles.get("ffn_up") or roles.get("ffn_up_exps")
+            if role in ("ffn_gate", "ffn_gate_exps", "ffn_gate_shexp") and drop_ffn_up:
+                up = {"ffn_gate": "ffn_up", "ffn_gate_exps": "ffn_up_exps",
+                      "ffn_gate_shexp": "ffn_up_shexp"}.get(role)
+                up = roles.get(up)
                 if up is not None and up["gt"] in _MATVEC_TYPES:
                     ent["bytes"] += up["bytes"]
                     ent["fused"] = "gate+up"
@@ -1710,6 +1744,47 @@ def build_expected_sequence(tensors, drop_ffn_up):
 
 
 # --- token segmentation -------------------------------------------------------
+
+def detect_boundaries_by_head(evs):
+    """Token boundaries from the OUTPUT-HEAD anchor instead of inter-dispatch gaps.
+    The vocab projection (lm_head) is a mul_mat_vec with the largest N in the graph
+    and fires exactly once per decode token, so successive heads bracket each token.
+    This is robust whether or not HIP graph replay is on -- unlike the gap detector,
+    which relies on the clean inter-token idle that a single hipGraphLaunch leaves and
+    breaks in EAGER mode (graphs disabled, e.g. MoE mul_mat_id above the mmvq batch
+    cap), where dispatches are packed with no distinguishing gap.
+
+    Returns the index of the FIRST dispatch AFTER each head (= each token's start), so
+    the returned list plays the same role as detect_boundaries() output. Empty if there
+    is no clear periodic head anchor (falls back to the gap detector at the call site)."""
+    mv = [(i, n) for i, (s, e, nm, n, _nb) in enumerate(evs)
+          if n and "mul_mat" in nm]
+    if len(mv) < 3:
+        return []
+    max_n = max(n for _, n in mv)
+    # The head must be a clear outlier (vocab >> any weight N); require it to dwarf the
+    # next-largest distinct N, else this isn't a reliable anchor (e.g. a prefill trace).
+    other = [n for _, n in mv if n < max_n]
+    if other and max_n < 2 * max(other):
+        return []
+    heads = [i for i, n in mv if n == max_n]
+    if len(heads) < 3:
+        return []
+    # Boundary = first dispatch after each head. The head ENDS a token, so the next
+    # dispatch STARTS the following token. Drop the trailing head (no token follows it).
+    bounds = [h + 1 for h in heads[:-1] if h + 1 < len(evs)]
+    # De-noise: keep only boundaries spaced ~ the dominant period apart (guards against
+    # a stray duplicate-N dispatch masquerading as a head).
+    if len(bounds) < 3:
+        return bounds
+    deltas = [bounds[i] - bounds[i - 1] for i in range(1, len(bounds))]
+    period = statistics.median(deltas) or 1
+    kept = [bounds[0]]
+    for b in bounds[1:]:
+        if b - kept[-1] >= period * 0.5:
+            kept.append(b)
+    return kept
+
 
 def detect_boundaries(evs, gap_thr_ns):
     """Indices i where a gap > gap_thr_ns precedes evs[i] (candidate token
@@ -1906,10 +1981,20 @@ def build_payload(args):
         view_i0 = 0
         view_i1 = 1
     else:
-        bounds = detect_boundaries(evs, args.gap_threshold_us * 1000)
+        # Prefer the output-head anchor (robust in both graph-replay and EAGER mode);
+        # fall back to the inter-dispatch gap detector when there is no clear periodic
+        # head (older traces / non-standard decode). The head anchor is what makes
+        # token segmentation work for MoE models that run eager (graphs disabled above
+        # the mmvq mul_mat_id batch cap), where the gap detector finds no clean cadence.
+        bounds = detect_boundaries_by_head(evs)
         if len(bounds) < args.skip_tokens + args.tokens + 2:
-            sys.exit(f"error: only {len(bounds)} token boundaries detected; "
-                     f"need > {args.skip_tokens + args.tokens}. Lower --skip-tokens "
+            gap_bounds = detect_boundaries(evs, args.gap_threshold_us * 1000)
+            if len(gap_bounds) > len(bounds):
+                bounds = gap_bounds
+        if len(bounds) < args.skip_tokens + args.tokens + 2:
+            sys.exit(f"error: only {len(bounds)} token boundaries detected "
+                     f"(head-anchor + gap fallback); need > "
+                     f"{args.skip_tokens + args.tokens}. Lower --skip-tokens "
                      f"or --gap-threshold-us.")
 
         # Bake a wider span (context on each side) so the stepper can pan.
@@ -1969,6 +2054,17 @@ def build_payload(args):
     clean_tps = (parse_clean_tps(args.clean_tps_file,
                                  "pp" if args.mode == "prefill" else "tg")
                  if args.clean_tps_file else None)
+
+    # Model name for the title/sub-header. Prefer the explicit --gguf basename (minus the
+    # .gguf suffix, to match the clean_tps-derived name); else recover it from
+    # clean_tps.txt (llama-bench records model_filename), so the model is always identified
+    # even without --gguf. collect.sh always emits clean_tps.txt.
+    model_name = ""
+    if args.gguf:
+        _base = os.path.basename(args.gguf)
+        model_name = _base[:-5] if _base.endswith(".gguf") else _base
+    if not model_name and args.clean_tps_file:
+        model_name = parse_clean_model_name(args.clean_tps_file)
 
     # Prefill is COMPUTE-bound: it processes a batch of B prompt tokens per matmul
     # (a GEMM), so the roofline denominator is peak TOPS, not peak DRAM BW. B is the
@@ -2157,6 +2253,25 @@ def build_payload(args):
                   "pct": round(100.0 * mv_mapped / mv_total, 1) if mv_total else 0,
                   "seq_len": len(expected_seq)}
                  if expected_seq else None)
+
+    # GPU-busy = wall time with >=1 kernel running (merged-interval UNION), NOT the
+    # sum of per-dispatch durations. Summing double-counts overlapping dispatches --
+    # in EAGER mode (graphs disabled, e.g. MoE mul_mat_id over the mmvq batch cap) the
+    # trace has back-to-back/overlapping kernels, so the sum can exceed the window span
+    # (>100% "busy"). The union is overlap-correct in both graph and eager mode.
+    busy_ns = 0
+    _iv = sorted(((sl["s"], sl["e"]) for sl in gpu_slices))
+    _cs = _ce = None
+    for _s, _e in _iv:
+        if _cs is None:
+            _cs, _ce = _s, _e
+        elif _s <= _ce:
+            _ce = max(_ce, _e)
+        else:
+            busy_ns += _ce - _cs
+            _cs, _ce = _s, _e
+    if _cs is not None:
+        busy_ns += _ce - _cs
 
     # Per-kernel steady-state stats: decode tokens are structurally identical, so
     # the Nth kernel of every token is the same dispatch. Aggregate each within-token
@@ -2477,7 +2592,7 @@ def build_payload(args):
 
     payload = {
         "title": title,
-        "model_name": os.path.basename(args.gguf) if args.gguf else "",
+        "model_name": model_name,
         "provenance": _provenance(),
         "mode": args.mode,
         "ttft_est_ms": ttft_est_ms,
@@ -2878,7 +2993,7 @@ const ACTIVE_MODE = pickMode();
 const D = IS_MULTI ? RAW.payloads[ACTIVE_MODE] : RAW;
 const cv = document.getElementById('cv');
 const ctx = cv.getContext('2d');
-const CPU_H = 70, GPU_H = 70, PAD_T = 8, GAP = 26, AXIS_H = 22;
+const CPU_H = 35, GPU_H = 35, PAD_T = 8, GAP = 26, AXIS_H = 22;
 const LAYER_H = D.has_layers ? 20 : 0;      // per-decode-layer swim lane
 const LGAP = D.has_layers ? 6 : 0;          // gap between GPU lane and layer lane
 const PHASE_H = D.has_phases ? 16 : 0;      // functional sub-block lane (finer)
@@ -2944,9 +3059,11 @@ if (IS_MULTI){
   sel.onchange=()=>{ location.hash='mode='+sel.value; location.reload(); };
 }
 document.getElementById('titletext').textContent =
+  (D.model_name ? D.model_name + '  --  ' : '') +
   D.title + (IS_PREFILL ? '  -- PREFILL' : '  -- DECODE');
+// Also set the browser tab/window title so a web-shared HTML self-identifies.
+document.title = (D.model_name ? D.model_name + ' -- ' : '') + 'rocprof unified viewer';
 document.getElementById('sub').textContent =
-  (D.model_name ? `${D.model_name} | ` : ``)+
   (IS_PREFILL ? `prefill: 1 forward pass` : `baked ${D.n_tokens_baked} tokens`)+
   ` | ${D.gpu.length} GPU slices | `+
   `${D.cpu.length} HIP calls | window GPU-busy ${fmtms(D.busy_ns)} / span `+
