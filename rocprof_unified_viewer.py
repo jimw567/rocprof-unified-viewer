@@ -2432,14 +2432,51 @@ def build_payload(args):
         if m and m.get("packed") and m.get("_dur"):
             _eb_durs[(sl["fam"], sl.get("_ncol"))].append(m["_dur"])
     _eb_med = {kk: sorted(v)[len(v) // 2] for kk, v in _eb_durs.items()}
+
+    # AUTHORITATIVE effbw source: the roofline dump (--graph-json). Each dump op carries
+    # EXACT (N,K,quant) + its own mul_mat kernel gpu_time -- no positional order-map, no
+    # trace N-ambiguity. When present, this is the trustworthy per-shape kernel time to
+    # roofline against (e.g. attn_gate 4096x2048 q8_0 -> 41us -> 215 GB/s, vs the trace
+    # order-map's bogus 15us/583 GB/s). Build {(N,K,quant): median mul_mat us} from the
+    # reconstructed graph nodes; the effbw loop below prefers it over the trace median.
+    _dump_us = {}
+    if layer_graph and layer_graph.get("nodes"):
+        _dump_durs = defaultdict(list)
+        for nd in layer_graph["nodes"]:
+            if "MUL_MAT" not in str(nd.get("op", "")):
+                continue
+            N, K = nd.get("N"), nd.get("K")
+            if not (N and K):
+                continue
+            # the op's mul_mat kernel time (skip the quantize-prep subkernel): prefer a
+            # subkernel whose family names a matvec/gemm, else the op's total us_in.
+            mm = [sk["us"] for sk in (nd.get("kernels") or [])
+                  if "mul_mat" in sk.get("fam", "") or "wvsplitk" in sk.get("fam", "")
+                  or "gemm" in sk.get("fam", "").lower()]
+            us = sum(mm) if mm else ((nd.get("us_in") or 0) / 1000.0)
+            if us > 0:
+                _dump_durs[(N, K, nd.get("quant", ""))].append(us)
+        _dump_us = {kk: sorted(v)[len(v) // 2] for kk, v in _dump_durs.items()}
+
+    def _quant_norm(q):
+        # trace/gguf quant label ("Q8_0") vs dump label ("q8_0") -> compare case-insensitively
+        return (q or "").lower()
+
     for sl in gpu_slices:
         m = sl.get("map")
         if not (m and m.get("packed") and m.get("_dur")):
             continue
-        # Only emit a robust effbw when the order-map's weight N actually MATCHES the
-        # launched N (nmatch). A mismatch means the packed byte count and this dispatch's
-        # duration belong to different ops -> any effbw would be meaningless; leave it
-        # unset (UI shows the raw single-dispatch value, flagged) rather than fabricate.
+        # Prefer the authoritative dump time (exact shape, no order-map) when available.
+        dump_med_us = _dump_us.get((m.get("trueN"), m.get("K"), _quant_norm(m.get("q"))))
+        if dump_med_us:
+            m["effbw"] = round(m["packed"] / (dump_med_us * 1000.0), 1)
+            m["effbw_pct"] = round(m["packed"] / (dump_med_us * 1000.0) / peak_bw * 100, 1) if peak_bw else 0
+            m["effbw_med_us"] = round(dump_med_us, 2)
+            m["effbw_src"] = "roofline-dump (exact shape)"
+            continue
+        # Fallback (no dump): trace-median keyed on the actual launched N, gated on nmatch.
+        # A weight-N vs launched-N mismatch means packed and duration belong to different
+        # ops -> meaningless; leave unset and flag rather than fabricate.
         if not m.get("nmatch"):
             m["effbw"] = 0
             m["effbw_pct"] = 0
@@ -2450,10 +2487,9 @@ def build_payload(args):
             continue
         m["effbw"] = round(m["packed"] / med, 1)
         m["effbw_pct"] = round(m["packed"] / med / peak_bw * 100, 1) if peak_bw else 0
-        # how many same-launch dispatches the median is over, so the UI can show
-        # confidence (n=1 median == the raw value, still artifact-prone).
         m["effbw_n"] = len(_eb_durs[(sl["fam"], sl.get("_ncol"))])
         m["effbw_med_us"] = round(med / 1000.0, 2)
+        m["effbw_src"] = "trace order-map (median dur)"
 
     map_stats = ({"total": mv_total, "mapped": mv_mapped,
                   "pct": round(100.0 * mv_mapped / mv_total, 1) if mv_total else 0,
@@ -4238,10 +4274,10 @@ function renderSelectedKernel(){
       // (not this one dispatch), so the gfx1151 timestamp smear + N-only kernel labelling
       // can't produce an impossible >roofline single-dispatch value. No roofline clamp:
       // if the median genuinely exceeds peak it is shown (a real signal). n=1 == raw.
-      const nn=m.effbw_n||1, robust=(nn>1?`median of ${nn} disp`:`n=1, raw -- artifact-prone`);
+      const nn=m.effbw_n||1, robust=(m.effbw_src||(nn>1?`median of ${nn} disp`:`n=1, raw -- artifact-prone`));
       h+=`<tr><td>effective BW</td><td style="color:${lowBW?'#ff6b6b':'#8fe388'}">${m.effbw} GB/s `+
        `(${m.effbw_pct}% of ${D.peak_bw_gbs})${lowBW?' <span class="r">(BW-bound, <80% peak)</span>':''} `+
-       `<span class="r">(useful: packed / ${m.effbw_med_us||'?'}&micro;s ${robust})</span></td></tr>`+
+       `<span class="r">(useful: packed / ${m.effbw_med_us||'?'}&micro;s; ${robust})</span></td></tr>`+
        `<tr><td>effbw (raw disp)</td><td class="r">${m.effbw_raw} GB/s <span class="r">(packed / THIS dispatch time; noisy -- gfx1151 smear)</span></td></tr>`; }
     if(m.measured){ const src=m.mexact?'per-weight (order-mapped)':'family+N avg';
       h+=`<tr><td>FETCH_SIZE</td><td>${KB(m.measured)} <span class="r">(measured DRAM read, ${src})</span></td></tr>`+
