@@ -239,12 +239,22 @@ def load_kernel_slices(path, mmq_y=64):
                 # in WORK-ITEMS, so Grid_Size_X/Workgroup_Size_X = nrows_x exactly. N is that.
                 if "wvsplitk_q8_0_longk" in kname:
                     pass  # n = gx//wg already equals nrows_x (one workgroup per row)
-                # The other wvsplitk kernels use a 2D block (warp_size x WvPrGrp=16) and
-                # grid.x = ceil(nrows/16) workgroups, so Grid_Size_X/Workgroup_Size_X yields
-                # ceil(nrows/16), not nrows. Recover true output rows (exact for the
-                # 16-aligned decode shapes) so it still order-maps onto its weight.
+                # The other wvsplitk kernels use a 2D block (warp_size x WvPrGrp) and
+                # grid.x = ceil(nrows / (YTILE*WvPrGrp)) workgroups, so
+                # Grid_Size_X/Workgroup_Size_X = grid.x, and the true output-row count is
+                # grid.x * WvPrGrp (YTILE=1 for the decode kernels). WvPrGrp is the block's
+                # Y dimension == Workgroup_Size_Y, so read it PER DISPATCH rather than
+                # hardcoding it: the Q4_K kernel uses WvPrGrp=16 but the Q8_0 kernel uses
+                # WvPrGrp=8, and a fixed *16 tagged every Q8_0 dispatch's N at 2x its true
+                # value (e.g. N=4096 attn_gate read as 8192), cascading a wrong weight ->
+                # dispatch order-map, effbw, and over-fetch. Grid_Size_X is in WORK-ITEMS
+                # so grid.x = gx/warp_size(=Workgroup_Size_X); multiply by WvPrGrp.
                 elif "wvsplitk" in kname:
-                    n *= 16
+                    try:
+                        wvpg = int(r["Workgroup_Size_Y"])
+                    except (KeyError, ValueError, TypeError):
+                        wvpg = 16   # legacy fallback (old Q4_K-only assumption)
+                    n *= wvpg if wvpg else 16
                 # The mul_mat_q PREFILL GEMM tiles the N output rows in blocks of
                 # mmq_y along grid.x (nty = ceil(nrows_x/mmq_y)); recover launched N
                 # as (grid.x/wg.x)*mmq_y so it order-maps onto its GGUF weight just
@@ -395,7 +405,13 @@ def load_fetch_bytes(path):
                 ws = int(r["Workgroup_Size"])
                 n = gs // ws if ws else 0
                 if "wvsplitk" in r["Kernel_Name"]:  # 2D block: recover true rows
-                    n *= 16
+                    # true N = grid.x * WvPrGrp. gs//ws = grid.x; WvPrGrp is the block Y
+                    # dim, not present as a column here, but the total block size ws =
+                    # warp_size(32) * WvPrGrp, so WvPrGrp = ws/32. A hardcoded *16 assumed
+                    # the Q4_K kernel's WvPrGrp=16 and mis-tagged Q8_0 (WvPrGrp=8) N at 2x.
+                    # (Must match the N-recovery in load_kernel_slices.)
+                    wvpg = (ws // 32) if ws else 16
+                    n *= wvpg if wvpg else 16
             except (KeyError, ValueError, TypeError):
                 n = 0
             if n:
@@ -435,7 +451,13 @@ def load_fetch_bytes_mapped(path, expected_seq):
                 ws = int(r["Workgroup_Size"])
                 n = gs // ws if ws else 0
                 if "wvsplitk" in r["Kernel_Name"]:  # 2D block: recover true rows
-                    n *= 16
+                    # true N = grid.x * WvPrGrp. gs//ws = grid.x; WvPrGrp is the block Y
+                    # dim, not present as a column here, but the total block size ws =
+                    # warp_size(32) * WvPrGrp, so WvPrGrp = ws/32. A hardcoded *16 assumed
+                    # the Q4_K kernel's WvPrGrp=16 and mis-tagged Q8_0 (WvPrGrp=8) N at 2x.
+                    # (Must match the N-recovery in load_kernel_slices.)
+                    wvpg = (ws // 32) if ws else 16
+                    n *= wvpg if wvpg else 16
                 v = float(r["Counter_Value"]) * 1024.0
             except (KeyError, ValueError, TypeError):
                 continue
