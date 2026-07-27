@@ -177,6 +177,27 @@ def peak_tops_for(arch, override=None):
     return PEAK_TOPS_BY_ARCH.get(arch)
 
 
+# Per-MODEL-architecture token-boundary segmentation profile. NOTE: keyed by the GGUF
+# `general.architecture` (qwen35moe, gpt-oss, ...), NOT the GPU arch (gfx1151) used by the
+# dicts above -- decode cadence is a property of the model's graph, not the board. Model
+# architectures move far slower than this viewer, so hardcoding per-arch here is fine and
+# is exactly what keeps a tweak for one arch from perturbing another.
+#   method: "head" = output-head anchor only (robust for eager MoE, where the gap
+#                    detector finds no clean cadence); "gap" = inter-dispatch gap detector
+#                    at gap_us; "auto" = head first, gap fallback (the historical default).
+#   gap_us: threshold (us) for the gap detector; None = use --gap-threshold-us / its default.
+BOUNDARY_PROFILES = {
+    "qwen35moe": {"method": "head", "gap_us": None},   # hybrid GDN/MoE, runs eager
+    "qwen3moe":  {"method": "head", "gap_us": None},    # MoE, runs eager
+    "gpt-oss":   {"method": "gap",  "gap_us": 10.0},    # head-anchor under-segments; needs a low gap
+    "_default":  {"method": "auto", "gap_us": None},    # unknown/dense: head then gap fallback
+}
+
+
+def boundary_profile_for(arch):
+    return BOUNDARY_PROFILES.get(arch or "", BOUNDARY_PROFILES["_default"])
+
+
 def family_of(kernel_name):
     """Normalize a mangled/templated kernel name to a family (the same
     aggregation used when collecting PMC, so PMC families join onto trace slices).
@@ -218,11 +239,14 @@ def dominant_stall(counters):
 # --- CSV loaders (stdlib only; duplicated on purpose so this file is standalone) --
 
 def load_kernel_slices(path, mmq_y=64):
-    """Return {stream_id: [(start_ns, end_ns, kernel_name, N), ...] sorted by
-    start}. N = Grid_Size_X / Workgroup_Size_X is the launched output-row count
+    """Return {stream_id: [(start_ns, end_ns, kernel_name, N, nblk, gy), ...] sorted
+    by start}. N = Grid_Size_X / Workgroup_Size_X is the launched output-row count
     (one warp/workgroup-row per output row for mul_mat_vec), the join key onto the
     GGUF weight's true N (ne[1]); 0 when the grid dims are absent/degenerate.
-    mmq_y is the MMQ prefill row-tile height used to recover N for mul_mat_q."""
+    mmq_y is the MMQ prefill row-tile height used to recover N for mul_mat_q.
+    gy = grid.y block count: for a MoE mul_mat_id dispatch this is n_experts_used
+    (the experts run in one grouped launch over grid.y), so gy>1 flags MoE and lets
+    the order-map expect ONE grouped expert dispatch instead of desyncing on it."""
     by_stream = defaultdict(list)
     with open(path) as fh:
         for r in csv.DictReader(fh):
@@ -231,12 +255,32 @@ def load_kernel_slices(path, mmq_y=64):
                 gx = int(r["Grid_Size_X"])
                 wg = int(r["Workgroup_Size_X"])
                 n = gx // wg if wg else 0
-                # The wvsplitk decode kernel uses a 2D block (warp_size x WvPrGrp=16)
-                # and grid.x = ceil(nrows/16), so Grid_Size_X/Workgroup_Size_X yields
-                # ceil(nrows/16), not nrows. Recover true output rows (exact for the
-                # 16-aligned decode shapes) so it still order-maps onto its weight.
-                if "wvsplitk" in kname:
-                    n *= 16
+                # The wvsplitk_q8_0_longk kernel launches grid.x = nrows_x WORKGROUPS (one
+                # output row each) with block = (warp_size, NW); rocprofv3 reports Grid_Size_X
+                # in WORK-ITEMS, so Grid_Size_X/Workgroup_Size_X = nrows_x exactly. N is that.
+                if "wvsplitk_q8_0_longk" in kname:
+                    pass  # n = gx//wg already equals nrows_x (one workgroup per row)
+                # The other wvsplitk kernels use a 2D block (warp_size x WvPrGrp) and
+                # grid.x = ceil(nrows / (YTILE*WvPrGrp)) workgroups, so
+                # Grid_Size_X/Workgroup_Size_X = grid.x, and the true output-row count is
+                # grid.x * WvPrGrp (YTILE=1 for the decode kernels). WvPrGrp is the block's
+                # Y dimension == Workgroup_Size_Y, so read it PER DISPATCH rather than
+                # hardcoding it: the Q4_K kernel uses WvPrGrp=16 but the Q8_0 kernel uses
+                # WvPrGrp=8, and a fixed *16 tagged every Q8_0 dispatch's N at 2x its true
+                # value (e.g. N=4096 attn_gate read as 8192), cascading a wrong weight ->
+                # dispatch order-map, effbw, and over-fetch. Grid_Size_X is in WORK-ITEMS
+                # so grid.x = gx/warp_size(=Workgroup_Size_X); multiply by WvPrGrp.
+                elif "wvsplitk" in kname:
+                    try:
+                        wvpg = int(r["Workgroup_Size_Y"])
+                    except (KeyError, ValueError, TypeError):
+                        wvpg = 16   # legacy fallback (old Q4_K-only assumption)
+                    n *= wvpg if wvpg else 16
+                    # k512_fast uses YTILE=2 (2 output rows per wave), so grid.x =
+                    # ceil(N/(YTILE*WvPrGrp)); the *WvPrGrp above recovers only N/YTILE.
+                    # No YTILE column in the trace -> key off the kernel name.
+                    if "k512_fast" in kname:
+                        n *= 2
                 # The mul_mat_q PREFILL GEMM tiles the N output rows in blocks of
                 # mmq_y along grid.x (nty = ceil(nrows_x/mmq_y)); recover launched N
                 # as (grid.x/wg.x)*mmq_y so it order-maps onto its GGUF weight just
@@ -246,6 +290,13 @@ def load_kernel_slices(path, mmq_y=64):
                     n *= mmq_y
             except (KeyError, ValueError, TypeError):
                 n = 0
+            # grid.y block count. For mul_mat_id the experts (or channels) tile along
+            # grid.y, so gy = n_experts_used (e.g. 8); dense matvecs have gy = 1.
+            try:
+                gyd = int(r["Grid_Size_Y"]); wgy = int(r["Workgroup_Size_Y"])
+                gy = (gyd // wgy) if wgy else 1
+            except (KeyError, ValueError, TypeError):
+                gy = 1
             # Per-dispatch block (workgroup) count = product over grid dims of
             # (Grid_Size_d / Workgroup_Size_d). Grid_Size_* is in work-items, so the
             # per-dim ratio is that dim's block count. Unlike N above this is NOT
@@ -260,7 +311,7 @@ def load_kernel_slices(path, mmq_y=64):
                 nblk = 0
             by_stream[r["Stream_Id"]].append(
                 (int(r["Start_Timestamp"]), int(r["End_Timestamp"]),
-                 kname, n, nblk))
+                 kname, n, nblk, gy))
     for evs in by_stream.values():
         evs.sort()
     return by_stream
@@ -380,14 +431,44 @@ def load_fetch_bytes(path):
                 ws = int(r["Workgroup_Size"])
                 n = gs // ws if ws else 0
                 if "wvsplitk" in r["Kernel_Name"]:  # 2D block: recover true rows
-                    n *= 16
+                    # true N = grid.x * WvPrGrp. gs//ws = grid.x; WvPrGrp is the block Y
+                    # dim, not present as a column here, but the total block size ws =
+                    # warp_size(32) * WvPrGrp, so WvPrGrp = ws/32. A hardcoded *16 assumed
+                    # the Q4_K kernel's WvPrGrp=16 and mis-tagged Q8_0 (WvPrGrp=8) N at 2x.
+                    # (Must match the N-recovery in load_kernel_slices.)
+                    wvpg = (ws // 32) if ws else 16
+                    n *= wvpg if wvpg else 16
+                    if "k512_fast" in r["Kernel_Name"]:   # YTILE=2 (see load_kernel_slices)
+                        n *= 2
             except (KeyError, ValueError, TypeError):
                 n = 0
             if n:
                 agg_n[(fam, n)].append(v)
     by_fam = {fam: statistics.mean(v) * 1024.0 for fam, v in agg.items() if v}
     by_fam_n = {k: statistics.mean(v) * 1024.0 for k, v in agg_n.items() if v}
-    return by_fam, by_fam_n
+    # Per-(fam,N) fetch-size CLUSTERS. Two different-K weights can share an N (e.g.
+    # ffn_down_shexp K=512 and attn_output K=4096 both dispatch N=2048), so the
+    # (fam,N) mean blends their very different DRAM reads (1.1MB vs 8.9MB) -> a
+    # physically-impossible over-fetch (4.5x on the small weight). But each weight's
+    # own fetch is tightly clustered, so 1-D clustering the per-dispatch fetch values
+    # recovers the distinct K reads without needing a complete order-map. The consumer
+    # then picks the cluster whose center is nearest a weight's packed footprint.
+    by_fam_n_clusters = {}
+    for (fam, n), vals in agg_n.items():
+        vb = sorted(v * 1024.0 for v in vals)     # bytes
+        if not vb:
+            continue
+        # split where a gap exceeds max(64KB, 25% of the running center) -> tight modes
+        clusters = [[vb[0]]]
+        for x in vb[1:]:
+            c = clusters[-1]
+            center = c[len(c) // 2]
+            if x - c[-1] > max(65536.0, 0.25 * center):
+                clusters.append([x])
+            else:
+                c.append(x)
+        by_fam_n_clusters[(fam, n)] = [statistics.mean(c) for c in clusters]
+    return by_fam, by_fam_n, by_fam_n_clusters
 
 
 def load_fetch_bytes_mapped(path, expected_seq):
@@ -420,7 +501,15 @@ def load_fetch_bytes_mapped(path, expected_seq):
                 ws = int(r["Workgroup_Size"])
                 n = gs // ws if ws else 0
                 if "wvsplitk" in r["Kernel_Name"]:  # 2D block: recover true rows
-                    n *= 16
+                    # true N = grid.x * WvPrGrp. gs//ws = grid.x; WvPrGrp is the block Y
+                    # dim, not present as a column here, but the total block size ws =
+                    # warp_size(32) * WvPrGrp, so WvPrGrp = ws/32. A hardcoded *16 assumed
+                    # the Q4_K kernel's WvPrGrp=16 and mis-tagged Q8_0 (WvPrGrp=8) N at 2x.
+                    # (Must match the N-recovery in load_kernel_slices.)
+                    wvpg = (ws // 32) if ws else 16
+                    n *= wvpg if wvpg else 16
+                    if "k512_fast" in r["Kernel_Name"]:   # YTILE=2 (see load_kernel_slices)
+                        n *= 2
                 v = float(r["Counter_Value"]) * 1024.0
             except (KeyError, ValueError, TypeError):
                 continue
@@ -509,6 +598,34 @@ def parse_clean_tps(path, kind="tg"):
             if m2:
                 best = {"test": test, "tps": float(m2.group(1)), "sd": None}
     return best
+
+
+def parse_clean_model_name(path):
+    """Best-effort model name from collect.sh's clean_tps.txt (llama-bench JSON).
+    Prefers the gguf basename (minus .gguf) from `model_filename`; falls back to the
+    `model_type` label llama-bench prints (e.g. "qwen35moe 35B.A3B Q4_K - Medium").
+    Returns "" if unavailable. Lets the overlay title carry the model even when the
+    caller did not pass --gguf (collect.sh always emits clean_tps.txt)."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            stripped = fh.read().lstrip()
+    except OSError:
+        return ""
+    if stripped[:1] not in "[{":
+        return ""
+    try:
+        rows = json.loads(stripped)
+    except ValueError:
+        return ""
+    row = (rows[0] if isinstance(rows, list) and rows else
+           rows if isinstance(rows, dict) else None)
+    if not row:
+        return ""
+    fn = row.get("model_filename") or ""
+    if fn:
+        base = os.path.basename(fn)
+        return base[:-5] if base.endswith(".gguf") else base
+    return row.get("model_type") or ""
 
 
 def load_hw_diagram():
@@ -652,40 +769,61 @@ def load_checked_in_topology(key):
 
 
 def expand_topology_to_layers(skel, n_layer):
-    """Expand a one-layer structural skeleton into a per-layer node list the frontend
-    consumes. The skeleton's nodes carry NORMALIZED names (Qcur, norm, ffn_moe_down) and
-    string `src` referencing sibling normalized names. We instantiate the block for each
-    of the n_layer layers -- suffixing names with `-<L>`, resolving intra-block edges to
-    node indices, and threading the residual stream across layers (a node reading a name
-    not produced within its own layer links to the most recent prior producer, so the
-    inter-layer residual connects). Returns {step, nodes:[{i,name,op,L,src:[idx],...}],
-    by_layer, edges_inferred:False}."""
+    """Expand a one-block skeleton into a per-layer node list the frontend consumes. The
+    skeleton's `src` are INDEX-based (producing node index within the block, from the dump's
+    storage-id DAG), so instantiating a layer is a pure index OFFSET -- copy the block, add
+    L*B to each intra-block edge. No name resolution (the old name-based path split disjoint
+    subgraphs when a cb-name repeated). The inter-layer residual is threaded by wiring each
+    layer's entry (a block root that reads nothing but should consume the running stream) to
+    the previous layer's exit (the block's terminal). Returns {step, nodes:[{i,name,op,L,
+    src:[idx],...}], by_layer, edges_inferred:False}."""
     sk = skel.get("nodes", [])
+    B = len(sk)
+    if B == 0:
+        return {"step": "topology (checked-in)", "n_nodes": 0, "nodes": [],
+                "by_layer": {}, "edges_inferred": False, "provenance": ""}
+    # Block entry = the first root (no in-block src) that is a norm/residual consumer -- the
+    # node that in a full trace reads the previous block's output. Block exit = the last node
+    # feeding it (the residual sink). We thread entry[L] <- exit[L-1] to connect layers.
+    roots = [i for i, nd in enumerate(sk) if not nd.get("src")]
+    entry = next((i for i in roots if "norm" in sk[i].get("name", "").lower()),
+                 roots[0] if roots else 0)
+    # exit = the highest-index node that is NOT a cache/state write (those are KV sinks, not
+    # the residual). Falls back to the last node.
+    exit_ = B - 1
+    for i in range(B - 1, -1, -1):
+        nm = sk[i].get("name", "").lower()
+        if "cache" not in nm and "state" not in nm and "result" not in nm:
+            exit_ = i
+            break
     nodes = []
-    last_by_name = {}          # normalized name -> most recent global node index
     for L in range(max(n_layer, 1)):
-        local = {}             # normalized name -> node index within THIS layer
-        for nd in sk:
-            i = len(nodes)
-            nm = nd.get("name", "?")
-            srcs = []
-            for s in nd.get("src", []):
-                # prefer a producer within this layer; else the running (prior-layer) one
-                w = local.get(s, last_by_name.get(s))
-                if w is not None and w != i:
-                    srcs.append(w)
-            nodes.append({"i": i, "name": "%s-%d" % (nm, L), "op": nd.get("op", "?"),
-                          "L": L, "ne": [], "type": "",
+        base = L * B
+        for j, nd in enumerate(sk):
+            srcs = [base + s for s in nd.get("src", []) if 0 <= s < B and s != j]
+            # residual thread: this layer's entry reads the previous layer's exit
+            if j == entry and L > 0:
+                srcs.append((L - 1) * B + exit_)
+            nodes.append({"i": base + j, "name": "%s-%d" % (nd.get("name", "?"), L),
+                          "op": nd.get("op", "?"), "L": L, "ne": [], "type": "",
+                          # fam/quant/role baked into the skeleton (stable per arch): role is
+                          # the join key to this run's order-mapped dispatch -> live per-size
+                          # KxN + actual kernel without a view-time dump.
+                          "fam": nd.get("fam", ""), "quant": nd.get("quant", ""),
+                          # role = best-effort single role; roles = all roles a shared cb-name
+                          # node can be (e.g. "node" -> attn_qkv/ssm_alpha/ssm_beta); the
+                          # frontend picks whichever has a live dispatch in this layer.
+                          "role": nd.get("role", ""), "roles": nd.get("roles", []),
+                          # folded sub-kernels (quantize_q8_1 prep) -> the node's +Nk badge.
+                          "kernels": nd.get("kernels", []),
                           "us_in": None, "src": list(dict.fromkeys(srcs)), "chain": False})
-            local[nm] = i
-            last_by_name[nm] = i
     by_layer = defaultdict(list)
     for nd in nodes:
         by_layer[nd["L"]].append(nd["i"])
     return {"step": "topology (checked-in)", "n_nodes": len(nodes), "nodes": nodes,
             "by_layer": dict(by_layer), "edges_inferred": False,
             "provenance": "FAITHFUL topology from checked-in architecture skeleton "
-                          "(ggml-roofline storage-id edges, arch-keyed); live timings "
+                          "(ggml-roofline storage-id INDEX edges, arch-keyed); live timings "
                           "not attached in this view."}
 
 
@@ -728,14 +866,48 @@ def _reconstruct_from_roofline(rows):
     This is architecture-agnostic: no per-model topology template is used, so it covers
     every model (dense, MoE, GDN/SSM, VLM) identically. Returns the standard node list
     (i, name, op, L, src=[node indices], us_in, ...) the frontend expects."""
-    rows = [r for r in rows if r.get("in_storage_ids") is not None
-            or r.get("out_storage_id") is not None]
-    rows = sorted(rows, key=lambda r: r.get("invocation", 0))
+    # Keep rows that carry storage-id edges under EITHER schema (aspirational
+    # in/out_storage_id, or the emitter's real src_/dst_storage_id).
+    rows = [r for r in rows
+            if r.get("in_storage_ids") is not None or r.get("out_storage_id") is not None
+            or r.get("src_storage_ids") is not None or r.get("dst_storage_id") is not None]
+    # Preserve execution order. The emitter writes rows in launch order and omits an
+    # explicit "invocation" index, so a sort by a missing key would collapse to a no-op
+    # anyway; only sort when the field is actually present (stable-sort keeps order else).
+    if any("invocation" in r for r in rows):
+        rows = sorted(rows, key=lambda r: r.get("invocation", 0))
     rows = _first_token_rows(rows)
     nodes = []
     writer = {}                 # storage_id -> node index that last wrote it
+    # Layer inference: the emitter's geometry-dedup schema (dst_storage_id + shape, NO
+    # per-op name -- see ggml-cuda-roofline.cpp, ops collapsed by geometry_id) carries no
+    # blk.<N> tag, so _layer_of_name can't recover L. Rows are in execution order and each
+    # decode layer repeats the same op sequence, so we assign L by counting how many times
+    # an identical (op,N,K,quant) signature has been seen so far -- the Nth occurrence is
+    # layer N. This gives every matvec its true layer without needing names.
+    _sig_seen = {}
     for idx, r in enumerate(rows):
-        name = r.get("name", "") or ("#%d" % idx)
+        # Accept BOTH schemas: the aspirational name-based one (in_storage_ids/out_storage_id/
+        # name) AND the emitter's real geometry schema (src_storage_ids/dst_storage_id, no
+        # name -> synthesize a shape-based identity). Real names win when present.
+        in_sids = r.get("in_storage_ids")
+        if in_sids is None:
+            in_sids = r.get("src_storage_ids") or []
+        out_sid = r.get("out_storage_id")
+        if out_sid is None:
+            out_sid = r.get("dst_storage_id")
+        name = r.get("name", "")
+        if not name:
+            # no tensor name in the dump: synthesize op@NxK[quant] and layer-tag it below so
+            # the matcher and layer swim-lane still have a stable, shape-unique identity.
+            _op = r.get("ggml_op", "op"); _N = r.get("N"); _K = r.get("K")
+            _q = r.get("quant", "")
+            if _N and _K:
+                sig = "%s.%dx%d.%s" % (_op, _N, _K, _q)
+            else:
+                sig = "%s" % _op
+            lyr = _sig_seen.get(sig, 0); _sig_seen[sig] = lyr + 1
+            name = "blk.%d.%s" % (lyr, sig)
         L = _layer_of_name(name)
         kernels = r.get("kernels", [])
         us = sum(k.get("gpu_time_us", 0.0) for k in kernels) or None
@@ -760,15 +932,24 @@ def _reconstruct_from_roofline(rows):
         subk = [{"fam": family_of(k.get("name", "")),
                  "us": round(k.get("gpu_time_us", 0.0), 2)} for k in kernels]
         srcs = []
-        for sid in (r.get("in_storage_ids") or []):
+        for sid in in_sids:
             w = writer.get(sid)
             if w is not None and w != idx:
                 srcs.append(w)
         nodes.append({"i": idx, "name": name, "op": op, "label": label,
-                      "fam": fam, "kernels": subk, "L": L, "ne": [], "type": "",
+                      "fam": fam, "kernels": subk, "L": L,
+                      # carry the emitter's exact shape so the weight->dispatch matcher can
+                      # disambiguate same-N siblings by (N,K,quant) instead of N alone.
+                      "ne": [r.get("K"), r.get("N")] if r.get("N") else [],
+                      "N": r.get("N"), "K": r.get("K"), "quant": r.get("quant", ""),
+                      "n_experts": r.get("n_experts", 0),
+                      # experts_used = experts ROUTED this launch (top_k). A grouped MoE
+                      # mul_mat_id reads experts_used experts in ONE dispatch, so its eff BW
+                      # numerator is per_expert_bytes * experts_used, not one expert.
+                      "experts_used": r.get("experts_used", 0),
+                      "top_k": r.get("top_k", 0), "type": "",
                       "us_in": (us * 1000.0) if us is not None else None,  # us -> ns
                       "src": list(dict.fromkeys(srcs)), "chain": False})
-        out_sid = r.get("out_storage_id")
         if out_sid is not None:
             writer[out_sid] = idx        # last writer wins (also handles in-place aliasing)
     return nodes
@@ -796,8 +977,13 @@ def load_graph_json(path):
     # A roofline artifact keys its per-op list under "ops" (or reuses "nodes"); detect
     # the topology schema by whether any row has storage-id edges.
     rows = g.get("rows") or g.get("ops") or g.get("invocations") or g.get("nodes") or []
+    # Detect the roofline/storage-id schema. Accept the aspirational field names
+    # (in_storage_ids/out_storage_id) AND the emitter's actual geometry-dedup names
+    # (src_storage_ids/dst_storage_id -- see ggml-cuda-roofline.cpp). Either means we
+    # have exact per-op edges -> the FAITHFUL reconstruction path, not inferred edges.
     is_roofline = any(isinstance(r, dict) and
-                      ("in_storage_ids" in r or "out_storage_id" in r) for r in rows)
+                      ("in_storage_ids" in r or "out_storage_id" in r or
+                       "src_storage_ids" in r or "dst_storage_id" in r) for r in rows)
     if is_roofline:
         nodes = _reconstruct_from_roofline(rows)
         edges_inferred = False
@@ -1641,22 +1827,141 @@ _MATVEC_ROLE_ORDER = [
     # then the fused expert gate+up and the expert down projection dispatch. These
     # sit where the dense ffn_gate/up/down would in a non-MoE model.
     "ffn_gate_inp", "ffn_gate_exps", "ffn_up_exps", "ffn_down_exps",
+    # Shared expert (qwen3.6/qwen3next MoE): after the routed experts, a dense FFN
+    # runs every token -- fused gate+up (Q8_0) then down -- plus its own 1D sigmoid
+    # gate (ffn_gate_inp_shexp, excluded: 1D output, not a real matvec dispatch).
+    "ffn_gate_inp_shexp", "ffn_gate_shexp", "ffn_up_shexp", "ffn_down_shexp",
     "ffn_gate", "ffn_up", "ffn_down",
 ]
 # Roles whose weight is a router/gating projection dispatched as F32 mul_mat_vec_f
 # (not a quantized mul_mat_vec_q), so they are matvec-eligible regardless of quant.
-_ROUTER_ROLES = {"ffn_gate_inp"}
+_ROUTER_ROLES = {"ffn_gate_inp", "ffn_gate_inp_shexp"}
 # ne-dim quant/dense types dispatched as a matvec at decode (K-quants, legacy
 # quants, Q8_0 which carries the ssm alpha/beta scale projections, and MXFP4 which
 # carries gpt-oss MoE expert weights -> mul_mat_vec_q<(ggml_type)39>).
 _MATVEC_TYPES = {2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 39}
 
 
+# MoE expert roles: their weight is 3D (one matrix per expert) and runs as a single
+# grouped GGML_OP_MUL_MAT_ID dispatch over grid.y = n_experts_used, NOT one matvec per
+# expert. The order-map must expect ONE dispatch for these (flagged is_moe) and match it
+# against a trace slice with gy>1, else the positional lockstep desyncs on every MoE layer.
+_MOE_EXPERT_ROLES = {"ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"}
+
+
 def _seq_entry(t, layer, role):
     ne = t["ne"]
+    is_moe = role in _MOE_EXPERT_ROLES and len(ne) >= 3
+    # bytes for effbw: the packed footprint the DISPATCH streams. For a dense weight
+    # that is the whole tensor (t["bytes"]). For a 3D MoE expert weight t["bytes"] is
+    # the FULL ne[0]*ne[1]*n_experts stack (all 256 experts), but a decode dispatch
+    # reads only the routed experts -- using the full stack inflated effbw ~165x
+    # (e.g. 184MB/33us = 5567 GB/s, 24x roofline, and overfetch < 1.0 which is
+    # physically impossible). Use the PER-EXPERT 2D slice (ne[0]*ne[1]) as the packed
+    # footprint so effbw = one-expert-bytes / dispatch-time is a sane per-expert
+    # roofline number. (The grouped dispatch runs gy = active-experts of these in one
+    # launch; per-expert BW is the honest useful-work metric and matches FETCH_SIZE
+    # once multiplied by the active-expert count.)
+    if is_moe:
+        pbytes = _gguf_packed_bytes([ne[0], ne[1]], t["gt"])
+    else:
+        pbytes = t["bytes"]
     return {"nm": t["name"], "L": layer, "role": role,
-            "N": ne[1], "K": ne[0], "gt": t["gt"], "bytes": t["bytes"],
-            "q": _GGML_TYPES.get(t["gt"], "type%d" % t["gt"])}
+            "N": ne[1], "K": ne[0], "gt": t["gt"], "bytes": pbytes,
+            "q": _GGML_TYPES.get(t["gt"], "type%d" % t["gt"]),
+            # is_moe: a 3D expert weight -> grouped mul_mat_id dispatch (gy = experts).
+            "is_moe": is_moe}
+
+
+def _kernel_quant_type(kname):
+    """The ggml_type the KERNEL was templated on, from its mangled name
+    (mul_mat_vec_q<(ggml_type)12,...> -> 12 -> "Q4_K"), or the specialized-kernel
+    quant (mul_mat_vec_q_wvsplitk_q8_0 -> "Q8_0"). None if the name carries no quant
+    (mul_mat_vec_f = float, generic ops). Used to reject an order-map that would attach
+    a weight whose quant contradicts the kernel that actually ran (Level 1 guard)."""
+    m = re.search(r"\(ggml_type\)(\d+)", kname)
+    if m:
+        return _GGML_TYPES.get(int(m.group(1)), "type%d" % int(m.group(1)))
+    m = re.search(r"wvsplitk_(q\d+_[0k]|q\d+_k)", kname, re.I)
+    if m:
+        return m.group(1).upper()
+    # The plain wvsplitk kernel (no type suffix) is Q4_K-specialized (static_assert).
+    if "wvsplitk" in kname:
+        return "Q4_K"
+    return None
+
+
+def build_expected_sequence_from_dump(layer_graph, tensors):
+    """Build the per-token matvec expected sequence from a roofline DUMP instead of
+    the GGUF role heuristic. The dump carries EVERY op the model actually ran, in exact
+    execution order, with exact (N, K, quant) -- including the GDN/SSM F32 projections
+    (ssm_alpha/beta N=32, per-token gates N=1, router N=256) that the GGUF role-order
+    builder deliberately skips (they have no clean weight-role mapping), which is why
+    GGUF-only coverage stalls at ~26% on hybrid models. Using the dump lifts coverage to
+    ~100% because the sequence IS the ground-truth op stream.
+
+    Each dump matvec node -> an entry {N, K, q, is_moe, nm, role, L, bytes} in the same
+    shape the order-map match loop expects. We attach a real GGUF weight name/role/bytes
+    when a tensor uniquely matches (N, K, quant); otherwise synthesize a shape-based name.
+    Returns the ONE-token sequence (delimited by the output-head vocab-N op)."""
+    if not (layer_graph and layer_graph.get("nodes")):
+        return []
+    mv = [n for n in layer_graph["nodes"] if "MUL_MAT" in str(n.get("op", "")) and n.get("N")]
+    if not mv:
+        return []
+    # Delimit one token: the output head is the largest-N op; it fires once per token.
+    vocab_n = max(n["N"] for n in mv)
+    heads = [i for i, n in enumerate(mv) if n["N"] == vocab_n]
+    seq_nodes = mv[heads[0]:heads[1]] if len(heads) >= 2 else mv
+    # Index GGUF tensors by (N, K, quant-name) for name/role/bytes attach. A shape may map
+    # to several weights (same N,K,quant across layers/roles); we round-robin per shape in
+    # execution order so repeated shapes get distinct per-layer names where possible.
+    from collections import defaultdict
+    by_shape = defaultdict(list)
+    for t in tensors:
+        ne = t["ne"]
+        if len(ne) < 2:
+            continue
+        qn = _GGML_TYPES.get(t["gt"], "type%d" % t["gt"]).lower()
+        by_shape[(ne[1], ne[0], qn)].append(t)
+    shape_cursor = defaultdict(int)
+    seq = []
+    for n in seq_nodes:
+        N, K = n["N"], n["K"]
+        qn = (n.get("quant") or "").lower()
+        cands = by_shape.get((N, K, qn), [])
+        t = None
+        if cands:
+            t = cands[shape_cursor[(N, K, qn)] % len(cands)]
+            shape_cursor[(N, K, qn)] += 1
+        if t is not None:
+            ne = t["ne"]
+            is_moe = len(ne) >= 3
+            pbytes = (_gguf_packed_bytes([ne[0], ne[1]], t["gt"]) if is_moe else t["bytes"])
+            nm = t["name"]
+            role = _role_of_name(nm)
+            L = _layer_of_name(nm)
+        else:
+            # No GGUF weight for this op (e.g. a fused/intermediate node) -> synthesize.
+            is_moe = bool(n.get("n_experts"))
+            pbytes = _gguf_packed_bytes([K, N], _quant_name_to_gt(qn)) if qn != "f32" else K * N * 4
+            nm = n.get("name") or ("op.%dx%d.%s" % (N, K, qn))
+            role = "gdn" if qn == "f32" else "matvec"
+            L = _layer_of_name(nm)
+        seq.append({"nm": nm, "L": L, "role": role, "N": N, "K": K,
+                    "gt": _quant_name_to_gt(qn), "bytes": pbytes,
+                    "q": qn.upper() if qn != "f32" else None, "is_moe": is_moe})
+    return seq
+
+
+def _quant_name_to_gt(qn):
+    inv = {v.lower(): k for k, v in _GGML_TYPES.items()}
+    return inv.get((qn or "").lower(), 0)
+
+
+def _role_of_name(nm):
+    m = re.search(r"blk\.\d+\.([a-z_]+?)(?:\.weight)?$", nm or "")
+    return m.group(1) if m else (nm or "")
 
 
 def build_expected_sequence(tensors, drop_ffn_up):
@@ -1682,7 +1987,7 @@ def build_expected_sequence(tensors, drop_ffn_up):
             # Fused SwiGLU: the single gate dispatch also streams the up weight, so
             # its up sibling is not a separate dispatch. This holds for the dense
             # ffn_up and the MoE ffn_up_exps alike.
-            if role in ("ffn_up", "ffn_up_exps") and drop_ffn_up:
+            if role in ("ffn_up", "ffn_up_exps", "ffn_up_shexp") and drop_ffn_up:
                 continue
             t = roles.get(role)
             if t is None or len(t["ne"]) < 2:
@@ -1695,10 +2000,19 @@ def build_expected_sequence(tensors, drop_ffn_up):
             # Fold the up weight's bytes into the fused gate dispatch (dense or MoE),
             # else the theoretical denominator is ~2x too small and the dispatch looks
             # like it over-fetches ~2x when it does not.
-            if role in ("ffn_gate", "ffn_gate_exps") and drop_ffn_up:
-                up = roles.get("ffn_up") or roles.get("ffn_up_exps")
+            if role in ("ffn_gate", "ffn_gate_exps", "ffn_gate_shexp") and drop_ffn_up:
+                up = {"ffn_gate": "ffn_up", "ffn_gate_exps": "ffn_up_exps",
+                      "ffn_gate_shexp": "ffn_up_shexp"}.get(role)
+                up = roles.get(up)
                 if up is not None and up["gt"] in _MATVEC_TYPES:
-                    ent["bytes"] += up["bytes"]
+                    # up["bytes"] is the raw tensor footprint (full 3D expert stack for
+                    # MoE); mirror _seq_entry and fold only the PER-EXPERT 2D slice so a
+                    # fused MoE gate+up dispatch's packed stays per-expert-honest.
+                    upne = up["ne"]
+                    if role == "ffn_gate_exps" and len(upne) >= 3:
+                        ent["bytes"] += _gguf_packed_bytes([upne[0], upne[1]], up["gt"])
+                    else:
+                        ent["bytes"] += up["bytes"]
                     ent["fused"] = "gate+up"
             seq.append(ent)
     # Output head: a dedicated output.weight, else the tied token_embd.weight.
@@ -1710,6 +2024,47 @@ def build_expected_sequence(tensors, drop_ffn_up):
 
 
 # --- token segmentation -------------------------------------------------------
+
+def detect_boundaries_by_head(evs):
+    """Token boundaries from the OUTPUT-HEAD anchor instead of inter-dispatch gaps.
+    The vocab projection (lm_head) is a mul_mat_vec with the largest N in the graph
+    and fires exactly once per decode token, so successive heads bracket each token.
+    This is robust whether or not HIP graph replay is on -- unlike the gap detector,
+    which relies on the clean inter-token idle that a single hipGraphLaunch leaves and
+    breaks in EAGER mode (graphs disabled, e.g. MoE mul_mat_id above the mmvq batch
+    cap), where dispatches are packed with no distinguishing gap.
+
+    Returns the index of the FIRST dispatch AFTER each head (= each token's start), so
+    the returned list plays the same role as detect_boundaries() output. Empty if there
+    is no clear periodic head anchor (falls back to the gap detector at the call site)."""
+    mv = [(i, n) for i, (s, e, nm, n, _nb, _gy) in enumerate(evs)
+          if n and "mul_mat" in nm]
+    if len(mv) < 3:
+        return []
+    max_n = max(n for _, n in mv)
+    # The head must be a clear outlier (vocab >> any weight N); require it to dwarf the
+    # next-largest distinct N, else this isn't a reliable anchor (e.g. a prefill trace).
+    other = [n for _, n in mv if n < max_n]
+    if other and max_n < 2 * max(other):
+        return []
+    heads = [i for i, n in mv if n == max_n]
+    if len(heads) < 3:
+        return []
+    # Boundary = first dispatch after each head. The head ENDS a token, so the next
+    # dispatch STARTS the following token. Drop the trailing head (no token follows it).
+    bounds = [h + 1 for h in heads[:-1] if h + 1 < len(evs)]
+    # De-noise: keep only boundaries spaced ~ the dominant period apart (guards against
+    # a stray duplicate-N dispatch masquerading as a head).
+    if len(bounds) < 3:
+        return bounds
+    deltas = [bounds[i] - bounds[i - 1] for i in range(1, len(bounds))]
+    period = statistics.median(deltas) or 1
+    kept = [bounds[0]]
+    for b in bounds[1:]:
+        if b - kept[-1] >= period * 0.5:
+            kept.append(b)
+    return kept
+
 
 def detect_boundaries(evs, gap_thr_ns):
     """Indices i where a gap > gap_thr_ns precedes evs[i] (candidate token
@@ -1821,9 +2176,15 @@ def add_common_args(ap):
                          "state past warmup/prefill (default 30)")
     ap.add_argument("--context-tokens", type=int, default=0,
                     help="extra tokens baked on each side for the stepper (default 0)")
-    ap.add_argument("--gap-threshold-us", type=float, default=150.0,
+    ap.add_argument("--gap-threshold-us", type=float, default=None,
                     help="inter-dispatch gap (us) that marks a token boundary "
-                         "(default 150)")
+                         "(default 150; a per-arch BOUNDARY_PROFILES value may apply "
+                         "instead unless this is set explicitly)")
+    ap.add_argument("--boundary-method", choices=("head", "gap", "auto"), default=None,
+                    help="override token-boundary detection method for this run "
+                         "(default: per-arch BOUNDARY_PROFILES, else auto). head = "
+                         "output-head anchor; gap = inter-dispatch gap; auto = head "
+                         "then gap fallback")
     ap.add_argument("--kv-context-tokens", type=int, default=-1,
                     help="context length (tokens) to size the KV-cache traffic in "
                          "the 'eff token BW%%' footer metric. KV bytes/token = "
@@ -1845,6 +2206,13 @@ def main():
 
 
 def build_payload(args):
+    # Normalize the gap-threshold sentinel: None default means "not set explicitly", so a
+    # per-arch BOUNDARY_PROFILES gap_us may apply. Resolve to 150us for the paths that use
+    # it unconditionally (prefill span, regen-command echo). Runs for both the CLI generator
+    # and serve.py, since both call build_payload.
+    args._gap_threshold_set = args.gap_threshold_us is not None
+    if args.gap_threshold_us is None:
+        args.gap_threshold_us = 150.0
     peak_bw = peak_bw_for(args.arch, args.peak_bw)
     peak_tops = peak_tops_for(args.arch, args.peak_tops)
     # Surface the roofline peaks next to the arch string in the title (e.g.
@@ -1865,6 +2233,14 @@ def build_payload(args):
     # Compute stream = the one with the most dispatches (stream 1 is model load).
     sid = max(by_stream, key=lambda s: len(by_stream[s]))
     evs = by_stream[sid]
+
+    # Load the GGUF (tensor table + meta) up front so the model architecture is known
+    # BEFORE token-boundary detection -- the boundary profile is arch-specific. Cheap
+    # (mmap, no weight bytes read). Empty meta for trace-only runs -> _default profile.
+    gguf_tensors, gguf_meta = ([], {})
+    if args.gguf:
+        gguf_tensors, gguf_meta = load_gguf_tensors(args.gguf)
+    model_arch = gguf_meta.get("general.architecture", "")
 
     if args.mode == "prefill":
         # Prefill = ONE prompt-processing forward pass (MMQ GEMMs), not the periodic
@@ -1906,11 +2282,35 @@ def build_payload(args):
         view_i0 = 0
         view_i1 = 1
     else:
-        bounds = detect_boundaries(evs, args.gap_threshold_us * 1000)
+        # Token segmentation strategy is chosen per model architecture (see
+        # BOUNDARY_PROFILES). The two detectors stay generic; the profile only picks
+        # which one + threshold. --boundary-method overrides the profile's method;
+        # --gap-threshold-us (if set) overrides the profile's gap_us.
+        prof = boundary_profile_for(model_arch)
+        method = args.boundary_method or prof["method"]
+        # Gap threshold precedence: explicit CLI flag > profile gap_us > flag default.
+        gap_us = args.gap_threshold_us
+        if not args._gap_threshold_set and prof["gap_us"] is not None:
+            gap_us = prof["gap_us"]
+
+        # "head" = output-head anchor only (robust for eager MoE); "gap" = inter-dispatch
+        # gap detector; "auto" = head first, gap fallback (the historical default, used
+        # for unknown/dense archs where either can work).
+        if method == "head":
+            bounds = detect_boundaries_by_head(evs)
+        elif method == "gap":
+            bounds = detect_boundaries(evs, gap_us * 1000)
+        else:  # "auto"
+            bounds = detect_boundaries_by_head(evs)
+            if len(bounds) < args.skip_tokens + args.tokens + 2:
+                gap_bounds = detect_boundaries(evs, gap_us * 1000)
+                if len(gap_bounds) > len(bounds):
+                    bounds = gap_bounds
         if len(bounds) < args.skip_tokens + args.tokens + 2:
-            sys.exit(f"error: only {len(bounds)} token boundaries detected; "
-                     f"need > {args.skip_tokens + args.tokens}. Lower --skip-tokens "
-                     f"or --gap-threshold-us.")
+            sys.exit(f"error: only {len(bounds)} token boundaries detected "
+                     f"(arch={model_arch or 'unknown'}, method={method}); need > "
+                     f"{args.skip_tokens + args.tokens}. Lower --skip-tokens, "
+                     f"try --boundary-method, or lower --gap-threshold-us.")
 
         # Bake a wider span (context on each side) so the stepper can pan.
         lo_tok = max(0, args.skip_tokens - args.context_tokens)
@@ -1934,8 +2334,8 @@ def build_payload(args):
     # estimate -- measured attributes bytes to the exact kernel that moved them
     # (so it also fixes the Q5_K shared-quant-type over-attribution the analytic
     # method had), and covers every family, not just mul_mat_vec.
-    fetch_bytes, fetch_bytes_n = (load_fetch_bytes(args.fetch_csv)
-                                  if args.fetch_csv else ({}, {}))
+    fetch_bytes, fetch_bytes_n, fetch_bytes_nk = (load_fetch_bytes(args.fetch_csv)
+                                                  if args.fetch_csv else ({}, {}, {}))
     loadwidth = load_loadwidth(args.loadwidth_json) if args.loadwidth_json else {}
     layer_graph = load_graph_json(args.graph_json) if args.graph_json else None
     att_by_fam = load_att_stats(args.att_dir) if args.att_dir else {}
@@ -1970,6 +2370,17 @@ def build_payload(args):
                                  "pp" if args.mode == "prefill" else "tg")
                  if args.clean_tps_file else None)
 
+    # Model name for the title/sub-header. Prefer the explicit --gguf basename (minus the
+    # .gguf suffix, to match the clean_tps-derived name); else recover it from
+    # clean_tps.txt (llama-bench records model_filename), so the model is always identified
+    # even without --gguf. collect.sh always emits clean_tps.txt.
+    model_name = ""
+    if args.gguf:
+        _base = os.path.basename(args.gguf)
+        model_name = _base[:-5] if _base.endswith(".gguf") else _base
+    if not model_name and args.clean_tps_file:
+        model_name = parse_clean_model_name(args.clean_tps_file)
+
     # Prefill is COMPUTE-bound: it processes a batch of B prompt tokens per matmul
     # (a GEMM), so the roofline denominator is peak TOPS, not peak DRAM BW. B is the
     # prompt length (pp<B> from clean_tps, e.g. pp128 -> 128); each mapped matmul does
@@ -1992,14 +2403,13 @@ def build_payload(args):
     #  - prefill: matmul kernel = mul_mat_q; reference = the WHOLE baked forward pass
     #             (one pass, no per-token repeat). N recovered as grid.x*mmq_y (above).
     expected_seq = []
-    gguf_meta = {}
+    # gguf_tensors/gguf_meta already loaded up front (before boundary detection).
     mm_key = "mul_mat_q" if args.mode == "prefill" else "mul_mat_vec"
     if args.gguf:
-        gguf_tensors, gguf_meta = load_gguf_tensors(args.gguf)
         if args.mode == "prefill":
-            ref = [n for (s, e, nm, n, _nb) in baked if mm_key in nm and n]
+            ref = [n for (s, e, nm, n, _nb, _gy) in baked if mm_key in nm and n]
         else:
-            ref = [n for (s, e, nm, n, _nb) in evs[bounds[args.skip_tokens]:
+            ref = [n for (s, e, nm, n, _nb, _gy) in evs[bounds[args.skip_tokens]:
                                               bounds[args.skip_tokens + 1]]
                    if mm_key in nm and n]
         best = None
@@ -2012,6 +2422,15 @@ def build_payload(args):
                 best = (score, cand, drop, hits, m)
         if best:
             expected_seq = best[1]
+
+        # NOTE: build_expected_sequence_from_dump() constructs the GROUND-TRUTH per-token op
+        # sequence from a roofline dump (every op incl. GDN F32 projections, exact N/K/quant)
+        # -- the path to lift order-map coverage past the ~26% GGUF-heuristic ceiling on
+        # hybrid GDN/SSM models. But the dump's graph-BUILD order and the trace's EXECUTION
+        # order diverge (GDN ops interleave differently), so a naive positional/rotational
+        # match only recovers ~33%. Reconciling them needs proper sequence alignment
+        # (edit-distance / storage-id join), which is follow-up work; the helper is kept
+        # for that. Until then we use the GGUF-heuristic sequence above.
 
         # Auto-attach the checked-in structural topology for this architecture when the
         # user did not pass an explicit --graph-json. The key is derived from the gguf's
@@ -2074,11 +2493,41 @@ def build_payload(args):
     busy_ns = 0
     fam_busy = defaultdict(float)
     fam_count = defaultdict(int)
+    # Dump shape-lookup: (kernel_family, launched-N) -> (K, quant). Built from the roofline
+    # dump, which carries exact (N,K,quant) for EVERY op. This lets us label a dispatch's
+    # KxN shape WITHOUT the order-map (which only covers ~26% on hybrid GDN models) -- the
+    # (family, N) key is unique to K in practice (0 ambiguous combos on qwen3.6-35b), so a
+    # dispatch's launched N + kernel family pins its K. Used to fill the detail table's
+    # shape column for UNMAPPED dispatches (needed for kernel-shape-level optimization).
+    dump_shape = {}
+    if layer_graph and layer_graph.get("nodes"):
+        _ds_tmp = {}
+        for nd in layer_graph["nodes"]:
+            if "MUL_MAT" not in str(nd.get("op", "")):
+                continue
+            N, K = nd.get("N"), nd.get("K")
+            if not (N and K):
+                continue
+            ks = nd.get("kernels") or []
+            fam_nd = family_of(ks[-1]["fam"]) if ks and ks[-1].get("fam") else nd.get("fam", "")
+            fam_nd = fam_nd or nd.get("fam", "")
+            key = (fam_nd, N)
+            # only keep unambiguous (family,N)->K (drop the rare collision rather than guess).
+            # None marks a known-ambiguous key; once marked it stays ambiguous.
+            if key not in _ds_tmp:
+                _ds_tmp[key] = (K, (nd.get("quant") or "").upper() or None)
+            elif _ds_tmp[key] is not None and _ds_tmp[key][0] != K:
+                _ds_tmp[key] = None
+        dump_shape = {k: v for k, v in _ds_tmp.items() if v is not None}
     fam_macs = defaultdict(float)   # prefill: total 2*N*K*B MACs of a family's mapped slices
+    # Launched-N values that a GGUF weight actually has -> a dispatch whose N is not in
+    # this set cannot be a weight matvec (e.g. the ssm scalar F32 projections), so it is
+    # excluded from the map denominator instead of counting as an unmapped miss.
+    _expected_Nset = {ent["N"] for ent in expected_seq}
     ei = 0
     ti_ctr = 0
     mv_total = mv_mapped = 0
-    for idx, (s, e, name, ncol, nblk) in enumerate(baked):
+    for idx, (s, e, name, ncol, nblk, gy) in enumerate(baked):
         if idx in tok_boundary_idx:
             ei = 0
             ti_ctr = 0
@@ -2092,23 +2541,93 @@ def build_payload(args):
         fam_busy[fam] += dur
         fam_count[fam] += 1
         sl = {"s": s - t0, "e": e - t0, "fam": fam, "stall": stall,
-              "blocks": nblk, "ti": ti_ctr}
+              "blocks": nblk, "ti": ti_ctr,
+              # launched output-row count + whether this is a matvec, so layer
+              # segmentation can find the output head (largest-N matvec) structurally.
+              "_ncol": ncol, "_mv": (mm_key in name)}
+        # Attach the dump-derived KxN shape to EVERY matvec dispatch (order-map-independent),
+        # so the detail table can show shape even for unmapped kernels.
+        if (mm_key in name) and ncol:
+            sk = dump_shape.get((fam, ncol))
+            if sk:
+                sl["shapeK"] = sk[0]
+                sl["shapeQ"] = sk[1]
         ti_ctr += 1
         if expected_seq and mm_key in name and ncol:
+            # Only count dispatches that COULD map to a weight in the denominator. A
+            # hybrid (GDN/SSM) model fires small F32 mul_mat_vec_f scalar projections
+            # (ssm_alpha/beta and per-token gates, launched N=1/32) that are matmuls but
+            # not GGUF weight matvecs -- they have no expected entry by construction, so
+            # counting them deflates the map %. Keep a dispatch in the denominator only
+            # if its launched N appears among the expected weight Ns.
+            if ncol not in _expected_Nset:
+                gpu_slices.append(sl)
+                continue
             mv_total += 1
-            ent = expected_seq[ei] if ei < len(expected_seq) else None
-            ei += 1
+            # Resync order-map (Level 1 type guard + Level 2 MoE guard). Instead of a
+            # strict positional ei++ that cascades a desync forever, match this dispatch
+            # to the FIRST expected entry at-or-after ei that is CONSISTENT with the
+            # kernel that actually ran, then advance past it. Consistency:
+            #  - type: a mul_mat_vec_q<(ggml_type)8> (Q8_0) kernel can't compute a Q5_K
+            #    weight; mul_mat_vec_f (float router) carries no quant -> skip the check.
+            #  - MoE: an expert weight (is_moe, 3D) runs as ONE grouped mul_mat_id with
+            #    gy>1; a dense dispatch (gy==1) must map to a dense entry, and vice versa.
+            #  - N: the launched output-row count must equal the weight's true N (the
+            #    original join key), so same-type siblings don't false-match.
+            # Scanning a bounded window self-corrects after an unmatched dispatch (a
+            # kernel we did not model) without derailing the rest of the token.
+            ktype = _kernel_quant_type(name)
+            dispatch_is_moe = gy > 1
+            # This dispatch's ACTUAL K, from the dump's unambiguous (family,N)->K lookup
+            # (attached as shapeK at slice construction). Two different-K weights can share
+            # an N (ffn_down_shexp K=512 and attn_output K=4096 both N=2048), and once K=512
+            # moved to the k512_fast kernel the base kernel's N=2048 dispatches are ALL
+            # K=4096 -- but a pure-N match would still slot ffn_down_shexp (K=512) onto them,
+            # producing a nonsense row (42us K=4096 dispatch labelled with the 1.1MB K=512
+            # weight -> over-fetch 8x). Require the candidate weight's K to equal the
+            # dispatch's real K whenever we know it.
+            dispatch_k = sl.get("shapeK")
+            ent = None
+            scan_max = min(len(expected_seq), ei + 8)
+            j = ei
+            while j < scan_max:
+                cand = expected_seq[j]
+                type_ok = (ktype is None or cand["q"] is None or ktype == cand["q"])
+                moe_ok = (dispatch_is_moe == bool(cand.get("is_moe")))
+                k_ok = (dispatch_k is None or cand.get("K") is None
+                        or cand["K"] == dispatch_k)
+                if type_ok and moe_ok and k_ok and cand["N"] == ncol:
+                    ent = cand
+                    ei = j + 1
+                    break
+                j += 1
+            if ent is None:
+                # no consistent entry in the window: advance one so we don't stall, but
+                # leave this dispatch unmapped rather than attach a wrong-type weight.
+                ei = min(ei + 1, len(expected_seq))
             if ent is not None:
                 true_n = ent["N"]
                 k = ent["K"]
                 packed = ent["bytes"]
-                # Prefer per-weight order-mapped bytes (over-fetch-honest even for
-                # weights sharing an N); fall back to the (family, N) blend, then
-                # the family mean.
+                # Measured DRAM bytes, best source first:
+                #  1. per-weight order-mapped bytes (exact, when the order-map segmented);
+                #  2. NEAREST fetch-size CLUSTER for (fam, launched-N): two different-K
+                #     weights that share an N have distinct, tightly-clustered fetch sizes,
+                #     so pick the cluster whose center is closest to THIS weight's packed
+                #     footprint -- this separates e.g. ffn_down_shexp (K=512, ~1.1MB) from
+                #     attn_output (K=4096, ~8.9MB) that both launch N=2048, instead of the
+                #     (fam,N) mean that blended them into a bogus 4.5x over-fetch;
+                #  3. the (fam,N) blend; 4. the family mean.
                 mexact = ent["nm"] in fetch_by_name
-                measured = (fetch_by_name.get(ent["nm"])
-                            or fetch_bytes_n.get((fam, ncol))
-                            or fetch_bytes.get(fam, 0))
+                measured = fetch_by_name.get(ent["nm"])
+                mnearest = False
+                if not measured:
+                    clusters = fetch_bytes_nk.get((fam, ncol))
+                    if clusters and packed:
+                        measured = min(clusters, key=lambda c: abs(c - packed))
+                        mnearest = True
+                if not measured:
+                    measured = fetch_bytes_n.get((fam, ncol)) or fetch_bytes.get(fam, 0)
                 sl["map"] = {
                     "nm": ent["nm"], "role": ent["role"], "L": ent["L"],
                     "q": ent["q"], "K": k, "trueN": true_n, "launchN": ncol,
@@ -2121,20 +2640,28 @@ def build_payload(args):
                     "measured": round(measured) if measured else 0,
                     # True when `measured` is this weight's own order-mapped bytes
                     # (over-fetch-honest); False when it fell back to the (fam, N) blend.
-                    "mexact": mexact,
+                    "mexact": mexact or mnearest,
                     # Over-fetch: measured DRAM bytes / theoretical packed footprint.
                     "overfetch": (round(measured / packed, 2)
                                   if (measured and packed) else 0),
                     # Effective (useful-work) bandwidth: the THEORETICAL bytes this
-                    # matvec must move / its exact kernel time. Immune to over-fetch
-                    # by construction (numerator is the algorithmic minimum, not
-                    # measured traffic), and uses exact per-dispatch duration (no
-                    # separate-run / family blend), so it is the honest roofline
-                    # number: a kernel that over-fetches 100x keeps DRAM busy but
-                    # its effective BW stays low. 1 byte/ns == 1 GB/s.
+                    # matvec must move / its kernel time. Immune to over-fetch by
+                    # construction (numerator is the algorithmic minimum, not measured
+                    # traffic). 1 byte/ns == 1 GB/s. NOTE: these raw per-dispatch values
+                    # divide by THIS one dispatch's duration, which on gfx1151 is subject
+                    # to the sub-100us HIP-graph timestamp smear (a fraction of dispatches
+                    # read artificially short/long -- see project memory), so a single
+                    # dispatch can report an impossible >roofline BW. The displayed effbw
+                    # is REPLACED below by a robust (fam,N,K)-median-duration recompute; we
+                    # do NOT clamp to roofline (a real >roofline median would be a signal
+                    # worth seeing, not something to hide). Raw kept for reference/debug.
+                    "effbw_raw": round(packed / dur, 1) if dur else 0,
                     "effbw": round(packed / dur, 1) if dur else 0,
                     "effbw_pct": (round(packed / dur / peak_bw * 100, 1)
                                   if dur else 0),
+                    # this dispatch's own duration (ns), so the post-pass can group
+                    # same-(fam,N,K) slices and take a robust median duration.
+                    "_dur": dur,
                     # Prefill compute roofline: this matmul does 2*N*K*B MACs over B
                     # prompt tokens; achieved TOPS = 2*N*K*B / kernel_time (1 MAC/ns ==
                     # 1e-3 TOPS -> /1e3). tops_pct rooflines against peak TOPS. Uses
@@ -2153,10 +2680,179 @@ def build_payload(args):
                     fam_macs[fam] += 2.0 * true_n * k * compute_batch
         gpu_slices.append(sl)
 
+    # --- Robust effbw: recompute per-slice effective BW from the MEDIAN duration of
+    # all dispatches sharing the same (family, trueN, K) shape, not this one dispatch's
+    # raw duration. Why: the kernel-trace grid encodes only N (output rows), so several
+    # distinct-K weights land under one kernel label, AND gfx1151's sub-100us HIP-graph
+    # timestamp smear makes a fraction of dispatches read artificially short/long. Both
+    # effects let a single dispatch divide a correct byte count by a corrupted duration
+    # and report an impossible >roofline BW (e.g. 8.9MB / 8us ~= 1079 GB/s vs the ~40us
+    # true cost). Grouping by (fam,N,K) separates the different-K populations, and the
+    # median is robust to the timestamp outliers. NO roofline clamp: a genuine
+    # >roofline median is left visible as a signal, not hidden.
+    # Group durations by the slice's ACTUAL launched N (_ncol, from the trace grid) +
+    # family, NOT the order-mapped weight's trueN. Critical: when the order-map mis-
+    # attaches a weight to a dispatch (the N-only-ambiguity / 25%-accuracy problem),
+    # the weight's trueN != the dispatch's real launch N. Keying the median on trueN
+    # then averages durations of DIFFERENTLY-launched dispatches -- e.g. an attn_gate
+    # weight (trueN=4096, packed 8.9MB) mis-attached to N=2048 (~15us) dispatches gave
+    # 8.9MB/15us = 583 GB/s (2.5x roofline). Keying on _ncol clusters like-launched
+    # dispatches so the median duration is physically consistent with the launch.
+    _eb_durs = defaultdict(list)
+    for sl in gpu_slices:
+        m = sl.get("map")
+        if m and m.get("packed") and m.get("_dur"):
+            _eb_durs[(sl["fam"], sl.get("_ncol"))].append(m["_dur"])
+    _eb_med = {kk: sorted(v)[len(v) // 2] for kk, v in _eb_durs.items()}
+
+    # AUTHORITATIVE effbw source: the roofline dump (--graph-json). Each dump op carries
+    # EXACT (N,K,quant) + its own mul_mat kernel gpu_time -- no positional order-map, no
+    # trace N-ambiguity. When present, this is the trustworthy per-shape kernel time to
+    # roofline against (e.g. attn_gate 4096x2048 q8_0 -> 41us -> 215 GB/s, vs the trace
+    # order-map's bogus 15us/583 GB/s). Build {(N,K,quant): median mul_mat us} from the
+    # reconstructed graph nodes; the effbw loop below prefers it over the trace median.
+    _dump_us = {}
+    _dump_experts = {}
+    if layer_graph and layer_graph.get("nodes"):
+        _dump_durs = defaultdict(list)
+        for nd in layer_graph["nodes"]:
+            if "MUL_MAT" not in str(nd.get("op", "")):
+                continue
+            N, K = nd.get("N"), nd.get("K")
+            if not (N and K):
+                continue
+            # the op's mul_mat kernel time (skip the quantize-prep subkernel): prefer a
+            # subkernel whose family names a matvec/gemm, else the op's total us_in.
+            mm = [sk["us"] for sk in (nd.get("kernels") or [])
+                  if "mul_mat" in sk.get("fam", "") or "wvsplitk" in sk.get("fam", "")
+                  or "gemm" in sk.get("fam", "").lower()]
+            us = sum(mm) if mm else ((nd.get("us_in") or 0) / 1000.0)
+            if us > 0:
+                _dump_durs[(N, K, nd.get("quant", ""))].append(us)
+        _dump_us = {kk: sorted(v)[len(v) // 2] for kk, v in _dump_durs.items()}
+        # (N,K,quant) -> experts routed per grouped MoE dispatch (top_k). A grouped
+        # mul_mat_id reads experts_used experts in one dispatch, so its effective packed
+        # footprint is per_expert_bytes * experts_used, NOT one expert (which under-reported
+        # MoE eff BW ~top_k-fold: Q4_K ffn_gate_exps 2048x512 read 5% roofline instead of ~42%).
+        for nd in layer_graph["nodes"]:
+            eu = nd.get("experts_used") or 0
+            N, K = nd.get("N"), nd.get("K")
+            if eu > 0 and N and K:
+                _dump_experts[(N, K, (nd.get("quant") or "").lower())] = eu
+
+    def _quant_norm(q):
+        # trace/gguf quant label ("Q8_0") vs dump label ("q8_0") -> compare case-insensitively
+        return (q or "").lower()
+
+    def _eff_packed(m):
+        # Effective bytes the DISPATCH streams = per-expert packed x experts_used for a
+        # grouped MoE op, else packed for dense. (m["packed"] for MoE is already the
+        # per-ONE-expert 2D footprint, see _seq_entry.)
+        p = m.get("packed") or 0
+        eu = _dump_experts.get((m.get("trueN"), m.get("K"), _quant_norm(m.get("q"))))
+        if eu and eu > 1:
+            return p * eu
+        return p
+
+    # Attach the DUMP's true per-op kernel time to every matvec slice. The trace Start->End
+    # duration is WRONG for small-grid kernels (e.g. longk, grid.x=nrows_x=512 workgroups,
+    # 77% occupancy): the scheduler co-runs them with neighbouring kernels, so their
+    # timestamp span brackets ~100us of overlapping OTHER work while the kernel itself is
+    # active only ~11us (confirmed by GRBM_GUI_ACTIVE). The dump runs graphs-disabled ->
+    # each op's kernel time is its OWN gpu_time, overlap-free. Use it as the displayed
+    # kernel time when available; the raw trace span is kept as _dur_raw for reference.
+    for sl in gpu_slices:
+        if not sl.get("_mv"):
+            continue
+        K = sl.get("shapeK"); N = sl.get("_ncol"); qn = _quant_norm(sl.get("shapeQ"))
+        du = _dump_us.get((N, K, qn)) if (K and N and qn) else None
+        if du:
+            sl["dispatch_us"] = round(du, 2)
+
+    for sl in gpu_slices:
+        m = sl.get("map")
+        if not (m and m.get("packed") and m.get("_dur")):
+            continue
+        # effective packed = per-expert packed x experts_used for grouped MoE ops, else packed.
+        _ep = _eff_packed(m)
+        m["eff_packed"] = _ep       # JS per-row eff BW divides THIS by the row's kernel time
+        _eu = _dump_experts.get((m.get("trueN"), m.get("K"), _quant_norm(m.get("q"))))
+        if _eu and _eu > 1:
+            m["experts_used"] = _eu   # routed experts this grouped dispatch computed (top_k)
+        # Prefer the authoritative dump time (exact shape, no order-map) when available.
+        dump_med_us = _dump_us.get((m.get("trueN"), m.get("K"), _quant_norm(m.get("q"))))
+        if dump_med_us:
+            m["effbw"] = round(_ep / (dump_med_us * 1000.0), 1)
+            m["effbw_pct"] = round(_ep / (dump_med_us * 1000.0) / peak_bw * 100, 1) if peak_bw else 0
+            m["effbw_med_us"] = round(dump_med_us, 2)
+            m["effbw_src"] = "roofline-dump (exact shape)"
+            continue
+        # Fallback (no dump): trace-median keyed on the actual launched N, gated on nmatch.
+        # A weight-N vs launched-N mismatch means packed and duration belong to different
+        # ops -> meaningless; leave unset and flag rather than fabricate.
+        if not m.get("nmatch"):
+            m["effbw"] = 0
+            m["effbw_pct"] = 0
+            m["effbw_mismatch"] = True
+            continue
+        med = _eb_med.get((sl["fam"], sl.get("_ncol")))
+        if not med:
+            continue
+        m["effbw"] = round(_ep / med, 1)
+        m["effbw_pct"] = round(_ep / med / peak_bw * 100, 1) if peak_bw else 0
+        m["effbw_n"] = len(_eb_durs[(sl["fam"], sl.get("_ncol"))])
+        m["effbw_med_us"] = round(med / 1000.0, 2)
+        m["effbw_src"] = "trace order-map (median dur)"
+
+    # UNMAPPED matvec dispatches: packed size and eff BW are pure functions of (N, K, quant)
+    # + the dump's per-shape kernel time -- NONE of which need the order-map (which only
+    # attaches the weight NAME). shapeK/_ncol/shapeQ were attached at slice construction
+    # from the dump's unambiguous (family,N)->K lookup. So compute packed + eff BW for every
+    # unmapped matvec too (F32 GDN projections have no packed-weight roofline -> skip those).
+    for sl in gpu_slices:
+        if sl.get("map") or not sl.get("_mv"):
+            continue
+        K = sl.get("shapeK"); N = sl.get("_ncol"); qs = sl.get("shapeQ")
+        if not (K and N and qs) or qs.upper() == "F32":
+            continue
+        gt = _quant_name_to_gt(qs)
+        packed = _gguf_packed_bytes([K, N], gt)
+        dump_med_us = _dump_us.get((N, K, _quant_norm(qs)))
+        med_us = dump_med_us if dump_med_us else (
+            (_eb_med.get((sl["fam"], N)) or 0) / 1000.0)
+        sh = {"K": K, "trueN": N, "launchN": N, "q": qs.upper(), "packed": packed,
+              "role": "", "nm": "", "L": -1, "shape_only": True}
+        if med_us:
+            sh["effbw"] = round(packed / (med_us * 1000.0), 1)
+            sh["effbw_pct"] = round(packed / (med_us * 1000.0) / peak_bw * 100, 1) if peak_bw else 0
+            sh["effbw_med_us"] = round(med_us, 2)
+            sh["effbw_src"] = ("roofline-dump (exact shape)" if dump_med_us
+                               else "trace median (shape-keyed)")
+        sl["map"] = sh
+
     map_stats = ({"total": mv_total, "mapped": mv_mapped,
                   "pct": round(100.0 * mv_mapped / mv_total, 1) if mv_total else 0,
                   "seq_len": len(expected_seq)}
                  if expected_seq else None)
+
+    # GPU-busy = wall time with >=1 kernel running (merged-interval UNION), NOT the
+    # sum of per-dispatch durations. Summing double-counts overlapping dispatches --
+    # in EAGER mode (graphs disabled, e.g. MoE mul_mat_id over the mmvq batch cap) the
+    # trace has back-to-back/overlapping kernels, so the sum can exceed the window span
+    # (>100% "busy"). The union is overlap-correct in both graph and eager mode.
+    busy_ns = 0
+    _iv = sorted(((sl["s"], sl["e"]) for sl in gpu_slices))
+    _cs = _ce = None
+    for _s, _e in _iv:
+        if _cs is None:
+            _cs, _ce = _s, _e
+        elif _s <= _ce:
+            _ce = max(_ce, _e)
+        else:
+            busy_ns += _ce - _cs
+            _cs, _ce = _s, _e
+    if _cs is not None:
+        busy_ns += _ce - _cs
 
     # Per-kernel steady-state stats: decode tokens are structurally identical, so
     # the Nth kernel of every token is the same dispatch. Aggregate each within-token
@@ -2173,7 +2869,7 @@ def build_payload(args):
     if kstats_ntok > 0:
         agg = defaultdict(list)
         for k in range(args.skip_tokens, len(bounds) - 1):
-            for ti, (s, e, nm, _n, _nb) in enumerate(evs[bounds[k]:bounds[k + 1]]):
+            for ti, (s, e, nm, _n, _nb, _gy) in enumerate(evs[bounds[k]:bounds[k + 1]]):
                 agg[(ti, family_of(nm))].append(e - s)
         for (ti, fam), durs in agg.items():
             cnt = len(durs)
@@ -2199,39 +2895,106 @@ def build_payload(args):
                 _roles[int(m.group(1))].add(m.group(2))
         for L, rs in _roles.items():
             block_kind[L] = "GDN" if any(r.startswith("ssm") for r in rs) else "ATTN"
+        n_layers = 1 + max(_roles) if _roles else 0
         # Window edges: each token boundary starts a window that runs to the next
         # boundary (decode), and the last window runs to the end of the baked slices.
         # Prefill has a single boundary {0}, so this is one window spanning the whole
         # forward pass -- append n as the closing edge so that window is processed.
         n = len(gpu_slices)
         starts = sorted(tok_boundary_idx) + [n]
+
+        # STRUCTURAL layer anchor: each decode block runs an identical kernel sequence,
+        # so a kernel family that fires exactly once per block (e.g. topk_moe_cuda for a
+        # MoE model, or ssm_conv/rope for others) yields n_layers clean per-layer starts.
+        # This is INDEPENDENT of the order-map, so layers segment correctly even when the
+        # map is sparse (MoE mul_mat_id maps poorly) -- avoiding the failure where all the
+        # unmapped slices collapse into one giant "layer". Pick the anchor per-window as a
+        # family whose count in that window == n_layers; fall back to the map-fill below
+        # when no such family exists (dense models where the map is dense anyway).
+        def _anchor_starts(st, en):
+            if n_layers < 2:
+                return None
+            fam_pos = defaultdict(list)
+            for i in range(st, en):
+                fam_pos[gpu_slices[i]["fam"]].append(i)
+            # candidate anchors: exactly n_layers occurrences, and the LAST op family
+            # (output head region) excluded. Prefer the one whose positions are most
+            # evenly spaced (a true per-layer marker), tie-break by name stability.
+            cands = [p for f, p in fam_pos.items() if len(p) == n_layers]
+            if not cands:
+                return None
+            def spread(p):
+                gaps = [p[i] - p[i - 1] for i in range(1, len(p))]
+                mean = sum(gaps) / len(gaps)
+                return sum((g - mean) ** 2 for g in gaps)  # variance*len; lower=evener
+            return min(cands, key=spread)
+
         lay_L = [None] * n
+        used_anchor = False
         for wi in range(len(starts) - 1):
             st = starts[wi]
             en = min(starts[wi + 1], n)
-            # backward fill: leading norms take the next matvec's layer index.
-            cur = None
-            for i in range(en - 1, st - 1, -1):
+            anchor = _anchor_starts(st, en)
+            if anchor is not None:
+                used_anchor = True
+                # Layer L owns [anchor[L] .. anchor[L+1]); slices before the first anchor
+                # (leading norms/get_rows of block 0) belong to L0; the tail after the
+                # last anchor's block (output head + final norm) is the head (L=-1).
+                # Assign each anchor a block index by its ORDER (0..n_layers-1), matching
+                # the GGUF block order that block_kind is keyed on.
+                for i in range(st, en):
+                    lay_L[i] = None
+                # first anchor's block starts at st (its leading norms)
+                for li in range(len(anchor)):
+                    seg_lo = st if li == 0 else anchor[li]
+                    seg_hi = anchor[li + 1] if li + 1 < len(anchor) else en
+                    for i in range(seg_lo, seg_hi):
+                        lay_L[i] = li
+                # Split off the OUTPUT HEAD: the final norm + lm_head (vocab projection)
+                # are not part of the last transformer block. The lm_head is the matvec
+                # with the largest launched N in the window (>> any weight N); mark it and
+                # everything after it (plus the final norm right before it) as head (L=-1)
+                # so the huge lm_head kernel doesn't inflate the last layer's width.
+                head_i = None
+                head_n = 0
+                for i in range(anchor[-1], en):
+                    if gpu_slices[i].get("_mv") and gpu_slices[i].get("_ncol", 0) > head_n:
+                        head_n = gpu_slices[i]["_ncol"]; head_i = i
+                if head_i is not None:
+                    # include the final norm(s) immediately preceding the head
+                    edge = head_i
+                    for k in range(head_i - 1, anchor[-1] - 1, -1):
+                        if "norm" in gpu_slices[k].get("fam", "").lower():
+                            edge = k
+                        elif gpu_slices[k].get("_mv"):
+                            break
+                    for i in range(edge, en):
+                        lay_L[i] = -1
+            else:
+              # --- map-driven fallback (dense models: order-map is dense) ---
+              # backward fill: leading norms take the next matvec's layer index.
+              cur = None
+              for i in range(en - 1, st - 1, -1):
                 mp = gpu_slices[i].get("map")
                 if mp is not None:
                     cur = mp["L"]
                 lay_L[i] = cur
-            # forward fill: trailing slices past the last matvec keep the last layer.
-            fill = None
-            for i in range(st, en):
+              # forward fill: trailing slices past the last matvec keep the last layer.
+              fill = None
+              for i in range(st, en):
                 if lay_L[i] is None:
                     lay_L[i] = fill
                 else:
                     fill = lay_L[i]
-            # Boundary correction to match the ggml compute graph (tensor-name layer
-            # index): pure backward-fill pulls a layer's TRAILING residual binops (the
-            # expert weighted-sum + residual adds, e.g. ffn_moe_weighted/l_out) into the
-            # NEXT layer, because they physically precede that layer's first matvec. But
-            # by the graph those belong to the layer that just finished. So at each
-            # inter-layer gap, keep the trailing non-matvec slices with the PREVIOUS
-            # layer; the new layer starts at its attention-input norm (the rms_norm that
-            # feeds the next matvec). Scan each boundary where the mapped layer increases.
-            for i in range(st + 1, en):
+              # Boundary correction to match the ggml compute graph (tensor-name layer
+              # index): pure backward-fill pulls a layer's TRAILING residual binops (the
+              # expert weighted-sum + residual adds, e.g. ffn_moe_weighted/l_out) into the
+              # NEXT layer, because they physically precede that layer's first matvec. But
+              # by the graph those belong to the layer that just finished. So at each
+              # inter-layer gap, keep the trailing non-matvec slices with the PREVIOUS
+              # layer; the new layer starts at its attention-input norm (the rms_norm that
+              # feeds the next matvec). Scan each boundary where the mapped layer increases.
+              for i in range(st + 1, en):
                 prevL, curL = lay_L[i - 1], lay_L[i]
                 if prevL is None or curL is None or curL <= prevL:
                     continue
@@ -2254,7 +3017,7 @@ def build_payload(args):
                 edge = norm_at if norm_at is not None else fm
                 for k in range(i, edge):
                     lay_L[k] = prevL
-            # coalesce consecutive equal-layer runs into one segment.
+            # coalesce consecutive equal-layer runs into one segment (both paths).
             j = st
             while j < en:
                 L = lay_L[j]
@@ -2449,8 +3212,10 @@ def build_payload(args):
         regen_parts.append("--skip-tokens %d" % args.skip_tokens)
     if args.context_tokens:
         regen_parts.append("--context-tokens %d" % args.context_tokens)
-    if args.gap_threshold_us != 150.0:
+    if args._gap_threshold_set and args.gap_threshold_us != 150.0:
         regen_parts.append("--gap-threshold-us %g" % args.gap_threshold_us)
+    if args.boundary_method:
+        regen_parts.append("--boundary-method " + args.boundary_method)
     att_cmd = {
         "script": os.path.join(_self_dir, "collect-att.sh"),
         "build_dir": os.path.abspath(args.build_dir) if args.build_dir
@@ -2477,7 +3242,7 @@ def build_payload(args):
 
     payload = {
         "title": title,
-        "model_name": os.path.basename(args.gguf) if args.gguf else "",
+        "model_name": model_name,
         "provenance": _provenance(),
         "mode": args.mode,
         "ttft_est_ms": ttft_est_ms,
@@ -2878,7 +3643,7 @@ const ACTIVE_MODE = pickMode();
 const D = IS_MULTI ? RAW.payloads[ACTIVE_MODE] : RAW;
 const cv = document.getElementById('cv');
 const ctx = cv.getContext('2d');
-const CPU_H = 70, GPU_H = 70, PAD_T = 8, GAP = 26, AXIS_H = 22;
+const CPU_H = 35, GPU_H = 35, PAD_T = 8, GAP = 26, AXIS_H = 22;
 const LAYER_H = D.has_layers ? 20 : 0;      // per-decode-layer swim lane
 const LGAP = D.has_layers ? 6 : 0;          // gap between GPU lane and layer lane
 const PHASE_H = D.has_phases ? 16 : 0;      // functional sub-block lane (finer)
@@ -2944,9 +3709,11 @@ if (IS_MULTI){
   sel.onchange=()=>{ location.hash='mode='+sel.value; location.reload(); };
 }
 document.getElementById('titletext').textContent =
+  (D.model_name ? D.model_name + '  --  ' : '') +
   D.title + (IS_PREFILL ? '  -- PREFILL' : '  -- DECODE');
+// Also set the browser tab/window title so a web-shared HTML self-identifies.
+document.title = (D.model_name ? D.model_name + ' -- ' : '') + 'rocprof unified viewer';
 document.getElementById('sub').textContent =
-  (D.model_name ? `${D.model_name} | ` : ``)+
   (IS_PREFILL ? `prefill: 1 forward pass` : `baked ${D.n_tokens_baked} tokens`)+
   ` | ${D.gpu.length} GPU slices | `+
   `${D.cpu.length} HIP calls | window GPU-busy ${fmtms(D.busy_ns)} / span `+
@@ -3599,18 +4366,23 @@ function renderFamilyMembers(){
   // the ~5% +24us artifact). The DISPLAYED table is scoped to a single complete
   // token cycle (this panel is "Kernel family/Token"), so it stays ~one token's
   // worth of rows instead of n_tokens_baked copies.
-  const allRows=[];
-  for(const s of D.gpu){ if(s.fam===fam && s.map) allRows.push(s); }
+  // Include EVERY dispatch of this family (mapped AND unmapped), so the table's row
+  // count == the summary's cnt/tok. Unmapped dispatches (order-map miss) render with
+  // blank shape/eff-BW cells but keep their # / kernel-time, so the count lines up and
+  // nothing is silently dropped. allRowsMapped is kept for the per-layer mode clustering
+  // (which needs the shape/L only mapped rows carry).
+  const allRows=[], allRowsMapped=[];
+  for(const s of D.gpu){ if(s.fam===fam){ allRows.push(s); if(s.map) allRowsMapped.push(s); } }
   const win=secondTokenWin();
   const rows = win ? allRows.filter(s=> s.s>=win.t0 && s.s<win.t1) : allRows.slice();
   if(!rows.length && allRows.length) rows.push(...allRows);
-  // Sort by SHAPE first (K, trueN, quant), then role, then layer, then exec time.
-  // Shape-primary keeps dispatches of identical [K x N] adjacent even when they
-  // belong to different roles that happen to share a shape (e.g. attn_k and attn_v
-  // are both 2560 x 1024 Q4_K in this model) -- role-first would wedge an unrelated
-  // shape between them.
+  // Sort: mapped rows by SHAPE first (K, trueN, quant, role, layer) so identical [K x N]
+  // dispatches sit together; unmapped rows (no map) sort to the end by exec time.
   rows.sort((a,b)=>{
     const ma=a.map, mb=b.map;
+    if(ma && !mb) return -1;
+    if(!ma && mb) return 1;
+    if(!ma && !mb) return a.s-b.s;
     if(ma.K!==mb.K) return ma.K-mb.K;
     if(ma.trueN!==mb.trueN) return ma.trueN-mb.trueN;
     if(ma.q!==mb.q) return ma.q<mb.q?-1:1;
@@ -3670,7 +4442,7 @@ function renderFamilyMembers(){
   // artifact bridge the gap). Per-layer medians are robust to that artifact.
   const med=a=>{const v=a.slice().sort((x,y)=>x-y);return v[Math.floor(v.length/2)];};
   const shp=new Map();
-  for(const s of allRows){ const m=s.map;
+  for(const s of allRowsMapped){ const m=s.map;   // mode clustering: mapped rows only (need shape/L)
     const k=m.role+'|'+m.K+'x'+m.trueN+'|'+m.q;
     if(!shp.has(k)) shp.set(k,new Map());
     const bl=shp.get(k); if(!bl.has(m.L)) bl.set(m.L,[]);
@@ -3691,7 +4463,8 @@ function renderFamilyMembers(){
   // then keeps eff BW as a secondary column; decode leads with eff BW.
   const compCols = IS_PREFILL
     ? `<th style="text-align:left">TOPS</th><th style="text-align:left">TOPS %</th>` : ``;
-  h+=`<table><thead><tr><th style="text-align:left">role</th>`+
+  h+=`<table><thead><tr><th style="text-align:left">#</th>`+
+     `<th style="text-align:left">role</th>`+
      `<th style="text-align:left">layer</th>`+
      `<th style="text-align:left">shape [K x N]</th><th style="text-align:left">packed</th>`+
      `<th style="text-align:left">kernel time</th>`+
@@ -3707,9 +4480,69 @@ function renderFamilyMembers(){
   const memBound=isBwBound(fam);
   // Shade alternating role+shape+layer groups so a weight's repeats cluster visually.
   let prevKey=null, band=0;
+  const nCol = IS_PREFILL ? 10 : 8;   // # role layer shape packed time [TOPS TOPS%] effbw eff% overfetch modes
+  // Per-shape (K x N x quant) MINIMUM kernel time across the shown rows -- the artifact-free
+  // floor, the best this kernel achieved on this shape. Highlight that row: a good indicator
+  // of kernel quality (the min is what the kernel CAN do; higher rows carry scheduling/
+  // timestamp noise). Key on the dispatch's real shape (shapeK/_ncol/shapeQ) so mapped and
+  // unmapped rows of the same shape share one floor.
+  const shapeMin=new Map();
+  const shapeKeyOf=(s)=>{
+    const K=s.map?s.map.K:s.shapeK, N=s.map?s.map.trueN:s._ncol, Q=s.map?s.map.q:s.shapeQ;
+    return (K&&N)?(K+'x'+N+'|'+(Q||'')):null;
+  };
+  for(const s of rows){ const k=shapeKeyOf(s); if(!k) continue;
+    const d=s.e-s.s; const cur=shapeMin.get(k);
+    if(cur==null || d<cur) shapeMin.set(k,d); }
+  const shapeMinShown=new Map();   // mark only the first row that hits each shape's floor
   rows.forEach((s,i)=>{
-    const m=s.map, dur=s.e-s.s;
-    const eb=dur?(m.packed/dur):0;
+    const m=s.map;
+    // Per-dispatch kernel time straight from the trace. NOTE: this is only honest when the
+    // trace was collected with HIP GRAPHS DISABLED (GGML_CUDA_DISABLE_GRAPHS=1) -- in graph
+    // mode gfx1151's GPU->host completion-signal End timestamps SMEAR for short back-to-back
+    // kernels (longk read 8.8us graph-off vs a bogus 106us graph-on median). Collect the
+    // sys-trace graphs-off for trustworthy per-shape times.
+    const dur=s.e-s.s;
+    const durIsDump=false;
+    // Is this the fastest dispatch of its shape (the floor)? Highlight it as the kernel-
+    // quality indicator. Only mark ONE row per shape even if several tie at the min.
+    const _sk=shapeKeyOf(s);
+    const isMin = _sk!=null && dur<=shapeMin.get(_sk) && (shapeMinShown.get(_sk)!==true);
+    if(isMin) shapeMinShown.set(_sk,true);
+    // Unmapped dispatch (order-map miss): no weight/shape attached. Still show it so the
+    // table count == the summary's cnt/tok -- keep #, kernel time, and dash the rest.
+    if(!m){
+      const emptyComp = IS_PREFILL ? `<td class="r">-</td><td class="r">-</td>` : ``;
+      // Even unmapped, we know the KxN shape from the dump (shapeK + launched-N _ncol),
+      // which is what matters for kernel optimization. Show it; only the weight NAME /
+      // eff-BW (which need the order-map) stay blank.
+      const shapeCell = (s.shapeK && s._ncol)
+        ? `${s.shapeK} x ${s._ncol}${s.shapeQ?` <span class="r">${s.shapeQ}</span>`:``}`
+        : `<span class="r">(unmapped)</span>`;
+      h+=`<tr class="shrow" data-idx="${i}" title="frame this dispatch in the timeline">`+
+         `<td class="r">${i+1}</td>`+
+         `<td class="r">-</td><td class="r">-</td>`+
+         `<td>${shapeCell}</td><td class="r">-</td>`+
+         `<td${isMin?` style="color:#5fe0a0;font-weight:700" title="fastest dispatch of this shape (floor)"`:``}>`+
+         `${fmtus(dur)}${isMin?' &#9733;':''}</td>`+ emptyComp +
+         `<td class="r">-</td><td class="r">-</td><td class="r">-</td>`+
+         `<td class="r">-</td></tr>`;
+      return;
+    }
+    // eff BW uses the CORRECTED per-shape value (m.effbw: dump-authoritative exact
+    // shape time when a roofline dump is present, else the nmatch-gated trace median),
+    // eff BW is PER-ROW: packed / THIS dispatch's own kernel time. This is a per-dispatch
+    // table, so each row shows its own achieved BW -- the whole point is to see the
+    // dispatch-to-dispatch variation (a slow row = a real slow dispatch OR the ~+24us
+    // gfx1151 timestamp smear, which the "modes" column flags). Earlier this used a global
+    // (fam,N,K) MEDIAN to dodge impossible >roofline values, but that was a packed-vs-wrong-
+    // dispatch mismatch bug (now fixed by the K-guard + dump shape lookup): with correct
+    // packed, packed/own-dur is honest, and flattening every row to one median hid exactly
+    // the per-dispatch signal this table exists to show.
+    // eff_packed = per-expert packed x experts_used for grouped MoE ops (the bytes the
+    // dispatch actually streams), else packed. Divides by THIS row's kernel time.
+    const _ep=(m.eff_packed!=null && m.eff_packed>0)?m.eff_packed:m.packed;
+    const eb=dur?(_ep/dur):0;
     const ep=D.peak_bw_gbs?(eb/D.peak_bw_gbs*100):0;
     // eff BW is INFORMATIONAL only for prefill (compute-bound) -> neutral color, no
     // flag. In decode (BW-bound) keep the low-BW red flag as before.
@@ -3726,11 +4559,13 @@ function renderFamilyMembers(){
     if(key!==prevKey){ band^=1; prevKey=key; }
     h+=`<tr class="shrow" data-idx="${i}" title="frame this dispatch in the timeline"`+
        (band?` style="background:rgba(255,255,255,.04)"`:``)+`>`+
+       `<td class="r">${i+1}</td>`+
        `<td style="color:#ffd479">${m.role}</td>`+
-       `<td>${m.L<0?'out':('L'+m.L)}</td>`+
-       `<td>${m.K} x ${m.trueN} <span class="r">${m.q}</span></td>`+
-       `<td>${KB(m.packed)}${m.fused?` <span class="r">(${m.fused})</span>`:``}</td>`+
-       `<td>${fmtus(dur)}</td>`+
+       `<td>${m.L<0?(m.shape_only?'unk':'out'):('L'+m.L)}</td>`+
+       `<td>${m.K} x ${m.trueN} <span class="r">${m.q}</span>${m.experts_used?` <b style="color:#ffd479">x${m.experts_used} exp</b>`:``}</td>`+
+       `<td>${KB(m.packed)}${m.experts_used?` <span class="r">/exp</span>`:``}${m.fused?` <span class="r">(${m.fused})</span>`:``}</td>`+
+       `<td${isMin?` style="color:#5fe0a0;font-weight:700" title="fastest dispatch of this ${m.K}x${m.trueN} shape -- the artifact-free floor (best achieved kernel time)"`:``}>`+
+       `${fmtus(dur)}${isMin?' &#9733;':''}</td>`+
        compCells+
        `<td style="color:${bwCol}">${eb.toFixed(1)} GB/s</td>`+
        `<td style="color:${bwCol}">${ep.toFixed(1)}%${lowBW?' <span class="r">(BW-bound)</span>':''}</td>`+
@@ -3741,10 +4576,14 @@ function renderFamilyMembers(){
            `${modeName[md.n]||md.n+'-modal'} <b>${md.ci+1}/${md.n}</b> `+
            `<span class="r">@${fmtus(md.c)}</span></td>`;})()+`</tr>`;
   });
+  const nUnmapped = rows.filter(s=>!s.map).length;
   h+=`</tbody></table>`+
-     `<div class="sub" style="margin-top:6px">Every order-mapped dispatch of `+
+     `<div class="sub" style="margin-top:6px">EVERY dispatch of `+
      `<b>${fam}</b> in one complete decode token, one row per dispatch `+
-     `(no averaging), ordered so same shape [K x N] sit together. <b>packed</b> = theoretical `+
+     `(no averaging), mapped rows first ordered by shape [K x N], then any unmapped rows. `+
+     `<b>#</b> is the row number (1..${rows.length}); this total = <b>cnt/tok</b> for ${fam} `+
+     `in the summary`+(nUnmapped?` (${rows.length-nUnmapped} order-mapped + ${nUnmapped} `+
+     `unmapped, shown with blank shape/BW cells)`:``)+`. <b>packed</b> = theoretical `+
      `on-disk weight bytes (gate+up folded when fused); <b>kernel time</b> = this dispatch's `+
      `measured Start->End (raw; ~5% of gfx1151 dispatches carry a ~+24us interrupt-latency `+
      `timestamp artifact -- visible as a lone inflated row); <b>modes</b> = this shape's `+
@@ -3754,8 +4593,11 @@ function renderFamilyMembers(){
      (IS_PREFILL?`<b>TOPS</b> = 2*N*K*B / kernel time (B=${D.compute_batch}, algorithmic `+
        `work; over-fetch/pad-immune) vs peak ${D.peak_tops} TOPS -- prefill's primary `+
        `(compute) roofline; <b>eff BW</b> is secondary. `
-       :`<b>eff BW</b> = packed / kernel time (over-fetch-immune, vs peak `+
-        `${D.peak_bw_gbs} GB/s). `)+
+       :`<b>&#9733;</b> marks the FASTEST dispatch of each shape (the artifact-free floor = best achieved kernel time, a kernel-quality indicator). `+
+        `<b>eff BW</b> = packed / THIS row's kernel time (per-dispatch, vs peak `+
+        `${D.peak_bw_gbs} GB/s). Rows carrying the ~+24us gfx1151 timestamp smear read low; `+
+        `the <b>modes</b> column flags them, and the artifact-free floor is the fastest row `+
+        `of each shape. `)+
      `Click a row to frame that dispatch in the timeline.</div>`;
   dp.innerHTML=h; dp.style.display='block';
   // Row click frames + selects that exact dispatch, reusing find's framing.
@@ -3837,12 +4679,28 @@ function renderSelectedKernel(){
        (m.padN?` <span class="r">(+${m.padN} padding rows vs true ${m.trueN})</span>`
              :` <span class="r">(== true N, no output-row padding)</span>`)+`</td></tr>`;
     if(m.padK) h+=`<tr><td>K block padding</td><td>+${m.padK} <span class="r">(to 256-elem quant block)</span></td></tr>`;
+    // MoE grouped dispatch: one mul_mat_id launch (grid.y = experts_used) computes several
+    // routed experts. Show the routed-expert count so the eff-BW numerator (per-expert packed
+    // x experts) is transparent.
+    if(m.experts_used) h+=`<tr><td>MoE experts routed</td><td style="color:#ffd479">${m.experts_used} `+
+       `<span class="r">(top_k; one mul_mat_id launch computes all ${m.experts_used} via grid.y)</span></td></tr>`;
     h+=`<tr><td>packed weights</td><td>${KB(m.packed)} <span class="r">(theoretical, on-disk`+
-       (m.fused?`, ${m.fused} fused`:``)+`)</span></td></tr>`;
+       (m.experts_used?`, PER expert`:``)+(m.fused?`, ${m.fused} fused`:``)+`)</span></td></tr>`+
+       (m.experts_used?`<tr><td>bytes streamed</td><td>${KB(m.eff_packed)} <span class="r">(${KB(m.packed)} x ${m.experts_used} routed experts -- the eff-BW numerator)</span></td></tr>`:``);
+    if(m.effbw_mismatch){
+      h+=`<tr><td>effective BW</td><td class="r" style="color:#ff6b6b">n/a `+
+       `<span class="r">(order-map N mismatch: weight N=${m.trueN} != launched N=${m.launchN}; `+
+       `byte/duration pairing unreliable -- raw ${m.effbw_raw} GB/s shown for reference)</span></td></tr>`; }
     if(m.effbw){ const memBound=isBwBound(s.fam), lowBW=memBound && m.effbw_pct>0 && m.effbw_pct<80;
+      // effbw is recomputed from the MEDIAN duration over all same-(fam,N,K) dispatches
+      // (not this one dispatch), so the gfx1151 timestamp smear + N-only kernel labelling
+      // can't produce an impossible >roofline single-dispatch value. No roofline clamp:
+      // if the median genuinely exceeds peak it is shown (a real signal). n=1 == raw.
+      const nn=m.effbw_n||1, robust=(m.effbw_src||(nn>1?`median of ${nn} disp`:`n=1, raw -- artifact-prone`));
       h+=`<tr><td>effective BW</td><td style="color:${lowBW?'#ff6b6b':'#8fe388'}">${m.effbw} GB/s `+
        `(${m.effbw_pct}% of ${D.peak_bw_gbs})${lowBW?' <span class="r">(BW-bound, <80% peak)</span>':''} `+
-       `<span class="r">(useful: packed / this dispatch time)</span></td></tr>`; }
+       `<span class="r">(useful: packed / ${m.effbw_med_us||'?'}&micro;s; ${robust})</span></td></tr>`+
+       `<tr><td>effbw (raw disp)</td><td class="r">${m.effbw_raw} GB/s <span class="r">(packed / THIS dispatch time; noisy -- gfx1151 smear)</span></td></tr>`; }
     if(m.measured){ const src=m.mexact?'per-weight (order-mapped)':'family+N avg';
       h+=`<tr><td>FETCH_SIZE</td><td>${KB(m.measured)} <span class="r">(measured DRAM read, ${src})</span></td></tr>`+
          `<tr><td>over-fetch</td><td>${m.overfetch}x <span class="r">(FETCH_SIZE / packed; ${src})</span></td></tr>`; }
@@ -4095,39 +4953,75 @@ function openLayerGraph(L){
   // unmapped dispatch into its layer (by time span) and, within a layer, collect its
   // per-family dispatch times in execution order. A graph node then joins by
   // op->family + order (the cgraph nodes are topologically sorted == execution order).
+  // op -> kernel-family regex, for the UNMAPPED single-family ops (norms, elementwise,
+  // unary, ...). Deliberately NO MUL_MAT here: a layer runs several matvec families
+  // (Q4_K/Q5_K/Q8_0/...) and the checked-in skeleton's matmul nodes neither 1:1-count nor
+  // role-align with the trace's matvec dispatches, so an order-join would mislabel them.
+  // Matmul nodes instead get their exact family from the GGUF order-map (see mvByRole).
   const OP2FAM={RMS_NORM:/rms_norm/i, L2_NORM:/l2_norm/i, ADD:/bin_bcast|_add|^add/i,
     MUL:/bin_bcast|_mul|^mul(?!_mat)/i, GET_ROWS:/get_rows/i, ROPE:/rope/i,
     SOFT_MAX:/soft_max/i, SCALE:/scale/i, CPY:/cpy|dup|cont/i, CONT:/cpy|cont/i,
-    UNARY:/unary|silu|gelu|relu/i, CONV:/conv/i, SSM_CONV:/conv/i};
+    UNARY:/unary|silu|gelu|relu/i, SILU:/silu|unary/i, GEGLU:/gelu|unary/i,
+    CONV:/conv/i, SSM_CONV:/conv/i};
   const layerOfSlice=(t)=>{ for(const Lo of (D.layers||[])){ if(t>=Lo.s&&t<=Lo.e) return Lo.L; } return null; };
   const famSeq={};  // L -> fam -> [dispatch times in execution order]
   const _sl=D.gpu.slice().sort((a,b)=>a.s-b.s);
   for(const s of _sl){ if(s.map && s.map.nm) continue; const Ls=layerOfSlice(s.s); if(Ls==null) continue;
     (famSeq[Ls]=famSeq[Ls]||{}); (famSeq[Ls][s.fam]=famSeq[Ls][s.fam]||[]).push(s.e-s.s); }
   const famCtr={};  // L|fam -> next unconsumed index
+  // ROLE-driven join: the skeleton bakes each matmul node's weight ROLE (attn_q, ffn_down,
+  // ...). This run's GGUF order-map already tags every matvec dispatch with (role, L) plus
+  // its LIVE per-size K/trueN and the ACTUAL kernel family that ran. So a node -> its
+  // dispatch is an exact (L, role) lookup -- no dump at view time, correct for any model
+  // size, and the family/KxN always match this run's build + this model. runByRole:
+  // "L|role" -> {fam, K, N}. (role is arch-stable; K/N scale with size, read live here.)
+  const runByRole={};
+  for(const s of D.gpu){ const m=s.map;
+    if(m && m.role!=null && m.L!=null){ const k=m.L+'|'+m.role;
+      if(!runByRole[k]) runByRole[k]={fam:s.fam, K:m.K, N:m.trueN}; } }
   const nodes=[];
   const push=(nd,isext)=>{
     // A trace-derived graph carries its own measured time on the node (node.us_in,
     // nanoseconds) -- it IS a real dispatch, so trust it directly as an exact match.
     let t=(nd.us_in!=null)?nd.us_in:((timeByName[nd.name]!=null)?timeByName[nd.name]/cntByName[nd.name]:null);
     let tsrc=(t!=null)?'name':null;
+    // matchedFam = the real kernel family this topology node resolved to (via op->family +
+    // execution order). Topology-skeleton nodes carry no kernel name, so we borrow the
+    // family from the actual swim-lane dispatch that the fam-join lands on, and use it as
+    // the display label (so nodes read "mul_mat_vec_q" / "rms_norm_f32", not "MUL_MAT").
+    let matchedFam=null;
     if(t==null && !isext){
       const rx=OP2FAM[nd.op]; const Ln=nd.L;
       if(rx!=null && famSeq[Ln]){
         for(const fam in famSeq[Ln]){ if(rx.test(fam)){
           const key=Ln+'|'+fam, c=famCtr[key]||0;
-          if(c<famSeq[Ln][fam].length){ t=famSeq[Ln][fam][c]; famCtr[key]=c+1; tsrc='fam'; break; }
+          if(c<famSeq[Ln][fam].length){ t=famSeq[Ln][fam][c]; famCtr[key]=c+1; tsrc='fam'; matchedFam=fam; break; }
         } }
       }
     }
-    nodes.push({i:nd.i, name:nd.name||('#'+nd.i), op:nd.op||'?', ne:nd.ne||[], type:nd.type||'',
+    // Resolve the node's kernel + shape. A matmul node carries a baked ROLE -> look up THIS
+    // run's actual dispatch for (L, role): its live family + KxN. Else (norms/unary/elementwise)
+    // use the op->family fam-join (matchedFam). Else the generic ggml op. Explicit nd.fam from
+    // a dump/trace graph wins. runNE = live [K, N] for the node, shown on the graph.
+    // Prefer the LIVE run's family (matches the swim lane + this build's kernel variant);
+    // the skeleton's baked nd.fam is only a fallback when this run has no dispatch for the role.
+    // A shared-name node can carry several candidate roles (nd.roles); pick the one that has a
+    // live dispatch in THIS layer (a GDN layer runs ssm_*, an attention layer runs attn_qkv --
+    // same "node" cb-name, different role per layer type). Fall back to nd.role.
+    let rr=null, useRole=nd.role||'';
+    const cand=(nd.roles&&nd.roles.length)?nd.roles:(nd.role?[nd.role]:[]);
+    for(const rl of cand){ const hit=runByRole[nd.L+'|'+rl]; if(hit){ rr=hit; useRole=rl; break; } }
+    const joinFam=(rr&&rr.fam)||nd.fam||matchedFam||nd.op||'';
+    const runNE=(rr&&rr.K&&rr.N)?[rr.K, rr.N]:(nd.ne||[]);
+    nodes.push({i:nd.i, name:nd.name||('#'+nd.i), op:nd.op||'?', ne:runNE, type:nd.type||'',
+      role:useRole,
       // fam = kernel family (matches the swim-lane label); the join key for selection sync
-      fam:(nd.fam||nd.op||''),
+      fam:joinFam,
       // kernels = the GPU kernels this op launched (a quantized matmul folds a
       // quantize_q8_1 prep + the matvec); surfaced on hover so nothing is hidden.
       kernels:(nd.kernels||[]),
       // label = display name (fam, or the ggml op for generic kernels like k_bin_bcast)
-      label:(nd.label||nd.fam||nd.op||''),
+      label:(nd.label||joinFam),
       src:(nd.src||[]).filter(x=>idset.has(x)||ext.has(x)), ext:!!isext,
       us:t!=null?t/1000:null, tsrc:tsrc, chain:!!nd.chain,
       // dispatch span (overlay-relative ns) for span-based sync when available (older
@@ -4309,6 +5203,10 @@ function openLayerGraph(L){
     `g.fillStyle='#e8eef5';g.fillText(flabel,pd.x+8,pd.y+14);`+
     `g.fillStyle='#aeb9c7';var nm=nd.name.length>26?nd.name.slice(0,25)+'\\u2026':nd.name;`+
     `g.fillText(nm,pd.x+8,pd.y+29);`+
+    // line 3 (right-aligned) = live weight shape KxN (from the loaded GGUF via role), so a
+    // matmul node shows the exact dimensions it multiplies for THIS model size.
+    `if(nd.ne&&nd.ne.length>=2&&nd.ne[0]&&nd.ne[1]){g.fillStyle='#7f8fa3';g.textAlign='right';`+
+    `g.fillText(nd.ne[0]+'\\u00d7'+nd.ne[1],pd.x+BW-8,pd.y+29);g.textAlign='left';}`+
     `if(nd.us!=null){g.fillStyle=nd.tsrc==='fam'?'#c8d98a':'#8fe388';`+
     `g.fillText(nd.us.toFixed(1)+' \\u00b5s'+(nd.tsrc==='fam'?' ~':''),pd.x+8,pd.y+44);}`+
     // badge: a "+N" chip when this op folds >1 GPU kernel (e.g. quantize + matmul)
@@ -4343,7 +5241,9 @@ function openLayerGraph(L){
     `if(!nd||!nd.kernels||!nd.kernels.length){ktip.style.display='none';return;}`+
     `var h='<b>'+esc(nd.op)+'</b> &middot; '+esc(nd.name)+'<br>';`+
     `for(var k=0;k<nd.kernels.length;k++){var kk=nd.kernels[k];`+
-    `h+='<span style=\"color:#8fe388\">'+kk.us.toFixed(1)+' us</span>  '+esc(kk.fam)+'<br>';}`+
+    // us is present for dump/trace graphs; the checked-in skeleton carries fam only.
+    `var ut=(kk.us!=null)?('<span style=\"color:#8fe388\">'+kk.us.toFixed(1)+' us</span>  '):'';`+
+    `h+=ut+esc(kk.fam||kk.name||'')+'<br>';}`+
     `ktip.innerHTML=h;ktip.style.display='block';`+
     `ktip.style.left=Math.min(e.clientX-r.left+14,r.width-330)+'px';`+
     `ktip.style.top=(e.clientY-r.top+14)+'px';});`+

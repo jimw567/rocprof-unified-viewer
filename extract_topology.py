@@ -23,6 +23,11 @@ import os
 import re
 import sys
 
+# Reuse the viewer's OWN kernel-name -> family normalizer so the baked-in node families
+# match exactly what the swim lane / order-map produce at view time.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from rocprof_unified_viewer import family_of  # noqa: E402
+
 # Strip per-layer indices ANYWHERE in the name so structurally-identical layers collapse:
 #   Qcur-23 -> Qcur, cache_k_l12 (view) -> cache_k (view), node_1343 -> node,
 #   conv_state_update (copy of conv_state_last-41) -> conv_state_update (copy of conv_state_last)
@@ -72,31 +77,211 @@ def _arch_key(gguf_path):
     return "%s-%s" % (arch, fp), arch, roles
 
 
-def skeleton(dump_path):
-    """Reduce a roofline dump to its structural skeleton: dedup layer/token repeats,
-    keep name-normalized (op, edges). Edges via storage-id last-writer-wins, mapped to
-    the PRODUCER's normalized name. Returns {"nodes":[{name,op,src:[names]}], ...}."""
+_GGML_QUANT = {0: "f32", 1: "f16", 8: "q8_0", 10: "q2_K", 11: "q3_K", 12: "q4_K",
+               13: "q5_K", 14: "q6_K", 15: "q8_K", 30: "bf16", 39: "mxfp4"}
+
+
+def gguf_role_shape(gguf_path):
+    """Read the gguf and return {(K, N, quant): [roles...]} plus a set of all roles.
+
+    Each per-block weight blk.<L>.<role>.weight has ggml dims [K, N, ...] and a quant.
+    We key by (K, N, quant) so a dump node's weight [K,N]+quant can be matched back to its
+    ROLE with zero hand-authoring -- the shape+quant of a role is fixed by the architecture
+    (a role's dims scale with model size, but within ONE model the mapping is exact). Ties
+    (two roles sharing a shape, e.g. attn_k/attn_v, ffn_gate/ffn_up) are returned as a list
+    for the caller to disambiguate by execution order."""
+    import importlib.util
+    here = os.path.dirname(os.path.abspath(__file__))
+    spec = importlib.util.spec_from_file_location(
+        "ruv", os.path.join(here, "rocprof_unified_viewer.py"))
+    ruv = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ruv)
+    tensors, _ = ruv.load_gguf_tensors(gguf_path)
+    by_shape = {}
+    for t in tensors:
+        nm = t.get("name", "")
+        ne = t.get("ne") or []
+        m = re.match(r"^blk\.\d+\.(.+)\.weight$", nm)
+        if not m or len(ne) < 2:
+            # the non-block output projection ("output.weight" / "token_embd.weight")
+            m2 = re.match(r"^(output|token_embd)\.weight$", nm)
+            if not (m2 and len(ne) >= 2):
+                continue
+            role = m2.group(1)
+        else:
+            role = m.group(1)
+        q = _GGML_QUANT.get(t.get("gt"), str(t.get("gt")))
+        key = (ne[0], ne[1], q)
+        by_shape.setdefault(key, [])
+        if role not in by_shape[key]:
+            by_shape[key].append(role)
+    return by_shape
+
+
+def _row_fam(r):
+    """The real kernel FAMILY a dump row's op ran as -- the matvec/gemm kernel, skipping
+    the quantize_q8_1 prep subkernel. Returns "" if the row launched no informative kernel
+    (a structural/elementwise op the viewer already labels from the trace). Stable per
+    node across layers/tokens (a Q5_K qkv is always the same kernel), which is what lets us
+    bake it into the checked-in skeleton and skip the dump at view time."""
+    ks = r.get("kernels") or []
+    mm = [k for k in ks if any(t in k.get("name", "")
+                               for t in ("mul_mat", "wvsplitk", "gemm"))]
+    pick = (mm[-1] if mm else (ks[-1] if ks else None))
+    return family_of(pick["name"]) if pick and pick.get("name") else ""
+
+
+def _row_kernels(r):
+    """The GPU kernel families this op FOLDS, in launch order (e.g. a quantized matmul folds
+    quantize_q8_1 then mul_mat_vec_q). Baked into the skeleton so the graph node shows a
+    "+Nk" badge + hover breakdown for its prep kernels -- the quantize step is otherwise
+    invisible (it is not a ggml op, just a sub-kernel). List of family strings; the kernel
+    VARIANT is build-dependent but the fact that a matmul folds a quantize is arch-stable."""
+    return [family_of(k.get("name", "")) for k in (r.get("kernels") or []) if k.get("name")]
+
+
+# Node-name fragment -> role SUBSTRING. A shape-tie (roles sharing K,N,quant) is broken by
+# the dump node's cb() name: Kcur -> a role containing "attn_k", ffn_moe_gate -> a role
+# containing "ffn_gate" (matches both dense "ffn_gate" and MoE "ffn_gate_exps"). Ordered so
+# the most specific fragment wins first (gate/up/down before the bare attn_q/k/v).
+_ROLE_HINT = [
+    ("gate", "ffn_gate"), ("up", "ffn_up"), ("down", "ffn_down"),
+    ("alpha", "ssm_alpha"), ("beta", "ssm_beta"),
+    ("kcur", "attn_k"), ("vcur", "attn_v"), ("qcur", "attn_q"),
+]
+
+
+def _match_role(rk, K, N, quant, tie_ctr, nm=""):
+    """Match a dump matmul node to its GGUF weight ROLE by (K, N, quant). rk is the gguf's
+    {(K,N,quant): [roles]}. On a shape TIE (>1 role shares the shape, e.g. attn_k/attn_v or
+    the three MoE experts ffn_{gate,up,down}_exps), first try to break it with the node's own
+    cb() NAME (Kcur -> attn_k, ffn_moe_gate -> ffn_gate_exps); if the name is uninformative,
+    fall back to handing out the tied roles in execution order via tie_ctr. Returns "" if no
+    gguf weight has this shape (a non-weight matmul, e.g. an attention score GEMM)."""
+    roles = rk.get((K, N, quant)) or rk.get((N, K, quant))
+    if not roles:
+        return ""
+    if len(roles) == 1:
+        return roles[0]
+    low = nm.lower()
+    for frag, sub in _ROLE_HINT:
+        if frag in low:
+            hit = next((r for r in roles if sub in r), None)
+            if hit:
+                return hit
+    key = (K, N, quant)
+    i = tie_ctr.get(key, 0)
+    tie_ctr[key] = i + 1
+    return roles[i % len(roles)]
+
+
+def _first_pass_rows(rows):
+    """A decode dump replays the whole graph once per token; keep just the first pass so the
+    skeleton is one forward pass (all layers once), cut at the terminal lm_head op."""
+    terms = ("result_output", "result_embd", "result_norm")
+    for i, r in enumerate(rows):
+        if str(r.get("name", "")) in terms:
+            return rows[:i + 1]
+    return rows
+
+
+def skeleton(dump_path, role_shape=None):
+    """Reduce a roofline dump to a one-block structural skeleton with INDEX-based edges.
+
+    Edges are the crux: the dump's storage-ids give an exact producer->consumer DAG. Rather
+    than fold all layers together (a name-signature collapse creates cross-layer forward
+    edges -> CYCLES, which break the layered layout), we extract ONE representative interior
+    layer verbatim, in execution order: its edges only point backward within the block, so
+    it is a clean DAG and connected. Intra-block edges become node indices; edges reaching
+    OUTSIDE the block (the residual read from the previous layer) are dropped here and
+    re-threaded per layer by the expander. An interior layer is used (not the first) so the
+    block is fully formed -- the first layer reads the token embedding, not a residual.
+
+    Each node also carries the kernel identity it ran as -- quant, family, and the WEIGHT
+    ROLE (matched to the gguf by shape+quant) -- all stable per architecture, so the viewer
+    names graph nodes and derives live per-size KxN (role -> loaded gguf weight) from a plain
+    --gguf overlay, no roofline dump at view time. Returns
+    {"nodes":[{name,op,src:[idx],fam,quant,role,roles}], ...}."""
+    role_shape = role_shape or {}
     g = json.load(open(dump_path))
     rows = sorted(g.get("rows") or [], key=lambda r: r.get("invocation", 0))
-    writer = {}          # storage_id -> normalized producer name
-    seen = set()
-    nodes = []
+    rows = _first_pass_rows(rows)
+
+    # 1) full first-pass graph, edges = producing node index (last-writer-wins). This is a
+    # strict DAG: a src is always an EARLIER row (its writer ran before this consumer).
+    writer = {}          # storage_id -> node index that last wrote it
+    full = []
+    tie_ctr = {}
     for r in rows:
         nm = _norm_name(r.get("name", ""))
         srcs = []
         for sid in (r.get("in_storage_ids") or []):
             w = writer.get(sid)
-            if w is not None and w != nm:
+            if w is not None:
                 srcs.append(w)
-        srcs = sorted(dict.fromkeys(srcs))
-        key = (nm, r.get("ggml_op"), tuple(srcs))
-        if key not in seen:
-            seen.add(key)
-            nodes.append({"name": nm, "op": r.get("ggml_op", "?"), "src": srcs})
+        role = ""
+        if r.get("ggml_op") in ("MUL_MAT", "MUL_MAT_ID"):
+            sne = (r.get("src_ne") or [[None, None]])[0]
+            if sne and sne[0] and sne[1]:
+                role = _match_role(role_shape, sne[0], sne[1], (r.get("quant") or ""),
+                                   tie_ctr, nm)
+        idx = len(full)
+        full.append({"name": nm, "op": r.get("ggml_op", "?"),
+                     "src": [s for s in dict.fromkeys(srcs) if s < idx],
+                     "fam": _row_fam(r), "quant": (r.get("quant") or ""), "role": role,
+                     "kernels": _row_kernels(r)})
         out = r.get("out_storage_id")
         if out is not None:
-            writer[out] = nm
+            writer[out] = idx
+
+    # 2) pick ONE real layer block by the raw name's layer suffix (blk index). The dump tags
+    # per-layer ops as "<name>-<L>" (cb() layer tag), so a whole layer is the rows whose raw
+    # name ends in "-<L>". We use the layer that has the MOST tagged ops (a fully-formed
+    # interior layer -- some archs' layer 0 is special), avoiding any period guessing.
+    span = _layer_span(rows)
+    if span is None:
+        # no per-layer tags: fall back to the whole first pass (still a valid DAG, just larger)
+        lo, hi = 0, len(full)
+    else:
+        lo, hi = span
+
+    # 3) re-index the block to 0-based; keep only intra-block edges (outside = the residual
+    # read from the previous layer, re-threaded per layer by the expander).
+    nodes = []
+    for j in range(lo, hi):
+        n = full[j]
+        srcs = [s - lo for s in n["src"] if lo <= s < hi and (s - lo) != j]
+        nd = {"name": n["name"], "op": n["op"], "src": list(dict.fromkeys(srcs)),
+              "fam": n["fam"], "quant": n["quant"], "role": n["role"]}
+        if n["role"]:
+            nd["roles"] = [n["role"]]
+        # folded sub-kernels (e.g. quantize_q8_1 prep) so the node shows a +Nk badge; drop
+        # empties and keep only when there is a prep kernel beyond the main matvec.
+        ker = [k for k in (n.get("kernels") or []) if k]
+        if len(ker) > 1:
+            nd["kernels"] = [{"fam": k} for k in ker]
+        nodes.append(nd)
     return {"nodes": nodes}
+
+
+def _layer_span(rows):
+    """Return (lo, hi) row indices delimiting the single most-complete layer block, using the
+    dump's raw "<name>-<L>" cb() layer tags. Returns None if the dump carries no layer tags.
+    The chosen block is a contiguous run of rows sharing one layer index L (the L with the
+    most tagged ops), extended to include the untagged ops interleaved within its span."""
+    tag = re.compile(r"-(\d+)(?:\s|$|\))")
+    layer_rows = {}      # L -> [row idx, ...]
+    for i, r in enumerate(rows):
+        m = tag.search(str(r.get("name", "")))
+        if m:
+            layer_rows.setdefault(int(m.group(1)), []).append(i)
+    if not layer_rows:
+        return None
+    # the busiest layer = most fully captured; take its contiguous [min, max] row span so the
+    # untagged ops (views, cache ops) that sit between its tagged ops are included in order.
+    best_L = max(layer_rows, key=lambda L: len(layer_rows[L]))
+    idxs = layer_rows[best_L]
+    return (idxs[0], idxs[-1] + 1)
 
 
 def main():
@@ -116,7 +301,8 @@ def main():
             print("skip (no dump)", file=sys.stderr)
             continue
         key, arch, roles = _arch_key(m["path"])
-        sk = skeleton(dump)
+        role_shape = gguf_role_shape(m["path"])
+        sk = skeleton(dump, role_shape)
         b = by_key.setdefault(key, {"arch": arch, "roles": roles, "sks": [], "n": 0})
         b["sks"].append(sk["nodes"])
         b["n"] += 1
