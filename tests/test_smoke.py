@@ -151,7 +151,7 @@ def test_model_name_field(tmp_path):
 def test_model_name_from_clean_tps(tmp_path):
     # Model name must appear in the title WITHOUT --gguf, recovered from clean_tps.txt's
     # model_filename (basename, minus .gguf). This is the "show the model in the title
-    # regardless" behavior — collect.sh always emits clean_tps.txt.
+    # regardless" behavior -- collect.sh always emits clean_tps.txt.
     html = _gen(tmp_path, "--clean-tps-file",
                 os.path.join(FIX, "decode_clean_tps.json"))
     raw = _raw(html)

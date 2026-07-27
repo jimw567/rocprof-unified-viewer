@@ -177,6 +177,27 @@ def peak_tops_for(arch, override=None):
     return PEAK_TOPS_BY_ARCH.get(arch)
 
 
+# Per-MODEL-architecture token-boundary segmentation profile. NOTE: keyed by the GGUF
+# `general.architecture` (qwen35moe, gptoss, ...), NOT the GPU arch (gfx1151) used by the
+# dicts above -- decode cadence is a property of the model's graph, not the board. Model
+# architectures move far slower than this viewer, so hardcoding per-arch here is fine and
+# is exactly what keeps a tweak for one arch from perturbing another.
+#   method: "head" = output-head anchor only (robust for eager MoE, where the gap
+#                    detector finds no clean cadence); "gap" = inter-dispatch gap detector
+#                    at gap_us; "auto" = head first, gap fallback (the historical default).
+#   gap_us: threshold (us) for the gap detector; None = use --gap-threshold-us / its default.
+BOUNDARY_PROFILES = {
+    "qwen35moe": {"method": "head", "gap_us": None},   # hybrid GDN/MoE, runs eager
+    "qwen3moe":  {"method": "head", "gap_us": None},    # MoE, runs eager
+    "gptoss":    {"method": "gap",  "gap_us": 10.0},    # head-anchor under-segments; needs a low gap
+    "_default":  {"method": "auto", "gap_us": None},    # unknown/dense: head then gap fallback
+}
+
+
+def boundary_profile_for(arch):
+    return BOUNDARY_PROFILES.get(arch or "", BOUNDARY_PROFILES["_default"])
+
+
 def family_of(kernel_name):
     """Normalize a mangled/templated kernel name to a family (the same
     aggregation used when collecting PMC, so PMC families join onto trace slices).
@@ -2134,9 +2155,15 @@ def add_common_args(ap):
                          "state past warmup/prefill (default 30)")
     ap.add_argument("--context-tokens", type=int, default=0,
                     help="extra tokens baked on each side for the stepper (default 0)")
-    ap.add_argument("--gap-threshold-us", type=float, default=150.0,
+    ap.add_argument("--gap-threshold-us", type=float, default=None,
                     help="inter-dispatch gap (us) that marks a token boundary "
-                         "(default 150)")
+                         "(default 150; a per-arch BOUNDARY_PROFILES value may apply "
+                         "instead unless this is set explicitly)")
+    ap.add_argument("--boundary-method", choices=("head", "gap", "auto"), default=None,
+                    help="override token-boundary detection method for this run "
+                         "(default: per-arch BOUNDARY_PROFILES, else auto). head = "
+                         "output-head anchor; gap = inter-dispatch gap; auto = head "
+                         "then gap fallback")
     ap.add_argument("--kv-context-tokens", type=int, default=-1,
                     help="context length (tokens) to size the KV-cache traffic in "
                          "the 'eff token BW%%' footer metric. KV bytes/token = "
@@ -2158,6 +2185,13 @@ def main():
 
 
 def build_payload(args):
+    # Normalize the gap-threshold sentinel: None default means "not set explicitly", so a
+    # per-arch BOUNDARY_PROFILES gap_us may apply. Resolve to 150us for the paths that use
+    # it unconditionally (prefill span, regen-command echo). Runs for both the CLI generator
+    # and serve.py, since both call build_payload.
+    args._gap_threshold_set = args.gap_threshold_us is not None
+    if args.gap_threshold_us is None:
+        args.gap_threshold_us = 150.0
     peak_bw = peak_bw_for(args.arch, args.peak_bw)
     peak_tops = peak_tops_for(args.arch, args.peak_tops)
     # Surface the roofline peaks next to the arch string in the title (e.g.
@@ -2178,6 +2212,14 @@ def build_payload(args):
     # Compute stream = the one with the most dispatches (stream 1 is model load).
     sid = max(by_stream, key=lambda s: len(by_stream[s]))
     evs = by_stream[sid]
+
+    # Load the GGUF (tensor table + meta) up front so the model architecture is known
+    # BEFORE token-boundary detection -- the boundary profile is arch-specific. Cheap
+    # (mmap, no weight bytes read). Empty meta for trace-only runs -> _default profile.
+    gguf_tensors, gguf_meta = ([], {})
+    if args.gguf:
+        gguf_tensors, gguf_meta = load_gguf_tensors(args.gguf)
+    model_arch = gguf_meta.get("general.architecture", "")
 
     if args.mode == "prefill":
         # Prefill = ONE prompt-processing forward pass (MMQ GEMMs), not the periodic
@@ -2219,21 +2261,35 @@ def build_payload(args):
         view_i0 = 0
         view_i1 = 1
     else:
-        # Prefer the output-head anchor (robust in both graph-replay and EAGER mode);
-        # fall back to the inter-dispatch gap detector when there is no clear periodic
-        # head (older traces / non-standard decode). The head anchor is what makes
-        # token segmentation work for MoE models that run eager (graphs disabled above
-        # the mmvq mul_mat_id batch cap), where the gap detector finds no clean cadence.
-        bounds = detect_boundaries_by_head(evs)
-        if len(bounds) < args.skip_tokens + args.tokens + 2:
-            gap_bounds = detect_boundaries(evs, args.gap_threshold_us * 1000)
-            if len(gap_bounds) > len(bounds):
-                bounds = gap_bounds
+        # Token segmentation strategy is chosen per model architecture (see
+        # BOUNDARY_PROFILES). The two detectors stay generic; the profile only picks
+        # which one + threshold. --boundary-method overrides the profile's method;
+        # --gap-threshold-us (if set) overrides the profile's gap_us.
+        prof = boundary_profile_for(model_arch)
+        method = args.boundary_method or prof["method"]
+        # Gap threshold precedence: explicit CLI flag > profile gap_us > flag default.
+        gap_us = args.gap_threshold_us
+        if not args._gap_threshold_set and prof["gap_us"] is not None:
+            gap_us = prof["gap_us"]
+
+        # "head" = output-head anchor only (robust for eager MoE); "gap" = inter-dispatch
+        # gap detector; "auto" = head first, gap fallback (the historical default, used
+        # for unknown/dense archs where either can work).
+        if method == "head":
+            bounds = detect_boundaries_by_head(evs)
+        elif method == "gap":
+            bounds = detect_boundaries(evs, gap_us * 1000)
+        else:  # "auto"
+            bounds = detect_boundaries_by_head(evs)
+            if len(bounds) < args.skip_tokens + args.tokens + 2:
+                gap_bounds = detect_boundaries(evs, gap_us * 1000)
+                if len(gap_bounds) > len(bounds):
+                    bounds = gap_bounds
         if len(bounds) < args.skip_tokens + args.tokens + 2:
             sys.exit(f"error: only {len(bounds)} token boundaries detected "
-                     f"(head-anchor + gap fallback); need > "
-                     f"{args.skip_tokens + args.tokens}. Lower --skip-tokens "
-                     f"or --gap-threshold-us.")
+                     f"(arch={model_arch or 'unknown'}, method={method}); need > "
+                     f"{args.skip_tokens + args.tokens}. Lower --skip-tokens, "
+                     f"try --boundary-method, or lower --gap-threshold-us.")
 
         # Bake a wider span (context on each side) so the stepper can pan.
         lo_tok = max(0, args.skip_tokens - args.context_tokens)
@@ -2326,10 +2382,9 @@ def build_payload(args):
     #  - prefill: matmul kernel = mul_mat_q; reference = the WHOLE baked forward pass
     #             (one pass, no per-token repeat). N recovered as grid.x*mmq_y (above).
     expected_seq = []
-    gguf_meta = {}
+    # gguf_tensors/gguf_meta already loaded up front (before boundary detection).
     mm_key = "mul_mat_q" if args.mode == "prefill" else "mul_mat_vec"
     if args.gguf:
-        gguf_tensors, gguf_meta = load_gguf_tensors(args.gguf)
         if args.mode == "prefill":
             ref = [n for (s, e, nm, n, _nb, _gy) in baked if mm_key in nm and n]
         else:
@@ -3136,8 +3191,10 @@ def build_payload(args):
         regen_parts.append("--skip-tokens %d" % args.skip_tokens)
     if args.context_tokens:
         regen_parts.append("--context-tokens %d" % args.context_tokens)
-    if args.gap_threshold_us != 150.0:
+    if args._gap_threshold_set and args.gap_threshold_us != 150.0:
         regen_parts.append("--gap-threshold-us %g" % args.gap_threshold_us)
+    if args.boundary_method:
+        regen_parts.append("--boundary-method " + args.boundary_method)
     att_cmd = {
         "script": os.path.join(_self_dir, "collect-att.sh"),
         "build_dir": os.path.abspath(args.build_dir) if args.build_dir
