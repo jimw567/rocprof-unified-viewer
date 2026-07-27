@@ -65,7 +65,7 @@ def _stream(n_tokens, *, gap):
 def test_known_archs_resolve_to_expected_profiles():
     assert boundary_profile_for("qwen35moe")["method"] == "head"
     assert boundary_profile_for("qwen3moe")["method"] == "head"
-    p = boundary_profile_for("gptoss")
+    p = boundary_profile_for("gpt-oss")
     assert p["method"] == "gap" and p["gap_us"] == 10.0
 
 
@@ -107,7 +107,7 @@ def test_arch_streams_are_independent():
     gpt = _stream(6, gap=20_000)     # gptoss (gap @ 10us)
 
     moe_bounds = detect_boundaries_by_head(moe)
-    gpt_bounds = detect_boundaries(gpt, boundary_profile_for("gptoss")["gap_us"] * 1000)
+    gpt_bounds = detect_boundaries(gpt, boundary_profile_for("gpt-oss")["gap_us"] * 1000)
 
     # Perturb the gptoss cadence (more tokens, still a >10us inter-token gap); the MoE
     # head segmentation must be untouched.

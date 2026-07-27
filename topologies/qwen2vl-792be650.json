@@ -7,142 +7,251 @@
   {
    "name": "norm",
    "op": "RMS_NORM",
-   "src": []
+   "src": [],
+   "fam": "rms_norm_f32",
+   "quant": "f32",
+   "role": ""
   },
   {
    "name": "Qcur",
    "op": "MUL_MAT",
    "src": [
-    "norm"
+    0,
+    13
+   ],
+   "fam": "mul_mat_vec_q[Q4_K]",
+   "quant": "q4_K",
+   "role": "attn_q",
+   "roles": [
+    "attn_q"
    ]
   },
   {
    "name": "Qcur",
    "op": "ROPE",
-   "src": []
+   "src": [
+    1
+   ],
+   "fam": "rope_multi",
+   "quant": "f32",
+   "role": ""
   },
   {
    "name": "Vcur",
    "op": "MUL_MAT",
    "src": [
-    "norm"
+    0,
+    13
+   ],
+   "fam": "mul_mat_vec_q[Q6_K]",
+   "quant": "q6_K",
+   "role": "attn_v",
+   "roles": [
+    "attn_v"
    ]
   },
   {
    "name": "Kcur",
    "op": "MUL_MAT",
    "src": [
-    "norm"
+    0,
+    13
+   ],
+   "fam": "mul_mat_vec_q[Q4_K]",
+   "quant": "q4_K",
+   "role": "attn_k",
+   "roles": [
+    "attn_k"
    ]
   },
   {
    "name": "Kcur",
    "op": "ROPE",
-   "src": []
+   "src": [
+    4
+   ],
+   "fam": "rope_multi",
+   "quant": "f32",
+   "role": ""
   },
   {
    "name": "cache_k (view)",
    "op": "SET_ROWS",
    "src": [
-    "Kcur"
-   ]
+    5
+   ],
+   "fam": "k_set_rows",
+   "quant": "f32",
+   "role": ""
   },
   {
    "name": "cache_v (view)",
    "op": "SET_ROWS",
    "src": [
-    "Vcur"
-   ]
+    3
+   ],
+   "fam": "k_set_rows",
+   "quant": "f32",
+   "role": ""
   },
   {
    "name": "node",
    "op": "FLASH_ATTN_EXT",
    "src": [
-    "Qcur",
-    "cache_k (view)",
-    "cache_v (view)"
-   ]
+    2,
+    6,
+    7
+   ],
+   "fam": "flash_attn_combine_results",
+   "quant": "f32",
+   "role": ""
   },
   {
    "name": "node",
    "op": "MUL_MAT",
-   "src": []
+   "src": [
+    8
+   ],
+   "fam": "mul_mat_vec_q[Q4_K]",
+   "quant": "q4_K",
+   "role": "attn_output",
+   "roles": [
+    "attn_output",
+    "attn_q"
+   ]
   },
   {
    "name": "norm",
    "op": "RMS_NORM",
    "src": [
-    "node"
-   ]
+    9,
+    14
+   ],
+   "fam": "rms_norm_f32",
+   "quant": "f32",
+   "role": ""
   },
   {
    "name": "ffn_gate",
    "op": "MUL_MAT",
    "src": [
-    "norm"
+    10,
+    18
+   ],
+   "fam": "mul_mat_vec_q[Q4_K]",
+   "quant": "q4_K",
+   "role": "ffn_gate",
+   "roles": [
+    "ffn_gate"
    ]
   },
   {
    "name": "ffn_out",
    "op": "MUL_MAT",
    "src": [
-    "ffn_gate",
-    "node"
+    11,
+    9,
+    14
+   ],
+   "fam": "mul_mat_vec_q[Q6_K]",
+   "quant": "q6_K",
+   "role": "ffn_down",
+   "roles": [
+    "ffn_down"
    ]
   },
   {
    "name": "norm",
    "op": "RMS_NORM",
    "src": [
-    "ffn_out"
-   ]
+    12,
+    19
+   ],
+   "fam": "rms_norm_f32",
+   "quant": "f32",
+   "role": ""
   },
   {
    "name": "node",
    "op": "MUL_MAT",
    "src": [
-    "ffn_out"
+    8,
+    12
+   ],
+   "fam": "mul_mat_vec_q[Q4_K]",
+   "quant": "q4_K",
+   "role": "attn_q",
+   "roles": [
+    "attn_q",
+    "attn_output"
    ]
-  },
-  {
-   "name": "node",
-   "op": "GET_ROWS",
-   "src": []
   },
   {
    "name": "node",
    "op": "GET_ROWS",
    "src": [
-    "ffn_out"
-   ]
+    9
+   ],
+   "fam": "k_get_rows_float",
+   "quant": "f32",
+   "role": ""
+  },
+  {
+   "name": "node",
+   "op": "GET_ROWS",
+   "src": [
+    12
+   ],
+   "fam": "k_get_rows_float",
+   "quant": "f32",
+   "role": ""
   },
   {
    "name": "ffn_inp",
    "op": "ADD",
    "src": [
-    "node"
-   ]
+    15,
+    16
+   ],
+   "fam": "k_bin_bcast[add]",
+   "quant": "f32",
+   "role": ""
   },
   {
    "name": "norm",
    "op": "RMS_NORM",
    "src": [
-    "ffn_inp"
-   ]
+    17
+   ],
+   "fam": "rms_norm_f32",
+   "quant": "f32",
+   "role": ""
   },
   {
    "name": "ffn_out",
    "op": "MUL_MAT",
    "src": [
-    "ffn_gate",
-    "ffn_inp"
+    11,
+    17
+   ],
+   "fam": "mul_mat_vec_q[Q6_K]",
+   "quant": "q6_K",
+   "role": "ffn_down",
+   "roles": [
+    "ffn_down"
    ]
   },
   {
    "name": "result_output",
    "op": "MUL_MAT",
    "src": [
-    "norm"
+    13
+   ],
+   "fam": "mul_mat_vec_q[Q6_K]",
+   "quant": "q6_K",
+   "role": "token_embd",
+   "roles": [
+    "token_embd"
    ]
   }
  ]

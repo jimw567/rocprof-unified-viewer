@@ -178,7 +178,7 @@ def peak_tops_for(arch, override=None):
 
 
 # Per-MODEL-architecture token-boundary segmentation profile. NOTE: keyed by the GGUF
-# `general.architecture` (qwen35moe, gptoss, ...), NOT the GPU arch (gfx1151) used by the
+# `general.architecture` (qwen35moe, gpt-oss, ...), NOT the GPU arch (gfx1151) used by the
 # dicts above -- decode cadence is a property of the model's graph, not the board. Model
 # architectures move far slower than this viewer, so hardcoding per-arch here is fine and
 # is exactly what keeps a tweak for one arch from perturbing another.
@@ -189,7 +189,7 @@ def peak_tops_for(arch, override=None):
 BOUNDARY_PROFILES = {
     "qwen35moe": {"method": "head", "gap_us": None},   # hybrid GDN/MoE, runs eager
     "qwen3moe":  {"method": "head", "gap_us": None},    # MoE, runs eager
-    "gptoss":    {"method": "gap",  "gap_us": 10.0},    # head-anchor under-segments; needs a low gap
+    "gpt-oss":   {"method": "gap",  "gap_us": 10.0},    # head-anchor under-segments; needs a low gap
     "_default":  {"method": "auto", "gap_us": None},    # unknown/dense: head then gap fallback
 }
 
@@ -769,40 +769,59 @@ def load_checked_in_topology(key):
 
 
 def expand_topology_to_layers(skel, n_layer):
-    """Expand a one-layer structural skeleton into a per-layer node list the frontend
-    consumes. The skeleton's nodes carry NORMALIZED names (Qcur, norm, ffn_moe_down) and
-    string `src` referencing sibling normalized names. We instantiate the block for each
-    of the n_layer layers -- suffixing names with `-<L>`, resolving intra-block edges to
-    node indices, and threading the residual stream across layers (a node reading a name
-    not produced within its own layer links to the most recent prior producer, so the
-    inter-layer residual connects). Returns {step, nodes:[{i,name,op,L,src:[idx],...}],
-    by_layer, edges_inferred:False}."""
+    """Expand a one-block skeleton into a per-layer node list the frontend consumes. The
+    skeleton's `src` are INDEX-based (producing node index within the block, from the dump's
+    storage-id DAG), so instantiating a layer is a pure index OFFSET -- copy the block, add
+    L*B to each intra-block edge. No name resolution (the old name-based path split disjoint
+    subgraphs when a cb-name repeated). The inter-layer residual is threaded by wiring each
+    layer's entry (a block root that reads nothing but should consume the running stream) to
+    the previous layer's exit (the block's terminal). Returns {step, nodes:[{i,name,op,L,
+    src:[idx],...}], by_layer, edges_inferred:False}."""
     sk = skel.get("nodes", [])
+    B = len(sk)
+    if B == 0:
+        return {"step": "topology (checked-in)", "n_nodes": 0, "nodes": [],
+                "by_layer": {}, "edges_inferred": False, "provenance": ""}
+    # Block entry = the first root (no in-block src) that is a norm/residual consumer -- the
+    # node that in a full trace reads the previous block's output. Block exit = the last node
+    # feeding it (the residual sink). We thread entry[L] <- exit[L-1] to connect layers.
+    roots = [i for i, nd in enumerate(sk) if not nd.get("src")]
+    entry = next((i for i in roots if "norm" in sk[i].get("name", "").lower()),
+                 roots[0] if roots else 0)
+    # exit = the highest-index node that is NOT a cache/state write (those are KV sinks, not
+    # the residual). Falls back to the last node.
+    exit_ = B - 1
+    for i in range(B - 1, -1, -1):
+        nm = sk[i].get("name", "").lower()
+        if "cache" not in nm and "state" not in nm and "result" not in nm:
+            exit_ = i
+            break
     nodes = []
-    last_by_name = {}          # normalized name -> most recent global node index
     for L in range(max(n_layer, 1)):
-        local = {}             # normalized name -> node index within THIS layer
-        for nd in sk:
-            i = len(nodes)
-            nm = nd.get("name", "?")
-            srcs = []
-            for s in nd.get("src", []):
-                # prefer a producer within this layer; else the running (prior-layer) one
-                w = local.get(s, last_by_name.get(s))
-                if w is not None and w != i:
-                    srcs.append(w)
-            nodes.append({"i": i, "name": "%s-%d" % (nm, L), "op": nd.get("op", "?"),
-                          "L": L, "ne": [], "type": "",
+        base = L * B
+        for j, nd in enumerate(sk):
+            srcs = [base + s for s in nd.get("src", []) if 0 <= s < B and s != j]
+            # residual thread: this layer's entry reads the previous layer's exit
+            if j == entry and L > 0:
+                srcs.append((L - 1) * B + exit_)
+            nodes.append({"i": base + j, "name": "%s-%d" % (nd.get("name", "?"), L),
+                          "op": nd.get("op", "?"), "L": L, "ne": [], "type": "",
+                          # fam/quant/role baked into the skeleton (stable per arch): role is
+                          # the join key to this run's order-mapped dispatch -> live per-size
+                          # KxN + actual kernel without a view-time dump.
+                          "fam": nd.get("fam", ""), "quant": nd.get("quant", ""),
+                          # role = best-effort single role; roles = all roles a shared cb-name
+                          # node can be (e.g. "node" -> attn_qkv/ssm_alpha/ssm_beta); the
+                          # frontend picks whichever has a live dispatch in this layer.
+                          "role": nd.get("role", ""), "roles": nd.get("roles", []),
                           "us_in": None, "src": list(dict.fromkeys(srcs)), "chain": False})
-            local[nm] = i
-            last_by_name[nm] = i
     by_layer = defaultdict(list)
     for nd in nodes:
         by_layer[nd["L"]].append(nd["i"])
     return {"step": "topology (checked-in)", "n_nodes": len(nodes), "nodes": nodes,
             "by_layer": dict(by_layer), "edges_inferred": False,
             "provenance": "FAITHFUL topology from checked-in architecture skeleton "
-                          "(ggml-roofline storage-id edges, arch-keyed); live timings "
+                          "(ggml-roofline storage-id INDEX edges, arch-keyed); live timings "
                           "not attached in this view."}
 
 
@@ -4932,39 +4951,75 @@ function openLayerGraph(L){
   // unmapped dispatch into its layer (by time span) and, within a layer, collect its
   // per-family dispatch times in execution order. A graph node then joins by
   // op->family + order (the cgraph nodes are topologically sorted == execution order).
+  // op -> kernel-family regex, for the UNMAPPED single-family ops (norms, elementwise,
+  // unary, ...). Deliberately NO MUL_MAT here: a layer runs several matvec families
+  // (Q4_K/Q5_K/Q8_0/...) and the checked-in skeleton's matmul nodes neither 1:1-count nor
+  // role-align with the trace's matvec dispatches, so an order-join would mislabel them.
+  // Matmul nodes instead get their exact family from the GGUF order-map (see mvByRole).
   const OP2FAM={RMS_NORM:/rms_norm/i, L2_NORM:/l2_norm/i, ADD:/bin_bcast|_add|^add/i,
     MUL:/bin_bcast|_mul|^mul(?!_mat)/i, GET_ROWS:/get_rows/i, ROPE:/rope/i,
     SOFT_MAX:/soft_max/i, SCALE:/scale/i, CPY:/cpy|dup|cont/i, CONT:/cpy|cont/i,
-    UNARY:/unary|silu|gelu|relu/i, CONV:/conv/i, SSM_CONV:/conv/i};
+    UNARY:/unary|silu|gelu|relu/i, SILU:/silu|unary/i, GEGLU:/gelu|unary/i,
+    CONV:/conv/i, SSM_CONV:/conv/i};
   const layerOfSlice=(t)=>{ for(const Lo of (D.layers||[])){ if(t>=Lo.s&&t<=Lo.e) return Lo.L; } return null; };
   const famSeq={};  // L -> fam -> [dispatch times in execution order]
   const _sl=D.gpu.slice().sort((a,b)=>a.s-b.s);
   for(const s of _sl){ if(s.map && s.map.nm) continue; const Ls=layerOfSlice(s.s); if(Ls==null) continue;
     (famSeq[Ls]=famSeq[Ls]||{}); (famSeq[Ls][s.fam]=famSeq[Ls][s.fam]||[]).push(s.e-s.s); }
   const famCtr={};  // L|fam -> next unconsumed index
+  // ROLE-driven join: the skeleton bakes each matmul node's weight ROLE (attn_q, ffn_down,
+  // ...). This run's GGUF order-map already tags every matvec dispatch with (role, L) plus
+  // its LIVE per-size K/trueN and the ACTUAL kernel family that ran. So a node -> its
+  // dispatch is an exact (L, role) lookup -- no dump at view time, correct for any model
+  // size, and the family/KxN always match this run's build + this model. runByRole:
+  // "L|role" -> {fam, K, N}. (role is arch-stable; K/N scale with size, read live here.)
+  const runByRole={};
+  for(const s of D.gpu){ const m=s.map;
+    if(m && m.role!=null && m.L!=null){ const k=m.L+'|'+m.role;
+      if(!runByRole[k]) runByRole[k]={fam:s.fam, K:m.K, N:m.trueN}; } }
   const nodes=[];
   const push=(nd,isext)=>{
     // A trace-derived graph carries its own measured time on the node (node.us_in,
     // nanoseconds) -- it IS a real dispatch, so trust it directly as an exact match.
     let t=(nd.us_in!=null)?nd.us_in:((timeByName[nd.name]!=null)?timeByName[nd.name]/cntByName[nd.name]:null);
     let tsrc=(t!=null)?'name':null;
+    // matchedFam = the real kernel family this topology node resolved to (via op->family +
+    // execution order). Topology-skeleton nodes carry no kernel name, so we borrow the
+    // family from the actual swim-lane dispatch that the fam-join lands on, and use it as
+    // the display label (so nodes read "mul_mat_vec_q" / "rms_norm_f32", not "MUL_MAT").
+    let matchedFam=null;
     if(t==null && !isext){
       const rx=OP2FAM[nd.op]; const Ln=nd.L;
       if(rx!=null && famSeq[Ln]){
         for(const fam in famSeq[Ln]){ if(rx.test(fam)){
           const key=Ln+'|'+fam, c=famCtr[key]||0;
-          if(c<famSeq[Ln][fam].length){ t=famSeq[Ln][fam][c]; famCtr[key]=c+1; tsrc='fam'; break; }
+          if(c<famSeq[Ln][fam].length){ t=famSeq[Ln][fam][c]; famCtr[key]=c+1; tsrc='fam'; matchedFam=fam; break; }
         } }
       }
     }
-    nodes.push({i:nd.i, name:nd.name||('#'+nd.i), op:nd.op||'?', ne:nd.ne||[], type:nd.type||'',
+    // Resolve the node's kernel + shape. A matmul node carries a baked ROLE -> look up THIS
+    // run's actual dispatch for (L, role): its live family + KxN. Else (norms/unary/elementwise)
+    // use the op->family fam-join (matchedFam). Else the generic ggml op. Explicit nd.fam from
+    // a dump/trace graph wins. runNE = live [K, N] for the node, shown on the graph.
+    // Prefer the LIVE run's family (matches the swim lane + this build's kernel variant);
+    // the skeleton's baked nd.fam is only a fallback when this run has no dispatch for the role.
+    // A shared-name node can carry several candidate roles (nd.roles); pick the one that has a
+    // live dispatch in THIS layer (a GDN layer runs ssm_*, an attention layer runs attn_qkv --
+    // same "node" cb-name, different role per layer type). Fall back to nd.role.
+    let rr=null, useRole=nd.role||'';
+    const cand=(nd.roles&&nd.roles.length)?nd.roles:(nd.role?[nd.role]:[]);
+    for(const rl of cand){ const hit=runByRole[nd.L+'|'+rl]; if(hit){ rr=hit; useRole=rl; break; } }
+    const joinFam=(rr&&rr.fam)||nd.fam||matchedFam||nd.op||'';
+    const runNE=(rr&&rr.K&&rr.N)?[rr.K, rr.N]:(nd.ne||[]);
+    nodes.push({i:nd.i, name:nd.name||('#'+nd.i), op:nd.op||'?', ne:runNE, type:nd.type||'',
+      role:useRole,
       // fam = kernel family (matches the swim-lane label); the join key for selection sync
-      fam:(nd.fam||nd.op||''),
+      fam:joinFam,
       // kernels = the GPU kernels this op launched (a quantized matmul folds a
       // quantize_q8_1 prep + the matvec); surfaced on hover so nothing is hidden.
       kernels:(nd.kernels||[]),
       // label = display name (fam, or the ggml op for generic kernels like k_bin_bcast)
-      label:(nd.label||nd.fam||nd.op||''),
+      label:(nd.label||joinFam),
       src:(nd.src||[]).filter(x=>idset.has(x)||ext.has(x)), ext:!!isext,
       us:t!=null?t/1000:null, tsrc:tsrc, chain:!!nd.chain,
       // dispatch span (overlay-relative ns) for span-based sync when available (older
@@ -5127,6 +5182,10 @@ function openLayerGraph(L){
     `g.fillStyle='#e8eef5';g.fillText(flabel,pd.x+8,pd.y+14);`+
     `g.fillStyle='#aeb9c7';var nm=nd.name.length>26?nd.name.slice(0,25)+'\\u2026':nd.name;`+
     `g.fillText(nm,pd.x+8,pd.y+29);`+
+    // line 3 (right-aligned) = live weight shape KxN (from the loaded GGUF via role), so a
+    // matmul node shows the exact dimensions it multiplies for THIS model size.
+    `if(nd.ne&&nd.ne.length>=2&&nd.ne[0]&&nd.ne[1]){g.fillStyle='#7f8fa3';g.textAlign='right';`+
+    `g.fillText(nd.ne[0]+'\\u00d7'+nd.ne[1],pd.x+BW-8,pd.y+29);g.textAlign='left';}`+
     `if(nd.us!=null){g.fillStyle=nd.tsrc==='fam'?'#c8d98a':'#8fe388';`+
     `g.fillText(nd.us.toFixed(1)+' \\u00b5s'+(nd.tsrc==='fam'?' ~':''),pd.x+8,pd.y+44);}`+
     // badge: a "+N" chip when this op folds >1 GPU kernel (e.g. quantize + matmul)

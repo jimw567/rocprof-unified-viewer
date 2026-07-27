@@ -7,388 +7,565 @@
   {
    "name": "norm",
    "op": "RMS_NORM",
-   "src": []
+   "src": [],
+   "fam": "rms_norm_f32",
+   "quant": "f32",
+   "role": ""
   },
   {
    "name": "cache_r (reshaped) (view) (view)",
    "op": "SCALE",
-   "src": []
+   "src": [],
+   "fam": "scale_f32",
+   "quant": "f32",
+   "role": ""
   },
   {
    "name": "conv_states",
    "op": "GET_ROWS",
    "src": [
-    "cache_r (reshaped) (view) (view)"
-   ]
+    1
+   ],
+   "fam": "k_get_rows_float",
+   "quant": "f32",
+   "role": ""
   },
   {
    "name": "node",
    "op": "MUL_MAT",
    "src": [
-    "norm"
+    0,
+    32
+   ],
+   "fam": "mul_mat_vec_q[Q8_0]",
+   "quant": "q8_0",
+   "role": "attn_qkv",
+   "roles": [
+    "attn_qkv",
+    "ssm_alpha",
+    "ssm_beta",
+    "attn_q"
    ]
   },
   {
    "name": "conv_input",
    "op": "CONCAT",
    "src": [
-    "conv_states",
-    "node"
-   ]
+    2,
+    3
+   ],
+   "fam": "concat_cont",
+   "quant": "f32",
+   "role": ""
   },
   {
    "name": "conv_state_update (copy of conv_state_last)",
    "op": "CPY",
    "src": [
-    "cache_r (reshaped) (view) (view)",
-    "conv_input"
-   ]
+    4,
+    1
+   ],
+   "fam": "__amd_rocclr_copyBuffer.kd",
+   "quant": "f32",
+   "role": ""
   },
   {
    "name": "cache_s (reshaped) (view) (view)",
    "op": "SCALE",
-   "src": []
+   "src": [],
+   "fam": "scale_f32",
+   "quant": "f32",
+   "role": ""
   },
   {
    "name": "node",
    "op": "GET_ROWS",
    "src": [
-    "cache_s (reshaped) (view) (view)"
-   ]
+    6
+   ],
+   "fam": "k_get_rows_float",
+   "quant": "f32",
+   "role": ""
   },
   {
    "name": "conv_output_raw",
    "op": "SSM_CONV",
    "src": [
-    "conv_input"
-   ]
+    4
+   ],
+   "fam": "ssm_conv_f32",
+   "quant": "f32",
+   "role": ""
   },
   {
    "name": "q_conv_predelta",
    "op": "L2_NORM",
    "src": [
-    "conv_output_raw"
-   ]
+    8
+   ],
+   "fam": "l2_norm_f32",
+   "quant": "f32",
+   "role": ""
   },
   {
    "name": "k_conv_predelta",
    "op": "L2_NORM",
    "src": [
-    "conv_output_raw"
-   ]
+    8
+   ],
+   "fam": "l2_norm_f32",
+   "quant": "f32",
+   "role": ""
   },
   {
    "name": "node",
    "op": "ADD",
-   "src": []
+   "src": [
+    3
+   ],
+   "fam": "k_bin_bcast[add]",
+   "quant": "f32",
+   "role": ""
   },
   {
    "name": "a_softplus",
    "op": "SOFTPLUS",
    "src": [
-    "node"
-   ]
+    11
+   ],
+   "fam": "unary_gated_op_kernel[softplus]",
+   "quant": "f32",
+   "role": ""
   },
   {
    "name": "beta_sigmoid",
    "op": "SIGMOID",
    "src": [
-    "node"
-   ]
+    3
+   ],
+   "fam": "unary_op_kernel[sigmoid]",
+   "quant": "f32",
+   "role": ""
   },
   {
    "name": "node",
    "op": "GATED_DELTA_NET",
    "src": [
-    "a_softplus",
-    "beta_sigmoid",
-    "conv_output_raw",
-    "k_conv_predelta",
-    "q_conv_predelta"
-   ]
+    9,
+    10,
+    8,
+    12,
+    13,
+    7
+   ],
+   "fam": "gated_delta_net_cuda",
+   "quant": "f32",
+   "role": ""
   },
   {
    "name": "z",
    "op": "MUL_MAT",
    "src": [
-    "norm"
+    0,
+    32
+   ],
+   "fam": "mul_mat_vec_q[Q8_0]",
+   "quant": "q8_0",
+   "role": "attn_gate",
+   "roles": [
+    "attn_gate"
    ]
   },
   {
    "name": "node",
    "op": "SILU",
    "src": [
-    "norm",
-    "z"
-   ]
+    15,
+    0
+   ],
+   "fam": "unary_gated_op_kernel[silu]",
+   "quant": "f32",
+   "role": ""
   },
   {
    "name": "linear_attn_out",
    "op": "MUL_MAT",
    "src": [
-    "node"
+    16
+   ],
+   "fam": "mul_mat_vec_q[Q8_0]",
+   "quant": "q8_0",
+   "role": "ssm_out",
+   "roles": [
+    "ssm_out",
+    "attn_output"
    ]
   },
   {
    "name": "attn_residual",
    "op": "ADD",
    "src": [
-    "linear_attn_out"
-   ]
+    17
+   ],
+   "fam": "k_bin_bcast[add]",
+   "quant": "f32",
+   "role": ""
   },
   {
    "name": "norm",
    "op": "RMS_NORM",
    "src": [
-    "attn_residual"
-   ]
+    18,
+    33
+   ],
+   "fam": "rms_norm_f32",
+   "quant": "f32",
+   "role": ""
   },
   {
    "name": "ffn_moe_logits",
    "op": "MUL_MAT",
    "src": [
-    "norm"
+    19,
+    47
+   ],
+   "fam": "mul_mat_vec_f",
+   "quant": "f32",
+   "role": "ffn_gate_inp",
+   "roles": [
+    "ffn_gate_inp"
    ]
   },
   {
    "name": "ffn_moe_probs",
    "op": "SOFT_MAX",
    "src": [
-    "ffn_moe_logits"
-   ]
+    20
+   ],
+   "fam": "topk_moe_cuda",
+   "quant": "f32",
+   "role": ""
   },
   {
    "name": "ffn_moe_gate",
    "op": "MUL_MAT_ID",
    "src": [
-    "norm"
+    19,
+    47
+   ],
+   "fam": "mul_mat_vec_q[Q4_K]",
+   "quant": "q4_K",
+   "role": "ffn_gate_exps",
+   "roles": [
+    "ffn_gate_exps"
    ]
   },
   {
    "name": "ffn_moe_down",
    "op": "MUL_MAT_ID",
    "src": [
-    "ffn_moe_gate"
+    22
+   ],
+   "fam": "mul_mat_vec_q[Q5_K]",
+   "quant": "q5_K",
+   "role": "ffn_down_exps",
+   "roles": [
+    "ffn_down_exps"
    ]
   },
   {
    "name": "ffn_moe_weighted",
    "op": "MUL",
    "src": [
-    "ffn_moe_down",
-    "ffn_moe_probs"
-   ]
+    23,
+    21
+   ],
+   "fam": "k_bin_bcast[mul]",
+   "quant": "f32",
+   "role": ""
   },
   {
    "name": "node",
    "op": "ADD",
    "src": [
-    "ffn_moe_weighted"
-   ]
+    24
+   ],
+   "fam": "k_bin_bcast[add]",
+   "quant": "f32",
+   "role": ""
   },
   {
    "name": "ffn_gate",
    "op": "MUL_MAT",
    "src": [
-    "norm"
+    19,
+    47
+   ],
+   "fam": "mul_mat_vec_q[Q8_0]",
+   "quant": "q8_0",
+   "role": "ffn_gate_shexp",
+   "roles": [
+    "ffn_gate_shexp"
    ]
   },
   {
    "name": "ffn_shexp",
    "op": "MUL_MAT",
    "src": [
-    "ffn_gate"
+    26
+   ],
+   "fam": "mul_mat_vec_q[Q8_0]",
+   "quant": "q8_0",
+   "role": "ffn_down_shexp",
+   "roles": [
+    "ffn_down_shexp"
    ]
   },
   {
    "name": "shared_expert_gate",
    "op": "MUL_MAT",
    "src": [
-    "norm"
-   ]
+    19,
+    47
+   ],
+   "fam": "mul_mat_vec_f",
+   "quant": "f32",
+   "role": ""
   },
   {
    "name": "shared_expert_gate_sigmoid",
    "op": "SIGMOID",
    "src": [
-    "shared_expert_gate"
-   ]
+    28
+   ],
+   "fam": "unary_op_kernel[sigmoid]",
+   "quant": "f32",
+   "role": ""
   },
   {
    "name": "ffn_shexp_gated",
    "op": "MUL",
    "src": [
-    "ffn_shexp",
-    "shared_expert_gate_sigmoid"
-   ]
+    27,
+    29
+   ],
+   "fam": "k_bin_bcast[mul]",
+   "quant": "f32",
+   "role": ""
   },
   {
    "name": "ffn_out",
    "op": "ADD",
    "src": [
-    "attn_residual",
-    "ffn_shexp_gated",
-    "node"
-   ]
+    25,
+    30,
+    18,
+    33
+   ],
+   "fam": "k_bin_bcast[add]",
+   "quant": "f32",
+   "role": ""
   },
   {
    "name": "norm",
    "op": "RMS_NORM",
    "src": [
-    "ffn_out"
-   ]
+    31,
+    48
+   ],
+   "fam": "rms_norm_f32",
+   "quant": "f32",
+   "role": ""
   },
   {
    "name": "attn_residual",
    "op": "ADD",
    "src": [
-    "ffn_out",
-    "linear_attn_out"
-   ]
+    17,
+    31,
+    48
+   ],
+   "fam": "k_bin_bcast[add]",
+   "quant": "f32",
+   "role": ""
   },
   {
    "name": "Qcur_full",
    "op": "MUL_MAT",
    "src": [
-    "norm"
+    32
+   ],
+   "fam": "mul_mat_vec_q[Q8_0]",
+   "quant": "q8_0",
+   "role": "attn_qkv",
+   "roles": [
+    "attn_qkv"
    ]
   },
   {
    "name": "norm",
    "op": "RMS_NORM",
    "src": [
-    "Qcur_full"
-   ]
+    34
+   ],
+   "fam": "rms_norm_f32",
+   "quant": "f32",
+   "role": ""
   },
   {
    "name": "Qcur",
    "op": "ROPE",
    "src": [
-    "norm"
-   ]
+    35
+   ],
+   "fam": "rope_multi",
+   "quant": "f32",
+   "role": ""
   },
   {
    "name": "Vcur",
    "op": "MUL_MAT",
    "src": [
-    "norm"
+    32
+   ],
+   "fam": "mul_mat_vec_q[Q8_0]",
+   "quant": "q8_0",
+   "role": "attn_v",
+   "roles": [
+    "attn_v"
    ]
   },
   {
    "name": "Kcur",
    "op": "MUL_MAT",
    "src": [
-    "norm"
+    32
+   ],
+   "fam": "mul_mat_vec_q[Q8_0]",
+   "quant": "q8_0",
+   "role": "attn_k",
+   "roles": [
+    "attn_k"
    ]
   },
   {
    "name": "norm",
    "op": "RMS_NORM",
    "src": [
-    "Kcur"
-   ]
+    38
+   ],
+   "fam": "rms_norm_f32",
+   "quant": "f32",
+   "role": ""
   },
   {
    "name": "Kcur",
    "op": "ROPE",
    "src": [
-    "norm"
-   ]
+    39
+   ],
+   "fam": "rope_multi",
+   "quant": "f32",
+   "role": ""
   },
   {
    "name": "cache_k (view)",
    "op": "SET_ROWS",
    "src": [
-    "Kcur"
-   ]
+    40
+   ],
+   "fam": "k_set_rows",
+   "quant": "f32",
+   "role": ""
   },
   {
    "name": "cache_v (view)",
    "op": "SET_ROWS",
    "src": [
-    "Vcur"
-   ]
+    37
+   ],
+   "fam": "k_set_rows",
+   "quant": "f32",
+   "role": ""
   },
   {
    "name": "node",
    "op": "FLASH_ATTN_EXT",
    "src": [
-    "Qcur",
-    "cache_k (view)",
-    "cache_v (view)"
-   ]
+    36,
+    41,
+    42
+   ],
+   "fam": "flash_attn_combine_results",
+   "quant": "f32",
+   "role": ""
   },
   {
    "name": "gate_reshaped",
    "op": "CONT",
    "src": [
-    "Qcur_full"
-   ]
+    34
+   ],
+   "fam": "cpy_scalar",
+   "quant": "f32",
+   "role": ""
   },
   {
    "name": "gate_sigmoid",
    "op": "SIGMOID",
    "src": [
-    "gate_reshaped",
-    "node"
-   ]
+    44,
+    43
+   ],
+   "fam": "unary_gated_op_kernel[sigmoid]",
+   "quant": "f32",
+   "role": ""
   },
   {
    "name": "attn_output",
    "op": "MUL_MAT",
    "src": [
-    "ffn_out",
-    "gate_sigmoid"
+    45,
+    31
+   ],
+   "fam": "mul_mat_vec_q[Q8_0]",
+   "quant": "q8_0",
+   "role": "attn_output",
+   "roles": [
+    "attn_output"
    ]
   },
   {
    "name": "norm",
    "op": "RMS_NORM",
    "src": [
-    "attn_output"
-   ]
+    46
+   ],
+   "fam": "rms_norm_f32",
+   "quant": "f32",
+   "role": ""
   },
   {
    "name": "ffn_out",
    "op": "ADD",
    "src": [
-    "attn_output",
-    "ffn_shexp_gated",
-    "node"
-   ]
+    25,
+    30,
+    46
+   ],
+   "fam": "k_bin_bcast[add]",
+   "quant": "f32",
+   "role": ""
   },
   {
    "name": "result_norm",
    "op": "GET_ROWS",
    "src": [
-    "norm"
-   ]
-  },
-  {
-   "name": "result_output",
-   "op": "MUL_MAT",
-   "src": [
-    "result_norm"
-   ]
-  },
-  {
-   "name": "conv_states",
-   "op": "GET_ROWS",
-   "src": [
-    "conv_state_update (copy of conv_state_last)"
-   ]
-  },
-  {
-   "name": "conv_state_update (copy of conv_state_last)",
-   "op": "CPY",
-   "src": [
-    "conv_input"
-   ]
-  },
-  {
-   "name": "node",
-   "op": "GET_ROWS",
-   "src": []
+    32
+   ],
+   "fam": "k_get_rows_float",
+   "quant": "f32",
+   "role": ""
   }
  ]
 }
