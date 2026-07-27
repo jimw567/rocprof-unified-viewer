@@ -131,6 +131,15 @@ def _row_fam(r):
     return family_of(pick["name"]) if pick and pick.get("name") else ""
 
 
+def _row_kernels(r):
+    """The GPU kernel families this op FOLDS, in launch order (e.g. a quantized matmul folds
+    quantize_q8_1 then mul_mat_vec_q). Baked into the skeleton so the graph node shows a
+    "+Nk" badge + hover breakdown for its prep kernels -- the quantize step is otherwise
+    invisible (it is not a ggml op, just a sub-kernel). List of family strings; the kernel
+    VARIANT is build-dependent but the fact that a matmul folds a quantize is arch-stable."""
+    return [family_of(k.get("name", "")) for k in (r.get("kernels") or []) if k.get("name")]
+
+
 # Node-name fragment -> role SUBSTRING. A shape-tie (roles sharing K,N,quant) is broken by
 # the dump node's cb() name: Kcur -> a role containing "attn_k", ffn_moe_gate -> a role
 # containing "ffn_gate" (matches both dense "ffn_gate" and MoE "ffn_gate_exps"). Ordered so
@@ -179,13 +188,14 @@ def _first_pass_rows(rows):
 def skeleton(dump_path, role_shape=None):
     """Reduce a roofline dump to a one-block structural skeleton with INDEX-based edges.
 
-    Edges are the crux: the dump's storage-ids give an exact producer->consumer DAG. We
-    build the full first-pass graph with edges as producing-NODE INDICES (last-writer-wins),
-    then collapse the repeated per-layer blocks into ONE representative block -- grouping
-    nodes by a layer-invariant signature (name, op, sorted producer NAMES) and remapping
-    edges to the canonical indices. This keeps the graph CONNECTED (a prior name-based edge
-    model split disjoint subgraphs when ggml reused one cb-name -- e.g. "node" -- for several
-    ops, since a name can't say WHICH sibling an edge meant; an index can).
+    Edges are the crux: the dump's storage-ids give an exact producer->consumer DAG. Rather
+    than fold all layers together (a name-signature collapse creates cross-layer forward
+    edges -> CYCLES, which break the layered layout), we extract ONE representative interior
+    layer verbatim, in execution order: its edges only point backward within the block, so
+    it is a clean DAG and connected. Intra-block edges become node indices; edges reaching
+    OUTSIDE the block (the residual read from the previous layer) are dropped here and
+    re-threaded per layer by the expander. An interior layer is used (not the first) so the
+    block is fully formed -- the first layer reads the token embedding, not a residual.
 
     Each node also carries the kernel identity it ran as -- quant, family, and the WEIGHT
     ROLE (matched to the gguf by shape+quant) -- all stable per architecture, so the viewer
@@ -197,7 +207,8 @@ def skeleton(dump_path, role_shape=None):
     rows = sorted(g.get("rows") or [], key=lambda r: r.get("invocation", 0))
     rows = _first_pass_rows(rows)
 
-    # 1) full first-pass graph, edges = producing node index (last-writer-wins).
+    # 1) full first-pass graph, edges = producing node index (last-writer-wins). This is a
+    # strict DAG: a src is always an EARLIER row (its writer ran before this consumer).
     writer = {}          # storage_id -> node index that last wrote it
     full = []
     tie_ctr = {}
@@ -216,51 +227,61 @@ def skeleton(dump_path, role_shape=None):
                                    tie_ctr, nm)
         idx = len(full)
         full.append({"name": nm, "op": r.get("ggml_op", "?"),
-                     "src": [s for s in dict.fromkeys(srcs) if s != idx],
-                     "fam": _row_fam(r), "quant": (r.get("quant") or ""), "role": role})
+                     "src": [s for s in dict.fromkeys(srcs) if s < idx],
+                     "fam": _row_fam(r), "quant": (r.get("quant") or ""), "role": role,
+                     "kernels": _row_kernels(r)})
         out = r.get("out_storage_id")
         if out is not None:
             writer[out] = idx
 
-    # 2) collapse repeated per-layer blocks: group by a layer-invariant signature
-    # (name, op, sorted producer NAMES). Keep the FIRST occurrence; remap every edge to its
-    # canonical node index. Repeated layers fold onto the representative block; the DAG (and
-    # cross-node identity) survives because edges are indices, not names.
-    sig_first = {}       # signature -> canonical index (into `nodes`)
-    orig2canon = {}      # full-graph index -> canonical index
-    nodes = []
-    for i, n in enumerate(full):
-        prod_names = tuple(sorted(full[s]["name"] for s in n["src"]))
-        sig = (n["name"], n["op"], prod_names)
-        if sig not in sig_first:
-            sig_first[sig] = len(nodes)
-            nodes.append({"name": n["name"], "op": n["op"], "src": [],
-                          "fam": n["fam"], "quant": n["quant"], "role": n["role"]})
-            if n["role"]:
-                nodes[-1]["roles"] = [n["role"]]
-        orig2canon[i] = sig_first[sig]
+    # 2) pick ONE real layer block by the raw name's layer suffix (blk index). The dump tags
+    # per-layer ops as "<name>-<L>" (cb() layer tag), so a whole layer is the rows whose raw
+    # name ends in "-<L>". We use the layer that has the MOST tagged ops (a fully-formed
+    # interior layer -- some archs' layer 0 is special), avoiding any period guessing.
+    span = _layer_span(rows)
+    if span is None:
+        # no per-layer tags: fall back to the whole first pass (still a valid DAG, just larger)
+        lo, hi = 0, len(full)
+    else:
+        lo, hi = span
 
-    # 3) remap edges to canonical indices; merge kernel-identity across folded occurrences.
-    for i, n in enumerate(full):
-        ci = orig2canon[i]
-        cn = nodes[ci]
-        for s in n["src"]:
-            cs = orig2canon[s]
-            if cs != ci and cs not in cn["src"]:
-                cn["src"].append(cs)
+    # 3) re-index the block to 0-based; keep only intra-block edges (outside = the residual
+    # read from the previous layer, re-threaded per layer by the expander).
+    nodes = []
+    for j in range(lo, hi):
+        n = full[j]
+        srcs = [s - lo for s in n["src"] if lo <= s < hi and (s - lo) != j]
+        nd = {"name": n["name"], "op": n["op"], "src": list(dict.fromkeys(srcs)),
+              "fam": n["fam"], "quant": n["quant"], "role": n["role"]}
         if n["role"]:
-            rl = cn.setdefault("roles", [])
-            if n["role"] not in rl:
-                rl.append(n["role"])
-            if not cn.get("role"):
-                cn["role"] = n["role"]
-        for fld in ("fam", "quant"):
-            v = n[fld]
-            if v and cn[fld] and v != cn[fld]:
-                cn[fld] = ""
-            elif v and not cn[fld]:
-                cn[fld] = v
+            nd["roles"] = [n["role"]]
+        # folded sub-kernels (e.g. quantize_q8_1 prep) so the node shows a +Nk badge; drop
+        # empties and keep only when there is a prep kernel beyond the main matvec.
+        ker = [k for k in (n.get("kernels") or []) if k]
+        if len(ker) > 1:
+            nd["kernels"] = [{"fam": k} for k in ker]
+        nodes.append(nd)
     return {"nodes": nodes}
+
+
+def _layer_span(rows):
+    """Return (lo, hi) row indices delimiting the single most-complete layer block, using the
+    dump's raw "<name>-<L>" cb() layer tags. Returns None if the dump carries no layer tags.
+    The chosen block is a contiguous run of rows sharing one layer index L (the L with the
+    most tagged ops), extended to include the untagged ops interleaved within its span."""
+    tag = re.compile(r"-(\d+)(?:\s|$|\))")
+    layer_rows = {}      # L -> [row idx, ...]
+    for i, r in enumerate(rows):
+        m = tag.search(str(r.get("name", "")))
+        if m:
+            layer_rows.setdefault(int(m.group(1)), []).append(i)
+    if not layer_rows:
+        return None
+    # the busiest layer = most fully captured; take its contiguous [min, max] row span so the
+    # untagged ops (views, cache ops) that sit between its tagged ops are included in order.
+    best_L = max(layer_rows, key=lambda L: len(layer_rows[L]))
+    idxs = layer_rows[best_L]
+    return (idxs[0], idxs[-1] + 1)
 
 
 def main():

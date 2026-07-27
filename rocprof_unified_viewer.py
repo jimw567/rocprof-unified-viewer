@@ -814,6 +814,8 @@ def expand_topology_to_layers(skel, n_layer):
                           # node can be (e.g. "node" -> attn_qkv/ssm_alpha/ssm_beta); the
                           # frontend picks whichever has a live dispatch in this layer.
                           "role": nd.get("role", ""), "roles": nd.get("roles", []),
+                          # folded sub-kernels (quantize_q8_1 prep) -> the node's +Nk badge.
+                          "kernels": nd.get("kernels", []),
                           "us_in": None, "src": list(dict.fromkeys(srcs)), "chain": False})
     by_layer = defaultdict(list)
     for nd in nodes:
@@ -5220,7 +5222,9 @@ function openLayerGraph(L){
     `if(!nd||!nd.kernels||!nd.kernels.length){ktip.style.display='none';return;}`+
     `var h='<b>'+esc(nd.op)+'</b> &middot; '+esc(nd.name)+'<br>';`+
     `for(var k=0;k<nd.kernels.length;k++){var kk=nd.kernels[k];`+
-    `h+='<span style=\"color:#8fe388\">'+kk.us.toFixed(1)+' us</span>  '+esc(kk.fam)+'<br>';}`+
+    // us is present for dump/trace graphs; the checked-in skeleton carries fam only.
+    `var ut=(kk.us!=null)?('<span style=\"color:#8fe388\">'+kk.us.toFixed(1)+' us</span>  '):'';`+
+    `h+=ut+esc(kk.fam||kk.name||'')+'<br>';}`+
     `ktip.innerHTML=h;ktip.style.display='block';`+
     `ktip.style.left=Math.min(e.clientX-r.left+14,r.width-330)+'px';`+
     `ktip.style.top=(e.clientY-r.top+14)+'px';});`+

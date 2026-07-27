@@ -5,19 +5,9 @@
  "n_variants": 1,
  "nodes": [
   {
-   "name": "inp_scaled",
-   "op": "SCALE",
-   "src": [],
-   "fam": "scale_f32",
-   "quant": "f32",
-   "role": ""
-  },
-  {
    "name": "norm",
    "op": "RMS_NORM",
-   "src": [
-    0
-   ],
+   "src": [],
    "fam": "rms_norm_f32",
    "quant": "f32",
    "role": ""
@@ -26,21 +16,28 @@
    "name": "Qcur",
    "op": "MUL_MAT",
    "src": [
-    1,
-    20
+    0
    ],
    "fam": "mul_mat_vec_q[Q4_K]",
    "quant": "q4_K",
    "role": "attn_q",
    "roles": [
     "attn_q"
+   ],
+   "kernels": [
+    {
+     "fam": "quantize_q8_1"
+    },
+    {
+     "fam": "mul_mat_vec_q[Q4_K]"
+    }
    ]
   },
   {
    "name": "norm",
    "op": "RMS_NORM",
    "src": [
-    2
+    1
    ],
    "fam": "rms_norm_f32",
    "quant": "f32",
@@ -50,7 +47,7 @@
    "name": "Qcur_pos",
    "op": "ROPE",
    "src": [
-    3
+    2
    ],
    "fam": "rope_neox",
    "quant": "f32",
@@ -60,21 +57,28 @@
    "name": "Kcur",
    "op": "MUL_MAT",
    "src": [
-    1,
-    20
+    0
    ],
    "fam": "mul_mat_vec_q[Q4_K]",
    "quant": "q4_K",
    "role": "attn_k",
    "roles": [
     "attn_k"
+   ],
+   "kernels": [
+    {
+     "fam": "quantize_q8_1"
+    },
+    {
+     "fam": "mul_mat_vec_q[Q4_K]"
+    }
    ]
   },
   {
    "name": "norm",
    "op": "RMS_NORM",
    "src": [
-    5
+    4
    ],
    "fam": "rms_norm_f32",
    "quant": "f32",
@@ -84,8 +88,7 @@
    "name": "Kcur_pos",
    "op": "ROPE",
    "src": [
-    6,
-    22
+    5
    ],
    "fam": "rope_neox",
    "quant": "f32",
@@ -95,22 +98,28 @@
    "name": "Vcur",
    "op": "MUL_MAT",
    "src": [
-    1,
-    20
+    0
    ],
-   "fam": "",
-   "quant": "",
+   "fam": "mul_mat_vec_q[Q6_K]",
+   "quant": "q6_K",
    "role": "attn_v",
    "roles": [
-    "attn_v",
-    "attn_k"
+    "attn_v"
+   ],
+   "kernels": [
+    {
+     "fam": "quantize_q8_1"
+    },
+    {
+     "fam": "mul_mat_vec_q[Q6_K]"
+    }
    ]
   },
   {
    "name": "Vcur_normed",
    "op": "RMS_NORM",
    "src": [
-    8
+    7
    ],
    "fam": "rms_norm_f32",
    "quant": "f32",
@@ -120,7 +129,7 @@
    "name": "cache_k (view)",
    "op": "SET_ROWS",
    "src": [
-    7
+    6
    ],
    "fam": "k_set_rows",
    "quant": "f32",
@@ -130,7 +139,7 @@
    "name": "cache_v (view)",
    "op": "SET_ROWS",
    "src": [
-    9
+    8
    ],
    "fam": "k_set_rows",
    "quant": "f32",
@@ -140,33 +149,48 @@
    "name": "node",
    "op": "FLASH_ATTN_EXT",
    "src": [
-    4,
-    10,
-    11
+    3,
+    9,
+    10
    ],
    "fam": "flash_attn_combine_results",
    "quant": "f32",
-   "role": ""
+   "role": "",
+   "kernels": [
+    {
+     "fam": "flash_attn_tile"
+    },
+    {
+     "fam": "flash_attn_combine_results"
+    }
+   ]
   },
   {
    "name": "node",
    "op": "MUL_MAT",
    "src": [
-    12
+    11
    ],
    "fam": "mul_mat_vec_q[Q4_K]",
    "quant": "q4_K",
    "role": "attn_output",
    "roles": [
     "attn_output"
+   ],
+   "kernels": [
+    {
+     "fam": "quantize_q8_1"
+    },
+    {
+     "fam": "mul_mat_vec_q[Q4_K]"
+    }
    ]
   },
   {
    "name": "norm",
    "op": "RMS_NORM",
    "src": [
-    13,
-    0
+    12
    ],
    "fam": "rms_norm_f32",
    "quant": "f32",
@@ -176,8 +200,7 @@
    "name": "norm",
    "op": "RMS_NORM",
    "src": [
-    14,
-    21
+    13
    ],
    "fam": "rms_norm_f32",
    "quant": "f32",
@@ -187,35 +210,50 @@
    "name": "ffn_gate",
    "op": "MUL_MAT",
    "src": [
-    15
+    14
    ],
    "fam": "mul_mat_vec_q[Q4_K]",
    "quant": "q4_K",
    "role": "ffn_gate",
    "roles": [
     "ffn_gate"
+   ],
+   "kernels": [
+    {
+     "fam": "quantize_q8_1"
+    },
+    {
+     "fam": "mul_mat_vec_q[Q4_K]"
+    }
    ]
   },
   {
    "name": "ffn_out",
    "op": "MUL_MAT",
    "src": [
-    16
+    15
    ],
    "fam": "mul_mat_vec_q[Q6_K]",
    "quant": "q6_K",
    "role": "ffn_down",
    "roles": [
     "ffn_down"
+   ],
+   "kernels": [
+    {
+     "fam": "quantize_q8_1"
+    },
+    {
+     "fam": "mul_mat_vec_q[Q6_K]"
+    }
    ]
   },
   {
    "name": "norm",
    "op": "RMS_NORM",
    "src": [
-    17,
-    14,
-    21
+    16,
+    13
    ],
    "fam": "rms_norm_f32",
    "quant": "f32",
@@ -225,50 +263,9 @@
    "name": "l_out",
    "op": "MUL",
    "src": [
-    18
+    17
    ],
    "fam": "k_bin_bcast[mul]",
-   "quant": "f32",
-   "role": ""
-  },
-  {
-   "name": "norm",
-   "op": "RMS_NORM",
-   "src": [
-    19
-   ],
-   "fam": "rms_norm_f32",
-   "quant": "f32",
-   "role": ""
-  },
-  {
-   "name": "norm",
-   "op": "RMS_NORM",
-   "src": [
-    13,
-    19
-   ],
-   "fam": "rms_norm_f32",
-   "quant": "f32",
-   "role": ""
-  },
-  {
-   "name": "norm",
-   "op": "RMS_NORM",
-   "src": [
-    8
-   ],
-   "fam": "rms_norm_f32",
-   "quant": "f32",
-   "role": ""
-  },
-  {
-   "name": "result_norm",
-   "op": "GET_ROWS",
-   "src": [
-    20
-   ],
-   "fam": "k_get_rows_float",
    "quant": "f32",
    "role": ""
   }
