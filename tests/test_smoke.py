@@ -138,13 +138,25 @@ def test_checked_in_topologies_are_valid():
 
 
 def test_model_name_field(tmp_path):
-    # No --gguf fixture (real model is multi-GB), so we can only assert the key exists
-    # and is empty here; the frontend guard must gate the sub-line on it either way.
+    # No --gguf and no --clean-tps-file: model_name is empty, but the field must exist
+    # and the title JS must guard on it.
     html = _gen(tmp_path)
     raw = _raw(html)
     assert "model_name" in raw, "payload missing model_name field"
-    assert raw["model_name"] == "", "model_name should be empty without --gguf"
-    assert "D.model_name ?" in html, "frontend sub-line must guard on D.model_name"
+    assert raw["model_name"] == "", "model_name should be empty without --gguf/clean-tps"
+    assert "D.model_name ?" in html, "frontend title must guard on D.model_name"
+    assert "document.title" in html, "frontend must set the browser tab title"
+
+
+def test_model_name_from_clean_tps(tmp_path):
+    # Model name must appear in the title WITHOUT --gguf, recovered from clean_tps.txt's
+    # model_filename (basename, minus .gguf). This is the "show the model in the title
+    # regardless" behavior -- collect.sh always emits clean_tps.txt.
+    html = _gen(tmp_path, "--clean-tps-file",
+                os.path.join(FIX, "decode_clean_tps.json"))
+    raw = _raw(html)
+    assert raw["model_name"] == "Qwen3.6-35B-A3B-UD-Q4_K_XL", \
+        "model_name should be recovered from clean_tps model_filename"
 
 
 def test_unmapped_family_lists_dispatches(tmp_path):

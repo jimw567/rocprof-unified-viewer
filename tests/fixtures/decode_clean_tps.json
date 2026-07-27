@@ -1,0 +1,11 @@
+[
+  {
+    "model_filename": "/models/unsloth/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf",
+    "model_type": "qwen35moe 35B.A3B Q4_K - Medium",
+    "n_prompt": 0,
+    "n_gen": 8,
+    "avg_ts": 47.25,
+    "stddev_ts": 1.24,
+    "samples_ts": [46.0, 47.25, 48.5]
+  }
+]

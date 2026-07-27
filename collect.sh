@@ -41,6 +41,18 @@ PROMPT=0
 BOTH=0
 CLEAN_REPS=3
 KERNEL_REGEX=""
+# Canonical benchmark flags -- the SINGLE source of truth shared by every llama-bench
+# invocation here (clean, sys-trace, PMC) so a profile is measured under the SAME
+# conditions as the regression/aligned-sweep benchmark and the two never drift. Matches
+# rocm-scripts llamacpp_regression.py + annier's aligned sweep BENCH_ARGS
+# (-t 8 --poll 50 -ctk f16 -ctv f16) and adds -d <DEPTH> to prime the KV cache so the
+# traced/measured tokens are STEADY-STATE, not cold from an empty cache (an empty-KV
+# -n8 run reads ~47 t/s vs ~57 t/s depth-primed on qwen3.6-35B). -p/-n stay per-phase
+# (the trace needs a SHORT -n; tracing 128 tokens is impractical), but -d/-t/--poll/-ctk
+# /-ctv apply to ALL phases so every traced token sits at the same depth+config the
+# benchmark uses. Override -d with --depth; disable the whole set with --no-canonical.
+DEPTH=128
+CANONICAL=1
 # Stall-classification counters + raw cycle counters for two derived ratios the
 # viewer computes: EA busy% = GRBM_EA_BUSY/GRBM_GUI_ACTIVE (DRAM-interface busy,
 # the true BW bottleneck meter) and ALU busy% = SQ_INST_CYCLES_VALU/SQ_BUSY_CYCLES
@@ -65,6 +77,14 @@ Usage: collect.sh --build-dir DIR --model M.gguf --out-dir DIR [opts] [-- llama-
   -n N              Decode tokens for the sys-trace run (default: $NTOK).
   --pmc-n N         Decode tokens for the PMC runs (default: $PMC_NTOK; keep small,
                     PMC replays every kernel once per counter-set pass).
+  --depth N         KV-cache depth to prime before the decode measurement (default:
+                    $DEPTH). Passed as llama-bench -d N so traced tokens are STEADY-STATE,
+                    matching the benchmark; an empty-KV run reads slower (cold). Ignored
+                    in prefill mode. Set 0 to disable priming.
+  --no-canonical    Do NOT apply the canonical benchmark flag set (-t 8 --poll 50
+                    -ctk f16 -ctv f16 -d <depth>). Use raw llama-bench defaults instead.
+                    By default these flags are applied to EVERY phase (clean/trace/pmc)
+                    so the profile matches the regression/aligned-sweep benchmark.
   --clean-reps N    Reps for the untraced clean run (default: $CLEAN_REPS). Emitted as
                     llama-bench JSON so the viewer takes the median of samples_ts
                     (matches the regression harness; -r 1 gives a cold first sample).
@@ -107,6 +127,8 @@ while [ $# -gt 0 ]; do
     -n)          NTOK="$2"; shift 2 ;;
     --pmc-n)     PMC_NTOK="$2"; shift 2 ;;
     --prompt)    PROMPT="$2"; shift 2 ;;
+    --depth)     DEPTH="$2"; shift 2 ;;
+    --no-canonical) CANONICAL=0; shift ;;
     --both)      BOTH=1; shift ;;
     --clean-reps) CLEAN_REPS="$2"; shift 2 ;;
     --kernel)    KERNEL_REGEX="$2"; shift 2 ;;
@@ -150,6 +172,18 @@ run_ok() { # $1=glob under dir  $2=dir  $3..=command
 KREGEX=()
 [ -n "$KERNEL_REGEX" ] && KREGEX=(--kernel-include-regex "$KERNEL_REGEX")
 
+# Canonical flag set shared by every llama-bench call (see the DEPTH comment above).
+# -d is decode-only (prefill's single forward pass has no cached context to prime), so
+# it is added per-regime, not here. Empty when --no-canonical is passed.
+CANONICAL_ARGS=()
+if [ "$CANONICAL" -eq 1 ]; then
+  CANONICAL_ARGS=(-t 8 --poll 50 -ctk f16 -ctv f16)
+fi
+# Depth arg (decode only). Validated as a non-negative integer.
+case "$DEPTH" in ''|*[!0-9]*) echo "ERROR: --depth must be a non-negative integer" >&2; exit 1 ;; esac
+DEPTH_ARGS=()
+[ "$CANONICAL" -eq 1 ] && [ "$DEPTH" -gt 0 ] && DEPTH_ARGS=(-d "$DEPTH")
+
 # collect_regime MODE OUTDIR : run clean + sys-trace + both PMC passes for ONE
 # regime into OUTDIR. Decode uses -p 0 -n NTOK (periodic per-token stream); prefill
 # uses -p PROMPT -n 0 (one MMQ forward pass), where -n / --pmc-n do not apply.
@@ -157,9 +191,14 @@ collect_regime() {
   local mode="$1" out="$2"
   local trace_pn pmc_pn
   if [ "$mode" = "prefill" ]; then
+    # Prefill: one forward pass over PROMPT tokens; -d does not apply (no cached
+    # context to prime -- the pass IS the context build).
     trace_pn=(-p "$PROMPT" -n 0); pmc_pn=(-p "$PROMPT" -n 0)
   else
-    trace_pn=(-p 0 -n "$NTOK");  pmc_pn=(-p 0 -n "$PMC_NTOK")
+    # Decode: periodic per-token stream. Prime the KV cache to DEPTH (canonical) so the
+    # traced/measured tokens are steady-state, matching the benchmark.
+    trace_pn=(-p 0 -n "$NTOK"  "${DEPTH_ARGS[@]}")
+    pmc_pn=(-p 0 -n "$PMC_NTOK" "${DEPTH_ARGS[@]}")
   fi
   mkdir -p "$out/trace" "$out/stall" "$out/fetch"
   echo "=== [$mode] out=$out (trace: ${trace_pn[*]}; pmc: ${pmc_pn[*]}) ==="
@@ -171,7 +210,8 @@ collect_regime() {
   echo "--- clean run (no rocprofv3, -r $CLEAN_REPS -o json) -> untraced tok/s (${trace_pn[*]}) ---"
   ( cd "$BUILD_DIR"
     LD_LIBRARY_PATH="$BUILD_DIR:$ROCM_LIBS:${LD_LIBRARY_PATH:-}" \
-      ./llama-bench -o json -r "$CLEAN_REPS" -m "$MODEL" "${trace_pn[@]}" "${EXTRA[@]}" ) \
+      ./llama-bench -o json -r "$CLEAN_REPS" -m "$MODEL" \
+        "${trace_pn[@]}" "${CANONICAL_ARGS[@]}" "${EXTRA[@]}" ) \
       | tee "$out/clean_tps.txt" | grep -E '"(n_prompt|n_gen|avg_ts)"' || true
 
   # 1. sys-trace (real timing; build dir first so llama-bench finds its libs).
@@ -181,7 +221,7 @@ collect_regime() {
     LD_LIBRARY_PATH="$BUILD_DIR:$ROCM_LIBS:${LD_LIBRARY_PATH:-}" \
     run_ok '*_kernel_trace.csv' "$out/trace" \
       "$ROCPROFV3" --sys-trace --output-format pftrace csv -d "$out/trace" -- \
-      ./llama-bench -m "$MODEL" "${trace_pn[@]}" "${EXTRA[@]}" )
+      ./llama-bench -m "$MODEL" "${trace_pn[@]}" "${CANONICAL_ARGS[@]}" "${EXTRA[@]}" )
 
   # 2/3. PMC (system ROCm runtime FIRST on LD_LIBRARY_PATH, no build dir).
   local pmc_run
@@ -191,7 +231,7 @@ collect_regime() {
       LD_LIBRARY_PATH="$ROCM_LIBS:${LD_LIBRARY_PATH:-}" \
       run_ok '*_counter_collection.csv' "$dir" \
         "$ROCPROFV3" --pmc "$@" --output-format csv "${KREGEX[@]}" -d "$dir" -- \
-        ./llama-bench -m "$MODEL" "${pmc_pn[@]}" "${EXTRA[@]}" )
+        ./llama-bench -m "$MODEL" "${pmc_pn[@]}" "${CANONICAL_ARGS[@]}" "${EXTRA[@]}" )
   }
   echo "--- PMC stall counters (${pmc_pn[*]}) ---"
   pmc_run "$out/stall" $STALL_COUNTERS

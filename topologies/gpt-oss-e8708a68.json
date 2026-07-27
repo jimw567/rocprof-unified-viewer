@@ -1,6 +1,6 @@
 {
- "topology_key": "qwen3moe-5b4866b2",
- "architecture": "qwen3moe",
+ "topology_key": "gpt-oss-e8708a68",
+ "architecture": "gpt-oss",
  "source": "ggml-roofline (PR#66) storage-id topology, last-writer-wins; layer/token-deduped, timing-free. Faithful node->src[] edges. Keyed by architecture + block tensor-role fingerprint.",
  "n_variants": 1,
  "nodes": [
@@ -18,8 +18,8 @@
    "src": [
     0
    ],
-   "fam": "mul_mat_vec_q[Q4_K]",
-   "quant": "q4_K",
+   "fam": "mul_mat_vec_q[Q8_0]",
+   "quant": "q8_0",
    "role": "attn_q",
    "roles": [
     "attn_q"
@@ -29,25 +29,46 @@
      "fam": "quantize_q8_1"
     },
     {
-     "fam": "mul_mat_vec_q[Q4_K]"
+     "fam": "mul_mat_vec_q[Q8_0]"
     }
    ]
-  },
-  {
-   "name": "norm",
-   "op": "RMS_NORM",
-   "src": [
-    1
-   ],
-   "fam": "rms_norm_f32",
-   "quant": "f32",
-   "role": ""
   },
   {
    "name": "Qcur",
    "op": "ROPE",
    "src": [
-    2
+    1
+   ],
+   "fam": "rope_neox",
+   "quant": "f32",
+   "role": ""
+  },
+  {
+   "name": "Kcur",
+   "op": "MUL_MAT",
+   "src": [
+    0
+   ],
+   "fam": "mul_mat_vec_q[Q8_0]",
+   "quant": "q8_0",
+   "role": "attn_k",
+   "roles": [
+    "attn_k"
+   ],
+   "kernels": [
+    {
+     "fam": "quantize_q8_1"
+    },
+    {
+     "fam": "mul_mat_vec_q[Q8_0]"
+    }
+   ]
+  },
+  {
+   "name": "Kcur",
+   "op": "ROPE",
+   "src": [
+    3
    ],
    "fam": "rope_neox",
    "quant": "f32",
@@ -59,8 +80,8 @@
    "src": [
     0
    ],
-   "fam": "mul_mat_vec_q[Q6_K]",
-   "quant": "q6_K",
+   "fam": "mul_mat_vec_q[Q8_0]",
+   "quant": "q8_0",
    "role": "attn_v",
    "roles": [
     "attn_v"
@@ -70,53 +91,12 @@
      "fam": "quantize_q8_1"
     },
     {
-     "fam": "mul_mat_vec_q[Q6_K]"
+     "fam": "mul_mat_vec_q[Q8_0]"
     }
    ]
   },
   {
-   "name": "Kcur",
-   "op": "MUL_MAT",
-   "src": [
-    0
-   ],
-   "fam": "mul_mat_vec_q[Q4_K]",
-   "quant": "q4_K",
-   "role": "attn_k",
-   "roles": [
-    "attn_k"
-   ],
-   "kernels": [
-    {
-     "fam": "quantize_q8_1"
-    },
-    {
-     "fam": "mul_mat_vec_q[Q4_K]"
-    }
-   ]
-  },
-  {
-   "name": "norm",
-   "op": "RMS_NORM",
-   "src": [
-    5
-   ],
-   "fam": "rms_norm_f32",
-   "quant": "f32",
-   "role": ""
-  },
-  {
-   "name": "Kcur",
-   "op": "ROPE",
-   "src": [
-    6
-   ],
-   "fam": "rope_neox",
-   "quant": "f32",
-   "role": ""
-  },
-  {
-   "name": "cache_v (view)",
+   "name": "cache_k (view)",
    "op": "SET_ROWS",
    "src": [
     4
@@ -126,12 +106,22 @@
    "role": ""
   },
   {
+   "name": "cache_v (view)",
+   "op": "SET_ROWS",
+   "src": [
+    5
+   ],
+   "fam": "k_set_rows",
+   "quant": "f32",
+   "role": ""
+  },
+  {
    "name": "node",
    "op": "FLASH_ATTN_EXT",
    "src": [
-    3,
-    7,
-    8
+    2,
+    6,
+    7
    ],
    "fam": "flash_attn_combine_results",
    "quant": "f32",
@@ -149,10 +139,10 @@
    "name": "node",
    "op": "MUL_MAT",
    "src": [
-    9
+    8
    ],
-   "fam": "mul_mat_vec_q[Q4_K]",
-   "quant": "q4_K",
+   "fam": "mul_mat_vec_q[Q8_0]",
+   "quant": "q8_0",
    "role": "attn_output",
    "roles": [
     "attn_output"
@@ -162,34 +152,15 @@
      "fam": "quantize_q8_1"
     },
     {
-     "fam": "mul_mat_vec_q[Q4_K]"
+     "fam": "mul_mat_vec_q[Q8_0]"
     }
    ]
-  },
-  {
-   "name": "node",
-   "op": "GET_ROWS",
-   "src": [
-    10
-   ],
-   "fam": "k_get_rows_float",
-   "quant": "f32",
-   "role": ""
-  },
-  {
-   "name": "node",
-   "op": "GET_ROWS",
-   "src": [],
-   "fam": "k_get_rows_float",
-   "quant": "f32",
-   "role": ""
   },
   {
    "name": "ffn_inp",
    "op": "ADD",
    "src": [
-    11,
-    12
+    9
    ],
    "fam": "k_bin_bcast[add]",
    "quant": "f32",
@@ -199,7 +170,7 @@
    "name": "norm",
    "op": "RMS_NORM",
    "src": [
-    13
+    10
    ],
    "fam": "rms_norm_f32",
    "quant": "f32",
@@ -209,7 +180,7 @@
    "name": "ffn_moe_logits",
    "op": "MUL_MAT",
    "src": [
-    14
+    11
    ],
    "fam": "mul_mat_vec_f",
    "quant": "f32",
@@ -219,10 +190,10 @@
    ]
   },
   {
-   "name": "ffn_moe_probs",
-   "op": "SOFT_MAX",
+   "name": "ffn_moe_argsort",
+   "op": "ARGSORT",
    "src": [
-    15
+    12
    ],
    "fam": "topk_moe_cuda",
    "quant": "f32",
@@ -232,10 +203,10 @@
    "name": "ffn_moe_gate",
    "op": "MUL_MAT_ID",
    "src": [
-    14
+    11
    ],
-   "fam": "mul_mat_vec_q[Q4_K]",
-   "quant": "q4_K",
+   "fam": "mul_mat_vec_q[MXFP4]",
+   "quant": "mxfp4",
    "role": "ffn_gate_exps",
    "roles": [
     "ffn_gate_exps"
@@ -245,7 +216,7 @@
      "fam": "quantize_q8_1"
     },
     {
-     "fam": "mul_mat_vec_q[Q4_K]"
+     "fam": "mul_mat_vec_q[MXFP4]"
     }
    ]
   },
@@ -253,10 +224,10 @@
    "name": "ffn_moe_down",
    "op": "MUL_MAT_ID",
    "src": [
-    17
+    14
    ],
-   "fam": "mul_mat_vec_q[Q6_K]",
-   "quant": "q6_K",
+   "fam": "mul_mat_vec_q[MXFP4]",
+   "quant": "mxfp4",
    "role": "ffn_down_exps",
    "roles": [
     "ffn_down_exps"
@@ -266,7 +237,7 @@
      "fam": "quantize_q8_1"
     },
     {
-     "fam": "mul_mat_vec_q[Q6_K]"
+     "fam": "mul_mat_vec_q[MXFP4]"
     }
    ]
   },
@@ -274,8 +245,8 @@
    "name": "ffn_moe_weighted",
    "op": "MUL",
    "src": [
-    18,
-    16
+    15,
+    13
    ],
    "fam": "k_bin_bcast[mul]",
    "quant": "f32",
@@ -285,7 +256,7 @@
    "name": "node",
    "op": "ADD",
    "src": [
-    19
+    16
    ],
    "fam": "k_bin_bcast[add]",
    "quant": "f32",
@@ -295,8 +266,8 @@
    "name": "l_out",
    "op": "ADD",
    "src": [
-    20,
-    13
+    17,
+    10
    ],
    "fam": "k_bin_bcast[add]",
    "quant": "f32",
