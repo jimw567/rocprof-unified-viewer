@@ -20,8 +20,21 @@ jobs:
         with:
           python-version: "3.12"
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
       - name: Compile modules
         run: python -m py_compile rocprof_unified_viewer.py serve.py disasm_loadwidth.py
+
+      - name: JS syntax check
+        # The frontend JS lives in js/*.js (inlined into the overlay at build time). Parse
+        # it so JS errors fail the build, not the browser -- see tests/test_js_syntax.py.
+        run: |
+          for f in js/*.js; do
+            sed 's/__DATA__/{}/g' "$f" > /tmp/_chk.js && node --check /tmp/_chk.js \
+              || { echo "::error::node --check failed on $f"; exit 1; }
+          done
 
       - name: ASCII purity check
         # Core generator + tooling + tests must stay ASCII (hard repo rule). The
