@@ -84,6 +84,9 @@ def test_layer_graph_input(tmp_path):
     # through so the popup can honestly label edge trust.
     assert lg.get("edges_inferred") is True, "edges_inferred flag not passed through"
     assert "inferred edges" in html, "frontend missing inferred-edges honesty banner"
+    # Graph-view fusion analysis: the popup must carry the analysis fn + its model inputs.
+    assert "function analyzeFusion" in html, "popup missing fusion analysis"
+    assert "fam_counters:D.fam_counters" in html, "popup missing fam_counters for fusion model"
 
 
 def test_roofline_topology_reconstruction(tmp_path):
