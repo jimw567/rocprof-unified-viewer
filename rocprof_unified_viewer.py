@@ -63,6 +63,8 @@ import subprocess
 import sys
 from collections import defaultdict
 
+from regimes import regime_for
+
 # Generator version. Bump alongside pyproject.toml's [project] version when the
 # output format or a user-visible behavior changes -- it is stamped into every
 # overlay (payload["provenance"]) so a shared HTML self-identifies what produced it.
@@ -2264,95 +2266,17 @@ def build_payload(args):
         gguf_tensors, gguf_meta = load_gguf_tensors(args.gguf)
     model_arch = gguf_meta.get("general.architecture", "")
 
-    if args.mode == "prefill":
-        # Prefill = ONE prompt-processing forward pass (MMQ GEMMs). llama-bench runs an
-        # eager warmup, then repeats the MEASURED pass several times -- each measured pass
-        # is ONE hipGraphLaunch. So the clean way to isolate a single pass is to bake the
-        # GPU kernels between the last two hipGraphLaunch timestamps. (The old "last big
-        # inter-dispatch gap" heuristic baked ALL the repeated measured passes at once,
-        # because they run back-to-back with no idle gap between them -> ~Nx the weights,
-        # wrecking the order-map.) Fall back to the gap heuristic only if the HIP trace
-        # has no graph launches (e.g. a graphs-disabled capture).
-        gl = graph_launch_starts(args.hip_csv)
-        baked = None
-        if len(gl) >= 2:
-            lo_t, hi_t = gl[-2], gl[-1]      # the last complete measured pass
-            baked = [ev for ev in evs if lo_t <= ev[0] < hi_t]
-        if not baked:
-            prologue = next((i for i, ev in enumerate(evs) if "mul_mat" in ev[2]), 0)
-            GAP_NS = max(2_000_000, int(args.gap_threshold_us * 1000))  # >= 2ms
-            a = prologue
-            for i in range(len(evs) - 1, prologue, -1):
-                if evs[i][0] - evs[i - 1][1] > GAP_NS:
-                    a = i
-                    break
-            baked = evs[a:len(evs)]
-        if not baked:
-            sys.exit("error: no mul_mat* dispatches in prefill trace "
-                     f"{args.kernel_csv}; is this a prefill (-p N -n 0) run?")
-        t_first, t_last = baked[0][0], baked[-1][1]
-        # Start the window a touch before the first kernel so a little bit of the
-        # driving hipStreamSynchronize / launch shows in the CPU lane as lead-in,
-        # and extend the end past the last kernel so the finish reads clearly.
-        span = t_last - t_first
-        # Head lead-in: pull back far enough to show a sliver of the PREVIOUS launch
-        # (the warmup tail / graph-setup that precedes the measured pass), so the
-        # start reads in context rather than beginning cold at the first kernel.
-        head_pad = min(int(span * 0.10), 12_000_000)  # <= 12ms lead-in
-        tail_pad = min(int(span * 0.05), 8_000_000)   # <= 8ms trailing room
-        t0, t1 = t_first - head_pad, t_last + tail_pad
-        # One span. The client viewport is [tok_starts[view_i0], tok_starts[view_i1]),
-        # so hand it two entries (pass start, pass end) => the initial viewport spans
-        # the whole forward pass instead of collapsing to zero width. These also render
-        # as the two delimiting markers. The order-map reset boundary is still just {0}.
-        tok_starts = [t0, t1]
-        lo_tok = 0
-        view_i0 = 0
-        view_i1 = 1
-    else:
-        # Token segmentation strategy is chosen per model architecture (see
-        # BOUNDARY_PROFILES). The two detectors stay generic; the profile only picks
-        # which one + threshold. --boundary-method overrides the profile's method;
-        # --gap-threshold-us (if set) overrides the profile's gap_us.
-        prof = boundary_profile_for(model_arch)
-        method = args.boundary_method or prof["method"]
-        # Gap threshold precedence: explicit CLI flag > profile gap_us > flag default.
-        gap_us = args.gap_threshold_us
-        if not args._gap_threshold_set and prof["gap_us"] is not None:
-            gap_us = prof["gap_us"]
-
-        # "head" = output-head anchor only (robust for eager MoE); "gap" = inter-dispatch
-        # gap detector; "auto" = head first, gap fallback (the historical default, used
-        # for unknown/dense archs where either can work).
-        if method == "head":
-            bounds = detect_boundaries_by_head(evs)
-        elif method == "gap":
-            bounds = detect_boundaries(evs, gap_us * 1000)
-        else:  # "auto"
-            bounds = detect_boundaries_by_head(evs)
-            if len(bounds) < args.skip_tokens + args.tokens + 2:
-                gap_bounds = detect_boundaries(evs, gap_us * 1000)
-                if len(gap_bounds) > len(bounds):
-                    bounds = gap_bounds
-        if len(bounds) < args.skip_tokens + args.tokens + 2:
-            sys.exit(f"error: only {len(bounds)} token boundaries detected "
-                     f"(arch={model_arch or 'unknown'}, method={method}); need > "
-                     f"{args.skip_tokens + args.tokens}. Lower --skip-tokens, "
-                     f"try --boundary-method, or lower --gap-threshold-us.")
-
-        # Bake a wider span (context on each side) so the stepper can pan.
-        lo_tok = max(0, args.skip_tokens - args.context_tokens)
-        hi_tok = min(len(bounds) - 1, args.skip_tokens + args.tokens + args.context_tokens)
-        a = bounds[lo_tok]
-        b = bounds[hi_tok]
-        baked = evs[a:b]
-        t0, t1 = baked[0][0], baked[-1][1]
-
-        # Token boundary timestamps within the baked span (for stepper snapping).
-        tok_starts = [evs[bounds[k]][0] for k in range(lo_tok, hi_tok + 1)]
-        # Initial viewport = the first `tokens` tokens after the leading context.
-        view_i0 = args.context_tokens if lo_tok > 0 else 0
-        view_i1 = min(len(tok_starts) - 1, view_i0 + args.tokens)
+    # Regime = the ONE place decode vs prefill diverge on how to slice + interpret the
+    # trace. It owns window selection, the order-map reference, and metric labels, so the
+    # shared payload path below has NO `if mode ==` for those -- a decode change can't
+    # touch prefill (see regimes/). The Window carries everything downstream needs.
+    regime = regime_for(args.mode)
+    win = regime.select_window(evs, args, model_arch)
+    baked = win.baked
+    t0, t1 = win.t0, win.t1
+    tok_starts = win.tok_starts
+    lo_tok = win.lo_tok
+    view_i0, view_i1 = win.view_i0, win.view_i1
 
     # PMC families -> color/stall lookup.
     fams = load_pmc_families(args.pmc_csv) if args.pmc_csv else {}
@@ -2432,14 +2356,11 @@ def build_payload(args):
     #             (one pass, no per-token repeat). N recovered as grid.x*mmq_y (above).
     expected_seq = []
     # gguf_tensors/gguf_meta already loaded up front (before boundary detection).
-    mm_key = "mul_mat_q" if args.mode == "prefill" else "mul_mat_vec"
+    # mm_key + the order-map reference come from the regime (decode: one steady-state token;
+    # prefill: the whole baked pass) -- no mode branch here.
+    mm_key = regime.mm_key
     if args.gguf:
-        if args.mode == "prefill":
-            ref = [n for (s, e, nm, n, _nb, _gy) in baked if mm_key in nm and n]
-        else:
-            ref = [n for (s, e, nm, n, _nb, _gy) in evs[bounds[args.skip_tokens]:
-                                              bounds[args.skip_tokens + 1]]
-                   if mm_key in nm and n]
+        ref = win.ref
         best = None
         for drop in (True, False):
             cand = build_expected_sequence(gguf_tensors, drop)
@@ -2505,13 +2426,10 @@ def build_payload(args):
     fetch_by_name = (load_fetch_bytes_mapped(args.fetch_csv, expected_seq)
                      if (args.fetch_csv and expected_seq) else {})
 
-    # Baked-relative indices where a new decode token starts (reset the order-map
-    # pointer here so each token re-aligns to the expected sequence head). Prefill
-    # is a single baked span -> one boundary at index 0.
-    if args.mode == "prefill":
-        tok_boundary_idx = {0}
-    else:
-        tok_boundary_idx = {bounds[k] - a for k in range(lo_tok, hi_tok + 1)}
+    # Baked-relative indices where a new unit starts (reset the order-map pointer here so
+    # each unit re-aligns to the expected sequence head). Regime-computed: decode = per-token
+    # boundaries, prefill = a single span {0}.
+    tok_boundary_idx = win.tok_boundary_idx
 
     # GPU slices in the baked span (relative ns from t0). If a GGUF sequence was
     # built, order-map each mul_mat_vec dispatch to its expected weight tensor
@@ -2890,23 +2808,10 @@ def build_payload(args):
     # once-per-token host-serialized GDN edge, launch bubbles, interrupt latency).
     # Keyed "ti|family" so a rare token with a different kernel count self-segregates
     # rather than blending mismatched positions. Durations are ns (JS renders us).
-    kstats = {}
-    # Per-position kernel-duration stats need the periodic per-token segmentation;
-    # prefill's single pass has no repeats to aggregate over.
-    kstats_ntok = 0 if args.mode == "prefill" else max(0, len(bounds) - 1 - args.skip_tokens)
-    if kstats_ntok > 0:
-        agg = defaultdict(list)
-        for k in range(args.skip_tokens, len(bounds) - 1):
-            for ti, (s, e, nm, _n, _nb, _gy) in enumerate(evs[bounds[k]:bounds[k + 1]]):
-                agg[(ti, family_of(nm))].append(e - s)
-        for (ti, fam), durs in agg.items():
-            cnt = len(durs)
-            mean = sum(durs) / cnt
-            std = (sum((d - mean) ** 2 for d in durs) / cnt) ** 0.5 if cnt > 1 else 0.0
-            kstats["%d|%s" % (ti, fam)] = {
-                "n": cnt, "mean": round(mean, 1), "std": round(std, 1),
-                "min": round(min(durs), 1), "max": round(max(durs), 1),
-            }
+    # Per-position kernel-duration stats: regime-computed (decode aggregates over the
+    # periodic per-token repeats; prefill's single pass has none -> empty).
+    kstats = win.kstats
+    kstats_ntok = win.kstats_ntok
 
     # Layer swim-lane: segment the baked GPU slices into per-decode-layer spans
     # using the order-map's true GGUF block index (map.L). Leading input-norm /
@@ -3124,7 +3029,7 @@ def build_payload(args):
 
     span_ns = t1 - t0
     # Prefill bakes one forward pass (a single span); decode bakes (hi-lo) tokens.
-    ntok_baked = 1 if args.mode == "prefill" else hi_tok - lo_tok
+    ntok_baked = win.ntok_baked   # decode tokens baked; 1 for prefill (regime)
 
     # Per-family summary (over the baked span), enriched with PMC counters and,
     # if a FETCH_SIZE run was given, MEASURED achieved DRAM bandwidth. bytes/disp
