@@ -3462,12 +3462,13 @@ _DEBUG_SHORTCUTS_HTML = shortcuts_help_html("dbgKeys", "Shortcuts -- trace view"
 # Mouse/keyboard help for the per-layer compute-graph popup. Embedded into the graph
 # window's bar so it matches the "?" affordance on the other windows.
 _GRAPH_SHORTCUTS_HTML = shortcuts_help_html("graphKeys", "Shortcuts -- layer graph", [
-    ("Selection sync", [
-        ("click a node", "select + frame its kernel in the timeline (two-way sync)"),
+    ("Fusion analysis", [
+        ("click a node", "add / remove it from the fusion set (register + occupancy verdict)"),
+        ("click empty space", "clear the fusion set"),
         ("(select in timeline)", "highlights + centers the matching node here"),
     ]),
     ("Zoom / pan", [
-        ("drag", "pan the graph"),
+        ("shift + drag", "pan the graph"),
         ("ctrl/alt + wheel", "zoom at the cursor"),
         ("Zoom + / -", "zoom in / out"),
         ("Fit", "fit the whole layer graph in view"),
@@ -5059,7 +5060,7 @@ function openLayerGraph(L){
     `#bar .info{font-size:12px;color:#9fb0c4}`+
     `#bar .warn{font-size:12px;color:#e0b341;font-weight:600}`+
     `#wrap{flex:1 1 auto;overflow:hidden;min-height:0;position:relative}`+
-    `#cv{display:block;cursor:grab}`+
+    `#cv{display:block;cursor:default}`+
     `#foot{flex:0 0 auto;padding:8px 16px;background:#12161c;border-top:1px solid #2a3340;`+
     `font-size:12px;color:#9fb0c4}#foot b{color:#c8d0da}`+
     `</style></head><body>`+
@@ -5081,9 +5082,9 @@ function openLayerGraph(L){
     `border:1px solid #2a3340;border-radius:6px;padding:10px 12px;font-size:12px;`+
     `box-shadow:0 4px 16px rgba(0,0,0,.55)"></div>`+
     `</div>`+
-    `<div id="foot"><b style="color:#e0a341">Ctrl/Cmd-click</b> nodes to build a fusion `+
-    `set for analysis. Nodes = real GPU dispatches (names + <b>us</b> times match the `+
-    `kernel swim lane exactly). `+
+    `<div id="foot">Rectangles = compute ops (real GPU dispatches; names + <b>us</b> `+
+    `times match the kernel swim lane exactly); faded <b>pills</b> = input/output tensors `+
+    `from adjacent layers. `+
     (payload.edges_inferred
       ?`<b style="color:#e0b341">Edges are INFERRED</b> from dataflow semantics + `+
        `execution order (dashed = chain-only, where the block topology is not `+
@@ -5109,6 +5110,13 @@ function openLayerGraph(L){
     `var head=0;while(head<q.length){var u=q[head++];var ur=rank[u]||0;`+
     `for(var a=0;a<N.length;a++){var nd=N[a];if(nd.src.indexOf(u)>=0){`+
     `rank[nd.i]=Math.max(rank[nd.i]||0,ur+1);if(--ind2[nd.i]===0)q.push(nd.i);}}}`+
+    // Pull sourceless nodes (indeg 0) DOWN next to their earliest consumer. A get_rows/view
+    // whose producer sits outside the captured layer has no in-layer parent, so it ranks 0
+    // and strands far left with a long edge to its deep consumer. Re-rank it to
+    // (min consumer rank - 1) so it sits beside what it feeds instead of floating away.
+    `for(var a=0;a<N.length;a++){var nd=N[a];if(indeg[nd.i]!==0)continue;`+
+    `var mc=Infinity;for(var b=0;b<N.length;b++){if(N[b].src.indexOf(nd.i)>=0)mc=Math.min(mc,rank[N[b].i]||0);}`+
+    `if(mc!==Infinity&&mc>1)rank[nd.i]=mc-1;}`+
     // Bucket by rank; assign a row within each column.
     `var cols={},maxr=0;for(var a=0;a<N.length;a++){var r=rank[N[a].i]||0;maxr=Math.max(maxr,r);`+
     `(cols[r]=cols[r]||[]).push(N[a]);}`+
@@ -5130,10 +5138,15 @@ function openLayerGraph(L){
     `for(var b=0;b<node.src.length;b++){var s=node.src[b];if(byId[s]&&(rank[s]||0)===adjRank){acc+=ord[s];cnt++;}}`+
     `for(var a=0;a<N.length;a++){var o=N[a];if((rank[o.i]||0)===adjRank&&o.src.indexOf(node.i)>=0){acc+=ord[o.i];cnt++;}}`+
     `return cnt?acc/cnt:ord[node.i];}`+
+    // Role order so sibling attention projections cluster adjacently (Q,K next to each other
+    // -- they run identical q/k-norm+rope paths and both feed the attention op -- then V).
+    // Used as a barycenter TIE-BREAK: nodes with the same parent keep this stable order.
+    `var RORD={attn_q:0,attn_k:1,attn_v:2,attn_qkv:0,attn_output:3};`+
+    `function rkey(nd){var r=nd.role;return (r!=null&&RORD[r]!=null)?RORD[r]:99;}`+
     `for(var pass=0;pass<4;pass++){var down=(pass%2===0);`+
     `for(var rr=1;rr<=maxr;rr++){var r=down?rr:(maxr-rr);var adj=down?r-1:r+1;`+
     `var c=cols[r]||[];if(!c.length||adj<0||adj>maxr)continue;`+
-    `c.sort(function(p,q){return bary(p,adj)-bary(q,adj);});`+
+    `c.sort(function(p,q){var d=bary(p,adj)-bary(q,adj);if(Math.abs(d)>1e-6)return d;return rkey(p)-rkey(q);});`+
     `for(var k=0;k<c.length;k++)ord[c[k].i]=k;}}`+
     // if barycenter did not reduce crossings, revert to the original order
     `if(xings(ord)>=baseX){for(var r=0;r<=maxr;r++)cols[r]=baseCols[r];ord=slotmap();}`+
@@ -5158,6 +5171,17 @@ function openLayerGraph(L){
     // resolve overlaps left->right keeping order (min gap CW), then right->left
     `for(var k=1;k<row.length;k++){if(X[row[k].i]<X[row[k-1].i]+CW)X[row[k].i]=X[row[k-1].i]+CW;}`+
     `for(var k=row.length-2;k>=0;k--){if(X[row[k].i]>X[row[k+1].i]-CW)X[row[k].i]=X[row[k+1].i]-CW;}}}`+
+    // Final producer-alignment pass (runs LAST so it wins over the bidirectional relaxation
+    // above, whose last sweep aligns to children). A consumer sits in its producer's column
+    // when it has ONE producer; with several producers it centers on the MIDDLE (median) of
+    // them. Top-down so a producer's x is already settled; de-overlap keeps order + min gap.
+    `for(var pr=0;pr<3;pr++){for(var r=1;r<=maxr;r++){var row=cols[r]||[];`+
+    `for(var k=0;k<row.length;k++){var nd=row[k];var px=[];`+
+    `for(var b=0;b<nd.src.length;b++){var s=nd.src[b];if(byId[s]&&(rank[s]||0)<r)px.push(X[s]);}`+
+    `if(px.length){px.sort(function(a,b){return a-b;});`+
+    `X[nd.i]=px.length%2?px[(px.length-1)/2]:(px[px.length/2-1]+px[px.length/2])/2;}}`+
+    `for(var k=1;k<row.length;k++){if(X[row[k].i]<X[row[k-1].i]+CW)X[row[k].i]=X[row[k-1].i]+CW;}`+
+    `for(var k=row.length-2;k>=0;k--){if(X[row[k].i]>X[row[k+1].i]-CW)X[row[k].i]=X[row[k+1].i]-CW;}}}`+
     // normalize to a positive origin and finalize positions
     `var minX=1e9;for(var a=0;a<N.length;a++)minX=Math.min(minX,X[N[a].i]);`+
     `var pos={},maxX=0;for(var r=0;r<=maxr;r++){var row=cols[r]||[];`+
@@ -5172,6 +5196,8 @@ function openLayerGraph(L){
     `function opcol(op){return OPCOL[op]||'#3a4553';}`+
     `function fit(){var dpr=window.devicePixelRatio||1;var W=wrap.clientWidth,H=wrap.clientHeight;`+
     `Z=Math.min(W/GW,H/GH,1.5);Z=Math.max(Z,0.15);OX=(W-GW*Z)/2;OY=(H-GH*Z)/2;draw();}`+
+    // rubber-band box state (declared before draw so draw can render it in screen space).
+    `var rb=false,rbX0=0,rbY0=0,rbX1=0,rbY1=0;`+
     `function draw(){var dpr=window.devicePixelRatio||1;var W=wrap.clientWidth,H=wrap.clientHeight;`+
     `cv.width=W*dpr;cv.height=H*dpr;cv.style.width=W+'px';cv.style.height=H+'px';`+
     `var g=cv.getContext('2d');g.setTransform(dpr,0,0,dpr,0,0);g.clearRect(0,0,W,H);`+
@@ -5196,7 +5222,14 @@ function openLayerGraph(L){
     // fusion-set member = amber ring; lane-synced node = blue ring; amber wins when both
     `g.strokeStyle=infuse?'#e0a341':(issel?'#4d90fe':(nd.ext?'#2a3340':'#0b0d12'));`+
     `g.lineWidth=(infuse||issel)?2.5:1;`+
-    `g.beginPath();g.rect(pd.x,pd.y,BW,BH);g.fill();g.stroke();g.globalAlpha=1;`+
+    // Shape encodes KIND: external input/output tensors (nd.ext) draw as a rounded PILL so
+    // they read as data stubs, not compute; op nodes stay sharp rectangles.
+    `g.beginPath();`+
+    `if(nd.ext){var rr=BH/2,xa=pd.x+rr,xb=pd.x+BW-rr;`+
+    `g.moveTo(xa,pd.y);g.lineTo(xb,pd.y);g.arc(xb,pd.y+rr,rr,-Math.PI/2,Math.PI/2);`+
+    `g.lineTo(xa,pd.y+BH);g.arc(xa,pd.y+rr,rr,Math.PI/2,-Math.PI/2);g.closePath();}`+
+    `else{g.rect(pd.x,pd.y,BW,BH);}`+
+    `g.fill();g.stroke();g.globalAlpha=1;`+
     // line 1 = kernel family (matches the swim-lane label so nodes are recognizable);
     // line 2 = the ggml tensor name (Qcur, ffn_moe_gate) for dataflow context.
     `var flabel=nd.label||nd.fam||nd.op;flabel=flabel.length>26?flabel.slice(0,25)+'\\u2026':flabel;`+
@@ -5215,7 +5248,13 @@ function openLayerGraph(L){
     `g.fillStyle='#c8d98a';g.font='10px sans-serif';g.fillText(bt,pd.x+BW-27,pd.y+11);`+
     `g.font='12px -apple-system,Segoe UI,sans-serif';}`+
     `else if(!nd.ext){g.fillStyle='#6f7d8f';g.fillText('--',pd.x+8,pd.y+44);}}`+
-    `g.restore();}`+
+    `g.restore();`+
+    // rubber-band selection box (screen space, after the pan/zoom transform is restored).
+    `if(rb){g.strokeStyle='#4d90fe';g.lineWidth=1;g.setLineDash([4,3]);`+
+    `g.fillStyle='rgba(77,144,254,.12)';`+
+    `var bx=Math.min(rbX0,rbX1),by=Math.min(rbY0,rbY1),bw=Math.abs(rbX1-rbX0),bh=Math.abs(rbY1-rbY0);`+
+    `g.fillRect(bx,by,bw,bh);g.strokeRect(bx,by,bw,bh);g.setLineDash([]);}`+
+    `}`+
     // Wheel = zoom only with Ctrl/Alt held (matches the timeline + tiling/CC/util
     // popups); plain wheel is left to the browser. Zoom is anchored at the cursor.
     `wrap.addEventListener('wheel',function(e){if(!(e.ctrlKey||e.altKey))return;`+
@@ -5227,12 +5266,35 @@ function openLayerGraph(L){
     `function nodeAt(mx,my){var wx=(mx-OX)/Z,wy=(my-OY)/Z;`+
     `for(var a=0;a<N.length;a++){var nd=N[a],pd=pos[nd.i];if(!pd)continue;`+
     `if(wx>=pd.x&&wx<=pd.x+BW&&wy>=pd.y&&wy<=pd.y+BH)return nd;}return null;}`+
-    `cv.addEventListener('mousedown',function(e){pan=true;moved=false;px=e.clientX;py=e.clientY;`+
-    `downX=e.clientX;downY=e.clientY;cv.style.cursor='grabbing';});`+
-    `window.addEventListener('mousemove',function(e){if(!pan)return;`+
-    `if(Math.abs(e.clientX-downX)>3||Math.abs(e.clientY-downY)>3)moved=true;`+
-    `OX+=e.clientX-px;OY+=e.clientY-py;px=e.clientX;py=e.clientY;draw();});`+
-    `window.addEventListener('mouseup',function(e){pan=false;cv.style.cursor='grab';});`+
+    // Interaction (matches the main timeline window): SHIFT+drag = pan; plain drag = rubber-band
+    // box select (adds every enclosed node to the fusion set); plain click on a node = toggle it.
+    `cv.addEventListener('mousedown',function(e){var r=cv.getBoundingClientRect();`+
+    `downX=e.clientX;downY=e.clientY;`+
+    `if(e.shiftKey){pan=true;px=e.clientX;py=e.clientY;cv.style.cursor='grabbing';}`+
+    `else{pan=false;rb=true;rbX0=rbX1=e.clientX-r.left;rbY0=rbY1=e.clientY-r.top;}});`+
+    `window.addEventListener('mousemove',function(e){`+
+    `if(pan){OX+=e.clientX-px;OY+=e.clientY-py;px=e.clientX;py=e.clientY;draw();return;}`+
+    `if(rb){var r=cv.getBoundingClientRect();rbX1=e.clientX-r.left;rbY1=e.clientY-r.top;draw();}});`+
+    `window.addEventListener('mouseup',function(e){`+
+    `if(pan){pan=false;cv.style.cursor='default';return;}`+
+    `var wasDrag=Math.abs(e.clientX-downX)>3||Math.abs(e.clientY-downY)>3;`+
+    `if(rb&&wasDrag){`+
+    // rubber-band: add every node whose box center is inside the drag rectangle to the set.
+    `var lo=(Math.min(rbX0,rbX1)-OX)/Z,hi=(Math.max(rbX0,rbX1)-OX)/Z;`+
+    `var lt=(Math.min(rbY0,rbY1)-OY)/Z,gt=(Math.max(rbY0,rbY1)-OY)/Z;`+
+    `for(var a=0;a<N.length;a++){var nd=N[a],pd=pos[nd.i];if(!pd)continue;`+
+    `var cx=pd.x+BW/2,cy=pd.y+BH/2;if(cx>=lo&&cx<=hi&&cy>=lt&&cy<=gt)SELSET[nd.i]=true;}`+
+    `rb=false;draw();try{renderFusion();}catch(err){}return;}`+
+    `rb=false;`+
+    `if(wasDrag)return;`+  // a tiny drag that hit no box -> ignore
+    // plain click: toggle one node (or clear on empty space).
+    `var r=cv.getBoundingClientRect();var nd=nodeAt(e.clientX-r.left,e.clientY-r.top);`+
+    `if(nd){if(SELSET[nd.i])delete SELSET[nd.i];else SELSET[nd.i]=true;SEL=nd.i;}`+
+    `else{SELSET={};SEL=null;}`+
+    // draw the ring FIRST (never blocked), then the analysis panel. If the panel throws, show
+    // the error IN the panel rather than hiding it silently, so it is never mysteriously absent.
+    `draw();try{renderFusion();}catch(err){var fp=document.getElementById('fusion');`+
+    `if(fp){fp.innerHTML='<b style=\"color:#ff6b6b\">fusion panel error</b><br>'+esc(String(err));fp.style.display='block';}}});`+
     // hover a node -> tooltip listing the GPU kernels this op launched (with times), so
     // folded prep kernels like quantize_q8_1 are visible without cluttering the graph.
     `var ktip=document.getElementById('ktip');`+
@@ -5248,16 +5310,7 @@ function openLayerGraph(L){
     `ktip.style.left=Math.min(e.clientX-r.left+14,r.width-330)+'px';`+
     `ktip.style.top=(e.clientY-r.top+14)+'px';});`+
     `cv.addEventListener('mouseleave',function(){ktip.style.display='none';});`+
-    // a click (no drag) on a node: highlight it locally. (Graph->swim-lane selection was
-    // removed -- fam-only matching couldn't reliably pick the exact dispatch, so it was
-    // more confusing than useful. Swim-lane -> graph highlighting is kept below.)
-    `cv.addEventListener('click',function(e){if(moved)return;`+
-    `var r=cv.getBoundingClientRect();var nd=nodeAt(e.clientX-r.left,e.clientY-r.top);`+
-    // ctrl/cmd-click builds the manual fusion set; plain click inspects one node + clears
-    // the fusion set. Clicking empty space with a modifier does nothing; plain clears all.
-    `if(e.ctrlKey||e.metaKey){if(nd){if(SELSET[nd.i])delete SELSET[nd.i];else SELSET[nd.i]=true;renderFusion();draw();}return;}`+
-    `SELSET={};renderFusion();`+
-    `if(!nd){SEL=null;draw();return;}SEL=nd.i;draw();});`+
+    // (node selection is handled in the mouseup listener above, so no separate click handler.)
     // apply a selection posted BY the parent: highlight + center the matching node. Match
     // by exact span first (trace-derived), else by kernel family (roofline).
     `function ruvApply(sel){if(!sel){SEL=null;draw();return;}`+
@@ -5303,26 +5356,29 @@ function openLayerGraph(L){
     `var Wf=Math.max(0,Math.max.apply(0,Ws)),anyScr=sc.some(function(x){return x>0;});`+
     `var busyUs=nodes.reduce(function(a,n){return a+(n.us||0);},0);`+
     `var oBest=occFor(vMax,lMax,Wf),oWorst=occFor(vSum,lSum,Wf);`+
-    `return {nodes:nodes,fams:fams,conn:conn,vMax:vMax,vSum:vSum,lMax:lMax,lSum:lSum,`+
+    `return {nodes:nodes,fams:fams,conn:conn,vMax:vMax,vSum:vSum,lMax:lMax,lSum:lSum,Wf:Wf,`+
     `anyScr:anyScr,busyUs:busyUs,oBest:oBest,oWorst:oWorst};}`+
     `function renderFusion(){var fp=document.getElementById('fusion');`+
     `var ids=Object.keys(SELSET).map(Number);`+
     `if(!ids.length){fp.style.display='none';return;}`+
-    `var A=analyzeFusion(ids);var h='<b style=\"color:#e0a341\">Fusion set</b> ('+A.nodes.length+' nodes)';`+
-    // connectivity verdict
-    `h+=A.conn?'<div style=\"color:#8fe388;margin:4px 0\">connected -- shares dataflow</div>'`+
+    `var A=analyzeFusion(ids);var multi=A.nodes.length>=2;`+
+    // Header: one node = just inspect its registers; 2+ = a fusion candidate set.
+    `var h=multi?('<b style=\"color:#e0a341\">Fusion set</b> ('+A.nodes.length+' nodes)')`+
+    `:'<b style=\"color:#9fb0c4\">Selected node</b> -- registers / occupancy';`+
+    // connectivity verdict -- only meaningful for 2+ nodes (a single node is trivially "connected").
+    `if(multi)h+=A.conn?'<div style=\"color:#8fe388;margin:4px 0\">connected -- shares dataflow</div>'`+
     `:'<div style=\"color:#ff6b6b;margin:4px 0\">NOT connected -- these ops do not share data, cannot fuse</div>';`+
-    // family table
+    // per-family register table (shown for any selection).
     `h+='<table style=\"width:100%;border-collapse:collapse;margin-top:4px\">';`+
     `h+='<tr style=\"color:#9fb0c4\"><td>family</td><td>x</td><td>VGPR</td><td>LDS</td><td>occ</td></tr>';`+
     `for(var a=0;a<A.fams.length;a++){var f=A.fams[a],fc=FC[f.fam]||{};`+
     `h+='<tr><td>'+esc(f.fam)+'</td><td>'+f.n+'</td><td>'+(fc.vgpr||'-')+'</td><td>'+(fc.lds_static?KB(fc.lds_static):'0')+'</td><td>'+(fc.occ?fc.occ+'%':'-')+'</td></tr>';}`+
     `h+='</table>';`+
-    // fused model + verdict
-    `if(HW&&Wf){h+='<div style=\"margin-top:6px;color:#c8d0da\">fused VGPR/wave: <b>'+A.vMax+' .. '+A.vSum+'</b> <span style=\"color:#9fb0c4\">(reuse..no-reuse; '+VGPR_FULL+'=full occ, '+VMAX_THREAD+'=spill)</span></div>';`+
-    `if(A.oBest&&A.oWorst)h+='<div style=\"color:#c8d0da\">modeled occupancy: <b>~'+A.oWorst.occ+'% .. '+A.oBest.occ+'%</b> <span style=\"color:#9fb0c4\">('+A.oWorst.lim+'..'+A.oBest.lim+'-bound)</span></div>';}`+
     `h+='<div style=\"color:#c8d0da\">busy (sum kernels): <b>'+A.busyUs.toFixed(1)+' us</b></div>';`+
-    // verdict
+    // Fusion modeling + verdict: ONLY for 2+ nodes (fusing a single op is meaningless).
+    `if(multi){`+
+    `if(HW&&A.Wf){h+='<div style=\"margin-top:6px;color:#c8d0da\">fused VGPR/wave: <b>'+A.vMax+' .. '+A.vSum+'</b> <span style=\"color:#9fb0c4\">(reuse..no-reuse; '+VGPR_FULL+'=full occ, '+VMAX_THREAD+'=spill)</span></div>';`+
+    `if(A.oBest&&A.oWorst)h+='<div style=\"color:#c8d0da\">modeled occupancy: <b>~'+A.oWorst.occ+'% .. '+A.oBest.occ+'%</b> <span style=\"color:#9fb0c4\">('+A.oWorst.lim+'..'+A.oBest.lim+'-bound)</span></div>';}`+
     `var risks=[];if(A.anyScr)risks.push('a selected kernel already spills to scratch');`+
     `if(A.vSum>VMAX_THREAD)risks.push('no-reuse VGPR '+A.vSum+' exceeds the '+VMAX_THREAD+'/wave max -> scratch spill unless the compiler reuses registers');`+
     `else if(A.oBest&&A.oBest.occ<50)risks.push('largest kernel uses '+A.vMax+' VGPR/wave (>'+VGPR_FULL+' for full occ); even perfect reuse caps the fused kernel at ~'+A.oBest.occ+'% occupancy');`+
@@ -5330,7 +5386,8 @@ function openLayerGraph(L){
     `var vc,vt;if(!A.conn){vc='#ff6b6b';vt='Not fusable -- the selected ops are not connected in the dataflow graph.';}`+
     `else if(risks.length){vc='#ffb454';vt='Fusable but risky -- '+risks.join('; ')+'.';}`+
     `else{vc='#8fe388';vt='Good candidate -- connected'+(A.oWorst?', modeled occ >='+A.oWorst.occ+'%':'')+', combined VGPR/LDS within budget.';}`+
-    `h+='<div style=\"margin-top:8px;padding:6px 8px;border-left:3px solid '+vc+';background:rgba(255,255,255,.05);border-radius:3px;line-height:1.35\"><b style=\"color:'+vc+'\">FUSION</b> <span style=\"color:#c8d0da\">'+vt+'</span></div>';`+
+    `h+='<div style=\"margin-top:8px;padding:6px 8px;border-left:3px solid '+vc+';background:rgba(255,255,255,.05);border-radius:3px;line-height:1.35\"><b style=\"color:'+vc+'\">FUSION</b> <span style=\"color:#c8d0da\">'+vt+'</span></div>';}`+
+    `else{h+='<div style=\"margin-top:6px;color:#9fb0c4;font-size:11px\">Select another connected node to model fusion.</div>';}`+
     `fp.innerHTML=h;fp.style.display='block';}`+
     `document.getElementById('zin').onclick=function(){Z*=1.25;draw();};`+
     `document.getElementById('zout').onclick=function(){Z/=1.25;draw();};`+
@@ -5346,6 +5403,7 @@ function openLayerGraph(L){
     `if(P.sel)ruvApply(P.sel);`+
     `<\/scr`+`ipt></body></html>`;
   w.document.open(); w.document.write(doc); w.document.close();
+  try{ w.focus(); }catch(e){}   // grab focus so the FIRST click selects instead of just focusing
 }
 function openTilingView(shape){
   if(!shape||!shape.K||!shape.N){ alert('No mapped shape for this kernel (run with --gguf).'); return; }
@@ -6935,6 +6993,15 @@ document.getElementById('findWhat').onchange=()=>{
 })();
 
 resize();
+// Deep-link straight into a layer's compute graph: open overlay.html#graph=<L> to land in
+// the graph view for layer L on load (fast iteration on fusion analysis without hunting for
+// the layer in the swim lane). #graph or #graph=0 opens layer 0.
+(function(){
+  const m=(location.hash||'').match(/graph(?:=(-?\d+))?/);
+  if(m && D.has_layer_graph){ const L=m[1]!=null?parseInt(m[1],10):0;
+    // defer so the page finishes its initial draw first, then pop the graph window.
+    setTimeout(function(){ try{ openLayerGraph(L); }catch(e){} }, 60); }
+})();
 </script>
 </body></html>
 """
