@@ -2792,17 +2792,28 @@ def build_payload(args):
             anchor = _anchor_starts(st, en)
             if anchor is not None:
                 used_anchor = True
-                # Layer L owns [anchor[L] .. anchor[L+1]); slices before the first anchor
-                # (leading norms/get_rows of block 0) belong to L0; the tail after the
-                # last anchor's block (output head + final norm) is the head (L=-1).
-                # Assign each anchor a block index by its ORDER (0..n_layers-1), matching
-                # the GGUF block order that block_kind is keyed on.
+                # The anchor family (e.g. the GLU ffn_gate matvec) fires once per block but
+                # sits near the END of the block (FFN is last), NOT the start. So a naive
+                # [anchor[L] .. anchor[L+1]) segment is off by one: it runs from block L's FFN
+                # through block L+1's attention/SSM, mislabeling the next block's input norm +
+                # qkv as this layer. Each block instead ENDS at its ffn_down (the matvec right
+                # after the anchor) and the NEXT block STARTS at the input norm immediately
+                # following. So cut each block boundary just after the anchor's ffn_down; then
+                # every layer segment begins at its input rms_norm, matching the ggml graph.
+                def _cut_after(a):
+                    for k in range(a + 1, en):
+                        if gpu_slices[k].get("_mv"):   # first matvec after ffn_gate = ffn_down
+                            return k + 1
+                    return a + 1
+                cut = [_cut_after(a) for a in anchor]
                 for i in range(st, en):
                     lay_L[i] = None
-                # first anchor's block starts at st (its leading norms)
+                # block 0 starts at st (its leading input norm); block L (L>=1) starts right
+                # after block L-1's ffn_down. The last block runs to `en`; the output head
+                # (final norm + lm_head) is carved off below.
                 for li in range(len(anchor)):
-                    seg_lo = st if li == 0 else anchor[li]
-                    seg_hi = anchor[li + 1] if li + 1 < len(anchor) else en
+                    seg_lo = st if li == 0 else cut[li - 1]
+                    seg_hi = cut[li] if li + 1 < len(anchor) else en
                     for i in range(seg_lo, seg_hi):
                         lay_L[i] = li
                 # Split off the OUTPUT HEAD: the final norm + lm_head (vocab projection)
