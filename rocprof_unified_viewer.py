@@ -320,6 +320,28 @@ def load_kernel_slices(path, mmq_y=64):
 _HIP_NAME_COLS = ("Function", "Api_Name", "Name", "Operation")
 
 
+def graph_launch_starts(path):
+    """Return the sorted start timestamps of every hipGraphLaunch in a HIP-API trace.
+    In graph mode each measured forward pass IS one hipGraphLaunch, so consecutive launch
+    timestamps bracket exactly one pass -- the clean way to isolate a single prefill pass
+    (far more robust than guessing from GPU inter-dispatch gaps). [] if none / no file."""
+    if not path or not os.path.isfile(path):
+        return []
+    out = []
+    with open(path) as fh:
+        reader = csv.DictReader(fh)
+        namecol = next((c for c in _HIP_NAME_COLS if c in (reader.fieldnames or [])), None)
+        if not namecol:
+            return []
+        for r in reader:
+            if "GraphLaunch" in (r.get(namecol) or ""):
+                try:
+                    out.append(int(r["Start_Timestamp"]))
+                except (KeyError, ValueError, TypeError):
+                    pass
+    return sorted(out)
+
+
 def load_hip_calls(path, t0, t1):
     """Return HIP-API calls overlapping [t0, t1] as (start, end, name), sorted."""
     out = []
@@ -2243,22 +2265,28 @@ def build_payload(args):
     model_arch = gguf_meta.get("general.architecture", "")
 
     if args.mode == "prefill":
-        # Prefill = ONE prompt-processing forward pass (MMQ GEMMs), not the periodic
-        # per-token decode stream. llama-bench runs an EAGER warmup pass first (a wall
-        # of hipLaunchKernel with sparse, gappy GPU work), then the MEASURED pass as a
-        # single hipGraphLaunch under one long hipStreamSynchronize. We want the
-        # measured pass, not the warmup: bake the last contiguous run of dense GPU
-        # work, i.e. everything after the final large idle gap (the graph-setup /
-        # instantiate stall that separates warmup from the replay).
-        prologue = next((i for i, ev in enumerate(evs) if "mul_mat" in ev[2]), 0)
-        # Find the last big inter-dispatch gap; the measured pass starts after it.
-        GAP_NS = max(2_000_000, int(args.gap_threshold_us * 1000))  # >= 2ms
-        a = prologue
-        for i in range(len(evs) - 1, prologue, -1):
-            if evs[i][0] - evs[i - 1][1] > GAP_NS:
-                a = i
-                break
-        baked = evs[a:len(evs)]
+        # Prefill = ONE prompt-processing forward pass (MMQ GEMMs). llama-bench runs an
+        # eager warmup, then repeats the MEASURED pass several times -- each measured pass
+        # is ONE hipGraphLaunch. So the clean way to isolate a single pass is to bake the
+        # GPU kernels between the last two hipGraphLaunch timestamps. (The old "last big
+        # inter-dispatch gap" heuristic baked ALL the repeated measured passes at once,
+        # because they run back-to-back with no idle gap between them -> ~Nx the weights,
+        # wrecking the order-map.) Fall back to the gap heuristic only if the HIP trace
+        # has no graph launches (e.g. a graphs-disabled capture).
+        gl = graph_launch_starts(args.hip_csv)
+        baked = None
+        if len(gl) >= 2:
+            lo_t, hi_t = gl[-2], gl[-1]      # the last complete measured pass
+            baked = [ev for ev in evs if lo_t <= ev[0] < hi_t]
+        if not baked:
+            prologue = next((i for i, ev in enumerate(evs) if "mul_mat" in ev[2]), 0)
+            GAP_NS = max(2_000_000, int(args.gap_threshold_us * 1000))  # >= 2ms
+            a = prologue
+            for i in range(len(evs) - 1, prologue, -1):
+                if evs[i][0] - evs[i - 1][1] > GAP_NS:
+                    a = i
+                    break
+            baked = evs[a:len(evs)]
         if not baked:
             sys.exit("error: no mul_mat* dispatches in prefill trace "
                      f"{args.kernel_csv}; is this a prefill (-p N -n 0) run?")
