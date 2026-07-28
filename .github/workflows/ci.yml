@@ -25,7 +25,7 @@ jobs:
           node-version: "20"
 
       - name: Compile modules
-        run: python -m py_compile rocprof_unified_viewer.py serve.py disasm_loadwidth.py
+        run: python -m py_compile rocprof_unified_viewer.py serve.py disasm_loadwidth.py common.py
 
       - name: JS syntax check
         # The frontend JS lives in js/*.js (inlined into the overlay at build time). Parse
@@ -42,7 +42,7 @@ jobs:
         # image-annotation scripts that intentionally embed unicode label glyphs.
         run: |
           if grep -rnP '[^\x00-\x7f]' --include='*.py' \
-               rocprof_unified_viewer.py serve.py disasm_loadwidth.py \
+               rocprof_unified_viewer.py serve.py disasm_loadwidth.py common.py \
                isa_glossary.py tests/; then
             echo "::error::non-ASCII bytes found (these files are ASCII-only)"
             exit 1

@@ -72,7 +72,7 @@ class DecodeRegime(Regime):
         # `bounds` lives, rather than leaking bounds into the shared payload path.
         kstats = {}
         if kstats_ntok > 0:
-            from rocprof_unified_viewer import family_of
+            from common import family_of
             agg = {}
             for k in range(args.skip_tokens, len(bounds) - 1):
                 for ti, (s, e, nm, _n, _nb, _gy) in enumerate(evs[bounds[k]:bounds[k + 1]]):

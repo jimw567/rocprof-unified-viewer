@@ -140,43 +140,14 @@ _GGML_TYPES = {
     29: "IQ1_M", 30: "BF16", 39: "MXFP4",
 }
 
-# Per-arch peak DRAM bandwidth (GB/s) used as the roofline denominator. Built up
-# gradually as boards are characterized. gfx1151 (Strix Halo) is 256-bit
-# LPDDR5X-8000 = 256 GB/s theoretical, but ~230 GB/s is the realistic achievable
-# ceiling, so we roofline against 230. achieved GB/s == bytes_per_token /
-# kernel_time_ns_per_token exactly (1 B/ns == 1 GB/s).
-PEAK_BW_GBS_BY_ARCH = {
-    "gfx1151": 230.0,   # Strix Halo, LPDDR5X-8000 256-bit (~230 achievable of 256 theo)
-}
-# Per-arch peak compute (TOPS) for the fp16/int8 matmul path -- the roofline's
-# compute ceiling, shown next to the BW peak in the title. gfx1151 (Strix Halo,
-# Radeon 8060S, 40 RDNA3.5 CUs @ ~2.9 GHz) delivers ~43 TOPS f16/int8 via WMMA.
-PEAK_TOPS_BY_ARCH = {
-    "gfx1151": 43.0,    # Strix Halo, WMMA fp16/int8
-}
-# MMQ prefill GEMM output-row tile height (mmq_y in ggml-cuda/mmq.cuh get_mmq_y_host):
-# the grid tiles the N output rows in blocks of mmq_y along grid.x, so the launched
-# N is recovered as (Grid_Size_X/Workgroup_Size_X) * mmq_y. RDNA3.5 (gfx115x) = 64.
-MMQ_Y_BY_ARCH = {
-    "gfx1151": 64, "gfx1150": 64, "gfx1152": 64, "gfx1153": 64,
-}
-DEFAULT_ARCH = "gfx1151"
-
-
-def peak_bw_for(arch, override=None):
-    if override:
-        return float(override)
-    return PEAK_BW_GBS_BY_ARCH.get(arch, PEAK_BW_GBS_BY_ARCH[DEFAULT_ARCH])
-
-
-def mmq_y_for(arch):
-    return MMQ_Y_BY_ARCH.get(arch, 64)
-
-
-def peak_tops_for(arch, override=None):
-    if override:
-        return float(override)
-    return PEAK_TOPS_BY_ARCH.get(arch)
+# Roofline peaks, stall thresholds, ggml type tables, and the family_of/dominant_stall
+# hot helpers now live in common.py (the shared dependency hub). Re-exported here so
+# existing importers (serve.py, tests) keep working at this module path.
+from common import (  # noqa: E402
+    _GGML_TYPES, _GGML_BLOCK, PEAK_BW_GBS_BY_ARCH, PEAK_TOPS_BY_ARCH, MMQ_Y_BY_ARCH,
+    DEFAULT_ARCH, MEM_BUSY_HI, L2_HIT_LO, LDS_CONFLICT_HI, OCC_LO, STALL_COLORS,
+    PMC_COUNTERS, peak_bw_for, mmq_y_for, peak_tops_for, dominant_stall, family_of,
+    gguf_packed_bytes as _gguf_packed_bytes)
 
 
 # Per-MODEL-architecture token-boundary segmentation profile. NOTE: keyed by the GGUF
@@ -200,39 +171,6 @@ def boundary_profile_for(arch):
     return BOUNDARY_PROFILES.get(arch or "", BOUNDARY_PROFILES["_default"])
 
 
-def family_of(kernel_name):
-    """Normalize a mangled/templated kernel name to a family (the same
-    aggregation used when collecting PMC, so PMC families join onto trace slices).
-    For quantized kernels whose first template arg is a (ggml_type)N, keep the
-    quant type so e.g. mul_mat_vec_q<(ggml_type)12,...> vs <(ggml_type)14,...>
-    (Q4_K vs Q6_K) are distinct families instead of one blend. For generic
-    elementwise kernels that carry the operation in the template (k_bin_bcast
-    <&(op_add(...))> vs op_mul), keep the op so add/mul/sub are distinct families
-    (otherwise a residual ADD and an expert-weighted MUL blend into one family)."""
-    short = re.sub(r"<.*", "", kernel_name).split("(")[0]
-    short = short.split("void ")[-1].strip()
-    m = re.search(r"<\s*\(ggml_type\)(\d+)", kernel_name)
-    if m:
-        n = int(m.group(1))
-        short += "[" + _GGML_TYPES.get(n, "type%d" % n) + "]"
-    mo = re.search(r"op_([a-z]+)\s*\(", kernel_name)
-    if mo:
-        short += "[" + mo.group(1) + "]"
-    return short
-
-
-def dominant_stall(counters):
-    """Classify a family's dominant stall from its mean counters."""
-    mem = counters.get("MemUnitBusy", 0.0)
-    l2 = counters.get("L2CacheHit", 0.0)
-    lds = counters.get("LDSBankConflict", 0.0)
-    occ = counters.get("OccupancyPercent", 0.0)
-    if lds > LDS_CONFLICT_HI:
-        return "lds"
-    if mem >= MEM_BUSY_HI and l2 <= L2_HIT_LO:
-        return "memory"
-    if mem >= 40.0:
-        return "compute"
     if occ < OCC_LO:
         return "occupancy"
     return "compute"
@@ -1763,22 +1701,6 @@ _GGUF_STRING, _GGUF_ARRAY = 8, 9
 
 # ggml_type -> (block_elems, block_bytes): on-disk packed size of one block.
 # K-quants pack 256 elems/block; legacy quants 32; F32/F16/BF16 are dense.
-_GGML_BLOCK = {
-    0: (1, 4), 1: (1, 2), 2: (32, 18), 3: (32, 20), 6: (32, 22), 7: (32, 24),
-    8: (32, 34), 9: (32, 40), 10: (256, 84), 11: (256, 110), 12: (256, 144),
-    13: (256, 176), 14: (256, 210), 15: (256, 292), 30: (1, 2),
-    # MXFP4 (type 39, gpt-oss MoE experts): QK_MXFP4=32 elems/block,
-    # sizeof(block_mxfp4)=1 scale byte + 32/2 packed nibbles = 17 bytes.
-    39: (32, 17),
-}
-
-
-def _gguf_packed_bytes(ne, gt):
-    be, bb = _GGML_BLOCK.get(gt, (1, 4))
-    n = 1
-    for d in ne:
-        n *= d
-    return (n // be) * bb if be > 1 else n * bb
 
 
 def load_gguf_tensors(path):
