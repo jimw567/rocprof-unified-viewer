@@ -1513,22 +1513,28 @@ function openLayerGraph(L){
     // Used as a barycenter TIE-BREAK: nodes with the same parent keep this stable order.
     `var RORD={attn_q:0,attn_k:1,attn_v:2,attn_qkv:0,attn_output:3};`+
     `function rkey(nd){var r=nd.role;return (r!=null&&RORD[r]!=null)?RORD[r]:99;}`+
+    // Compute a barycentered ordering (Sugiyama step 3) into baryCols, but do NOT commit it
+    // yet -- keep the original ordering too. The two are compared by realized WIDTH below.
     `for(var pass=0;pass<4;pass++){var down=(pass%2===0);`+
     `for(var rr=1;rr<=maxr;rr++){var r=down?rr:(maxr-rr);var adj=down?r-1:r+1;`+
     `var c=cols[r]||[];if(!c.length||adj<0||adj>maxr)continue;`+
     `c.sort(function(p,q){var d=bary(p,adj)-bary(q,adj);if(Math.abs(d)>1e-6)return d;return rkey(p)-rkey(q);});`+
     `for(var k=0;k<c.length;k++)ord[c[k].i]=k;}}`+
-    // if barycenter did not reduce crossings, revert to the original order
-    `if(xings(ord)>=baseX){for(var r=0;r<=maxr;r++)cols[r]=baseCols[r];ord=slotmap();}`+
+    `var baryX=xings(ord);var baryCols={};for(var r=0;r<=maxr;r++)baryCols[r]=(cols[r]||[]).slice();`+
     // Vertical dataflow: rank -> y (top to bottom). X is assigned by a median-alignment
     // pass (Sugiyama coordinate assignment), NOT fixed slots: each node is pulled toward
     // the median x of its neighbours (parents on down-sweeps, children on up-sweeps) so a
-    // node sits directly under its parent -- this is the "move the rank right so it lines
-    // up" fix. Order within a rank is preserved and a minimum gap (CW) is enforced left
-    // to right, so alignment never reorders or overlaps nodes.
-    `var maxRows=0;for(var r=0;r<=maxr;r++){maxRows=Math.max(maxRows,(cols[r]||[]).length);}`+
-    `var X={};`+                                          // node id -> x (continuous)
-    `for(var r=0;r<=maxr;r++){var row=cols[r]||[];for(var k=0;k<row.length;k++)X[row[k].i]=PADX+k*CW;}`+
+    // node sits directly under its parent. Order within a rank is preserved and a minimum
+    // gap (CW) is enforced left to right, so alignment never reorders or overlaps nodes.
+    // assignX() runs the full coordinate assignment for a GIVEN per-rank ordering (the
+    // `co` map: rank -> node[]), returning {X, width}. We run it for BOTH the original and
+    // the barycentered orderings and keep the more COMPACT one -- barycenter minimizes edge
+    // crossings but for parallel dataflow chains (e.g. a GDN block's attention + SSM paths)
+    // it scatters ranks into far-apart slots that the X-sweep then realizes as a very wide
+    // graph with big empty gutters ("nodes all over the place"). Width is the better global
+    // objective here; the X-sweep already keeps per-rank crossings low on its own.
+    `function assignX(co){`+
+    `var X={};for(var r=0;r<=maxr;r++){var row=co[r]||[];for(var k=0;k<row.length;k++)X[row[k].i]=PADX+k*CW;}`+
     `function neighAvg(nd,adj){var acc=0,c=0;`+
     `for(var b=0;b<nd.src.length;b++){var s=nd.src[b];if(byId[s]&&(rank[s]||0)===adj){acc+=X[s];c++;}}`+
     `for(var a=0;a<N.length;a++){var o=N[a];if((rank[o.i]||0)===adj&&o.src.indexOf(nd.i)>=0){acc+=X[o.i];c++;}}`+
@@ -1536,7 +1542,7 @@ function openLayerGraph(L){
     // sweep: propose each node's x = neighbour median, then de-overlap the rank in order.
     `for(var pass=0;pass<8;pass++){var down=(pass%2===0);`+
     `for(var rr=0;rr<=maxr;rr++){var r=down?rr:(maxr-rr);var adj=down?r-1:r+1;`+
-    `var row=cols[r]||[];if(adj>=0&&adj<=maxr){`+
+    `var row=co[r]||[];if(adj>=0&&adj<=maxr){`+
     `for(var k=0;k<row.length;k++){var want=neighAvg(row[k],adj);if(want!=null)X[row[k].i]=want;}}`+
     // resolve overlaps left->right keeping order (min gap CW), then right->left
     `for(var k=1;k<row.length;k++){if(X[row[k].i]<X[row[k-1].i]+CW)X[row[k].i]=X[row[k-1].i]+CW;}`+
@@ -1545,13 +1551,21 @@ function openLayerGraph(L){
     // above, whose last sweep aligns to children). A consumer sits in its producer's column
     // when it has ONE producer; with several producers it centers on the MIDDLE (median) of
     // them. Top-down so a producer's x is already settled; de-overlap keeps order + min gap.
-    `for(var pr=0;pr<3;pr++){for(var r=1;r<=maxr;r++){var row=cols[r]||[];`+
+    `for(var pr=0;pr<3;pr++){for(var r=1;r<=maxr;r++){var row=co[r]||[];`+
     `for(var k=0;k<row.length;k++){var nd=row[k];var px=[];`+
     `for(var b=0;b<nd.src.length;b++){var s=nd.src[b];if(byId[s]&&(rank[s]||0)<r)px.push(X[s]);}`+
     `if(px.length){px.sort(function(a,b){return a-b;});`+
     `X[nd.i]=px.length%2?px[(px.length-1)/2]:(px[px.length/2-1]+px[px.length/2])/2;}}`+
     `for(var k=1;k<row.length;k++){if(X[row[k].i]<X[row[k-1].i]+CW)X[row[k].i]=X[row[k-1].i]+CW;}`+
     `for(var k=row.length-2;k>=0;k--){if(X[row[k].i]>X[row[k+1].i]-CW)X[row[k].i]=X[row[k+1].i]-CW;}}}`+
+    `var lo=1e9,hi=-1e9;for(var a=0;a<N.length;a++){var v=X[N[a].i];if(v<lo)lo=v;if(v>hi)hi=v;}`+
+    `return {X:X, width:hi-lo};}`+
+    // Realize both orderings; keep the more compact. Ties (or a genuine crossing win with no
+    // width cost) favor the barycentered ordering, since fewer crossings read cleaner.
+    `var baseRes=assignX(baseCols);var baryRes=assignX(baryCols);`+
+    `var X,useBary=(baryRes.width<=baseRes.width+1e-6&&baryX<baseX);`+
+    `if(useBary){X=baryRes.X;for(var r=0;r<=maxr;r++)cols[r]=baryCols[r];}`+
+    `else{X=baseRes.X;for(var r=0;r<=maxr;r++)cols[r]=baseCols[r];}`+
     // normalize to a positive origin and finalize positions
     `var minX=1e9;for(var a=0;a<N.length;a++)minX=Math.min(minX,X[N[a].i]);`+
     `var pos={},maxX=0;for(var r=0;r<=maxr;r++){var row=cols[r]||[];`+
