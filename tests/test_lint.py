@@ -5,11 +5,13 @@ import py_compile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-MODULES = ["rocprof_unified_viewer.py", "serve.py", "disasm_loadwidth.py"]
+MODULES = ["rocprof_unified_viewer.py", "serve.py", "disasm_loadwidth.py", "common.py"]
 # isa_glossary.py is a large generated data table; include it in the ASCII sweep too.
 ASCII_FILES = MODULES + ["isa_glossary.py", os.path.join("tests", "test_smoke.py"),
                          os.path.join("tests", "test_lint.py"),
                          os.path.join("tests", "test_boundary_profiles.py"),
+                         os.path.join("tests", "test_golden.py"),
+                         os.path.join("tests", "test_js_syntax.py"),
                          os.path.join("tests", "make_fixtures.py")]
 
 

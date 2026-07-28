@@ -211,7 +211,9 @@
   {
    "name": "norm",
    "op": "RMS_NORM",
-   "src": [],
+   "src": [
+    16
+   ],
    "fam": "rms_norm_f32",
    "quant": "f32",
    "role": ""
