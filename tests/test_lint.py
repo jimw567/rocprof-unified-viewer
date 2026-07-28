@@ -10,6 +10,7 @@ MODULES = ["rocprof_unified_viewer.py", "serve.py", "disasm_loadwidth.py"]
 ASCII_FILES = MODULES + ["isa_glossary.py", os.path.join("tests", "test_smoke.py"),
                          os.path.join("tests", "test_lint.py"),
                          os.path.join("tests", "test_boundary_profiles.py"),
+                         os.path.join("tests", "test_golden.py"),
                          os.path.join("tests", "make_fixtures.py")]
 
 
