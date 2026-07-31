@@ -110,9 +110,11 @@ document.getElementById('bwnote').textContent = IS_PREFILL ?
    'immune). time% = share of window GPU-busy time. DRAM BW% is shown secondarily '+
    '(the few prefill ops that are BW-bound). Per-family + per-shape detail on click.')
   : (D.has_bw ?
-     ('Decode is BW-bound: time% = share of window GPU-busy time; BW% = achieved DRAM '+
-      'bandwidth vs '+D.peak_bw_gbs+' GB/s peak (bytes / kernel time). Per-family roofline '+
-      'is in the click-through detail panel (real per-shape effective BW).')
+     ('Decode is BW-bound: time% = share of window GPU-busy time; eff% = EFFECTIVE '+
+      '(useful-work) DRAM bandwidth vs '+D.peak_bw_gbs+' GB/s peak -- algorithmic-minimum '+
+      'weight bytes / kernel time, over-fetch-immune (grouped MoE counts all routed '+
+      'experts). Per-shape breakdown + measured achieved BW / over-fetch are in the '+
+      'click-through detail panel.')
      : '(no --fetch-csv supplied: achieved-bandwidth footer omitted)');
 
 // legend
@@ -335,19 +337,17 @@ const tb = document.querySelector('#tbl tbody');
 // achieved DRAM BW% (its bottleneck meter). "cnt/tok" becomes "cnt/fwd" for prefill.
 document.getElementById('tblcnt').textContent = IS_PREFILL ? 'cnt/fwd' : 'cnt/tok';
 document.getElementById('tblmet').textContent  = IS_PREFILL ? 'TOPS%' : 'time%';
-document.getElementById('tblmet2').textContent = IS_PREFILL ? 'time%' : 'BW%';
-// compact stall labels so the column fits without wrapping (full word in the title).
-const STALL_ABBR = {memory:'mem',compute:'comp',occupancy:'occu',lds:'lds',
-  copy:'copy',unknown:'?'};
+document.getElementById('tblmet2').textContent = IS_PREFILL ? 'time%' : 'eff%';
 tb.innerHTML = D.summary.map(r=>{
+  // keep the per-family dot colored by its dominant stall (surfaced in the per-shape
+  // detail); the standalone stall column was dropped -- it is only meaningful per shape.
   const col = D.colors[r.stall]||D.colors.unknown;
-  // prefill: [TOPS%][time%]; decode: [time%][BW%]. A dash when the metric is N/A
-  // (unmapped family has no TOPS; no-FETCH run has no BW%).
+  // prefill: [TOPS%][time%]; decode: [time%][eff%]. A dash when the metric is N/A
+  // (unmapped family has no TOPS; no eff BW for non-weight-streaming families).
   const m1 = IS_PREFILL ? (r.tops_pct? r.tops_pct : '-') : r.busy_pct;
-  const m2 = IS_PREFILL ? r.busy_pct : (r.bw_pct? r.bw_pct : '-');
-  const sab = STALL_ABBR[r.stall]||r.stall;
+  const m2 = IS_PREFILL ? r.busy_pct : (r.effbw_pct? r.effbw_pct : '-');
   return `<tr data-fam="${r.fam}"><td><span class="fam-dot" style="background:${col}"></span>${r.fam}</td>`+
-    `<td>${r.per_tok}</td><td>${m1}</td><td>${m2}</td><td title="${r.stall}">${sab}</td></tr>`;
+    `<td>${r.per_tok}</td><td>${m1}</td><td>${m2}</td></tr>`;
 }).join('');
 // selection: a table row selects a FAMILY (dims other families); a click on the
 // timeline selects a SINGLE kernel (bright outline) and shows its details below.

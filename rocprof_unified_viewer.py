@@ -1767,6 +1767,11 @@ def load_gguf_tensors(path):
 # owns only a subset of these roles.
 _MATVEC_ROLE_ORDER = [
     "attn_qkv", "attn_q", "attn_v", "attn_k",
+    # MLA (deepseek2 / GLM): the QKV projection is factorized low-rank -- q down/up
+    # (attn_q_a, attn_q_b), the joint KV+RoPE down (attn_kv_a_mqa), and the k/v up
+    # projections (attn_k_b, attn_v_b, both 3D batched over heads -> grouped gy>1).
+    # Ordered as they dispatch at decode: q_a, q_b, k_b, kv_a_mqa, v_b, then attn_output.
+    "attn_q_a", "attn_q_b", "attn_k_b", "attn_kv_a_mqa", "attn_v_b",
     "ssm_in", "ssm_alpha", "ssm_beta",
     "attn_gate", "ssm_out", "attn_output",
     # MoE (gpt-oss): the router (ffn_gate_inp, an F32 mul_mat_vec_f) picks experts,
@@ -1797,26 +1802,29 @@ _MOE_EXPERT_ROLES = {"ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"}
 
 def _seq_entry(t, layer, role):
     ne = t["ne"]
-    is_moe = role in _MOE_EXPERT_ROLES and len(ne) >= 3
+    # A 3D matvec weight runs as ONE dispatch grouped over grid.y (gy > 1), not one
+    # matvec per slice: MoE experts (ffn_*_exps, gy = routed experts) AND MLA attention
+    # weights that batch over heads (deepseek2 attn_k_b [K,N,heads], attn_v_b -- gy =
+    # n_heads). Both must be flagged so the order-map expects a gy>1 dispatch (moe_ok
+    # gate) and folds only the PER-SLICE 2D footprint (see below). Keyed on the weight
+    # being 3D, not on a role allowlist, so any grouped-3D matvec is handled.
+    is_grouped = len(ne) >= 3
     # bytes for effbw: the packed footprint the DISPATCH streams. For a dense weight
-    # that is the whole tensor (t["bytes"]). For a 3D MoE expert weight t["bytes"] is
-    # the FULL ne[0]*ne[1]*n_experts stack (all 256 experts), but a decode dispatch
-    # reads only the routed experts -- using the full stack inflated effbw ~165x
-    # (e.g. 184MB/33us = 5567 GB/s, 24x roofline, and overfetch < 1.0 which is
-    # physically impossible). Use the PER-EXPERT 2D slice (ne[0]*ne[1]) as the packed
-    # footprint so effbw = one-expert-bytes / dispatch-time is a sane per-expert
-    # roofline number. (The grouped dispatch runs gy = active-experts of these in one
-    # launch; per-expert BW is the honest useful-work metric and matches FETCH_SIZE
-    # once multiplied by the active-expert count.)
-    if is_moe:
+    # that is the whole tensor (t["bytes"]). For a 3D grouped weight t["bytes"] is the
+    # FULL ne[0]*ne[1]*n_slices stack (all experts / all heads), but the effbw numerator
+    # must be PER-SLICE (ne[0]*ne[1]) so effbw = one-slice-bytes / dispatch-time; the
+    # per-dispatch pass then multiplies by the ACTUAL grouped count gy (routed experts /
+    # heads) via _eff_packed. Using the full stack inflated effbw ~n_slices-fold.
+    if is_grouped:
         pbytes = _gguf_packed_bytes([ne[0], ne[1]], t["gt"])
     else:
         pbytes = t["bytes"]
     return {"nm": t["name"], "L": layer, "role": role,
             "N": ne[1], "K": ne[0], "gt": t["gt"], "bytes": pbytes,
             "q": _GGML_TYPES.get(t["gt"], "type%d" % t["gt"]),
-            # is_moe: a 3D expert weight -> grouped mul_mat_id dispatch (gy = experts).
-            "is_moe": is_moe}
+            # is_moe (grouped): a 3D weight -> one dispatch grouped over grid.y (gy>1);
+            # experts for MoE, heads for MLA k_b/v_b.
+            "is_moe": is_grouped}
 
 
 def _kernel_quant_type(kname):
@@ -2499,6 +2507,11 @@ def build_payload(args):
                 sl["map"] = {
                     "nm": ent["nm"], "role": ent["role"], "L": ent["L"],
                     "q": ent["q"], "K": k, "trueN": true_n, "launchN": ncol,
+                    # grid.y = experts routed in this grouped MoE dispatch (1 for dense).
+                    # The dump's experts_used is preferred when available, but with the
+                    # checked-in skeleton (no dump) this is the ONLY source of the routed
+                    # count -- without it a grouped MoE effbw under-reports ~gy-fold.
+                    "gy": gy,
                     # Output-row padding: launched rows beyond the true weight rows.
                     "padN": max(0, ncol - true_n),
                     # Reduction (K) padding to the quant block (256 for K-quants).
@@ -2617,7 +2630,14 @@ def build_payload(args):
         # grouped MoE op, else packed for dense. (m["packed"] for MoE is already the
         # per-ONE-expert 2D footprint, see _seq_entry.)
         p = m.get("packed") or 0
+        # experts routed this grouped dispatch: the dump's exact experts_used wins;
+        # else fall back to grid.y from the trace (m["gy"]), which is the routed count
+        # for a mul_mat_id launch. Without this fallback, a skeleton-only run (no dump)
+        # under-reports grouped-MoE effbw ~gy-fold (e.g. Q4_K ffn_gate_exps read 11.6%
+        # instead of ~70%, while the family FETCH_SIZE BW correctly showed ~90%).
         eu = _dump_experts.get((m.get("trueN"), m.get("K"), _quant_norm(m.get("q"))))
+        if not (eu and eu > 1):
+            eu = m.get("gy") or 0
         if eu and eu > 1:
             return p * eu
         return p
@@ -2645,6 +2665,8 @@ def build_payload(args):
         _ep = _eff_packed(m)
         m["eff_packed"] = _ep       # JS per-row eff BW divides THIS by the row's kernel time
         _eu = _dump_experts.get((m.get("trueN"), m.get("K"), _quant_norm(m.get("q"))))
+        if not (_eu and _eu > 1):
+            _eu = m.get("gy") or 0    # trace grid.y fallback when no dump experts_used
         if _eu and _eu > 1:
             m["experts_used"] = _eu   # routed experts this grouped dispatch computed (top_k)
         # Prefer the authoritative dump time (exact shape, no order-map) when available.
@@ -2964,6 +2986,22 @@ def build_payload(args):
     # Prefill bakes one forward pass (a single span); decode bakes (hi-lo) tokens.
     ntok_baked = win.ntok_baked   # decode tokens baked; 1 for prefill (regime)
 
+    # Per-family EFFECTIVE bandwidth (useful-work bytes / kernel time), aggregated from the
+    # mapped per-dispatch slices. Unlike the measured FETCH_SIZE BW (bw_pct), this is the
+    # algorithmic-minimum traffic and is over-fetch-immune -- and for grouped MoE it counts
+    # all routed experts (eff_packed = per-expert x gy), so it no longer under-reports.
+    # Family value = MEDIAN of its mapped slices' effbw (robust to the per-dispatch timestamp
+    # smear), the same basis as the per-shape detail rows.
+    fam_effbw = {}
+    _fam_eff = defaultdict(list)
+    for sl in gpu_slices:
+        m = sl.get("map")
+        if m and m.get("effbw"):
+            _fam_eff[sl["fam"]].append(m["effbw"])
+    for fam, vals in _fam_eff.items():
+        vals.sort()
+        fam_effbw[fam] = vals[len(vals) // 2]   # median GB/s
+
     # Per-family summary (over the baked span), enriched with PMC counters and,
     # if a FETCH_SIZE run was given, MEASURED achieved DRAM bandwidth. bytes/disp
     # is measured (FETCH_SIZE, token-independent); achieved GB/s = mean bytes/disp
@@ -3014,6 +3052,12 @@ def build_payload(args):
             "mb_tok": round(bytes_tok / 1e6, 1) if bytes_tok else 0,
             "bw_gbs": round(bw_gbs, 1),
             "bw_pct": round(bw_gbs / peak_bw * 100, 1) if bw_gbs else 0,
+            # Effective (useful-work) BW: family median of per-dispatch effbw. This is the
+            # column the per-family table shows (over-fetch-immune; MoE counts all routed
+            # experts). 0 for families with no mapped weight-streaming slices.
+            "effbw_gbs": round(fam_effbw.get(fam, 0), 1),
+            "effbw_pct": (round(fam_effbw[fam] / peak_bw * 100, 1)
+                          if fam_effbw.get(fam) and peak_bw else 0),
             # Prefill compute roofline (family-level): total algorithmic MACs of this
             # family's mapped matmuls / total family kernel time -> achieved TOPS,
             # rooflined vs peak TOPS. 0 for decode or unmapped families.
@@ -3483,7 +3527,7 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
       <h2 id="tblh2">Per-kernel-family/token (baked span)</h2>
       <table id="tbl"><thead><tr>
         <th>family</th><th id="tblcnt">cnt/tok</th><th id="tblmet">time%</th>
-        <th id="tblmet2"></th><th>stall</th>
+        <th id="tblmet2"></th>
       </tr></thead><tbody></tbody><tfoot></tfoot></table>
       <div class="sub" id="bwnote" style="margin-top:8px"></div>
     </div>
