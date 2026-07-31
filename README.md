@@ -182,6 +182,16 @@ The printed command uses **full paths and no env vars**, so it runs as-is: pass
 `--build-dir` (and `--gguf` for the model) when generating the overlay and they are
 baked into the command; the regen line reproduces the exact flags you used.
 
+> **Heads-up on overlay size with ATT.** The decoded thread trace is by far the
+> largest thing in the overlay: the per-instruction wave timelines and occupancy
+> lanes dominate the embedded payload, so an overlay with `--att-dir` can be tens of
+> megabytes (a many-family model like a large MoE can reach ~75 MB, vs ~8 MB without
+> ATT). This is expected -- the full per-wave detail is what the debug view needs --
+> but such a large self-contained HTML can take noticeably longer to open in the
+> browser (it parses the whole payload up front). If you only need the swim lane /
+> roofline / PMC layers, generate the overlay **without** `--att-dir`; add ATT back
+> when you actually need per-instruction stalls for a specific kernel.
+
 ```bash
 # on the gfx1151 board: trace one kernel (the overlay prints this line for you)
 ./collect-att.sh --kernel 'mul_mat_vec_q_wvsplitk' \
